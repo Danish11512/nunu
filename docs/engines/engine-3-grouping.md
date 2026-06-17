@@ -1,0 +1,134 @@
+# Engine 3: Same-Day Live Event Grouping Engine
+
+## Purpose
+
+Group the same-day live markets (from Engine 2) by `event_ticker`. This converts a flat list of classified markets into a structured event view.
+
+## Input
+
+```python
+@dataclass
+class Engine2Output:
+    same_day_live_markets: list[ClassifiedMarket]
+```
+
+Where:
+
+```python
+@dataclass
+class ClassifiedMarket:
+    market: Market
+    classification: MarketClassification
+
+@dataclass
+class MarketClassification:
+    ticker: str
+    event_ticker: str
+    live_now: bool
+    expected_to_resolve_today: bool
+    latest_expiration_today: bool
+    same_day_live_market: bool
+    reasons: list[str]
+```
+
+## Output
+
+```python
+@dataclass
+class ClassifiedEvent:
+    event_ticker: str
+    market_count: int                    # Total markets in event
+    same_day_live_market_count: int      # Markets passing same-day-live
+    same_day_live_markets: list[ClassifiedMarket]
+
+@dataclass
+class Engine3Output:
+    events: list[ClassifiedEvent]
+```
+
+## Event Inclusion Rule
+
+```
+event qualifies if ANY child market passes SAME_DAY_LIVE_MARKET
+```
+
+Do NOT require every child market to pass. A single live market qualifies the entire event.
+
+## Implementation
+
+```python
+def group_by_event_ticker(same_day_live_markets: list[ClassifiedMarket]) -> Engine3Output:
+    """
+    Group same-day live markets by event_ticker.
+    An event qualifies if at least one child market is same-day live.
+    """
+    by_event: dict[str, list[ClassifiedMarket]] = {}
+
+    for item in same_day_live_markets:
+        event_ticker = item.market.event_ticker
+        if event_ticker not in by_event:
+            by_event[event_ticker] = []
+        by_event[event_ticker].append(item)
+
+    events = [
+        ClassifiedEvent(
+            event_ticker=event_ticker,
+            market_count=len(markets),
+            same_day_live_market_count=len(markets),
+            same_day_live_markets=markets,
+        )
+        for event_ticker, markets in by_event.items()
+    ]
+
+    # Sort by event_ticker for deterministic output
+    events.sort(key=lambda e: e.event_ticker)
+
+    return Engine3Output(events=events)
+```
+
+## Key Concepts
+
+### Why group by event_ticker?
+
+Kalshi's hierarchy is `Series → Event → Market`. The `event_ticker` links child markets to their parent event. Grouping by it lets us:
+
+1. Show users a consolidated view per real-world occurrence
+2. Rank markets within a meaningful context
+3. Apply progress gates at the event level
+
+### Why not group by series_ticker?
+
+Events are the unit of real-world occurrences. A Series is a recurring template (e.g., "Will Bitcoin reach $X by date Y"). Markets within a Series may span different days. Grouping by Series would mix same-day and future markets.
+
+## Edge Cases
+
+| Scenario | Behavior |
+|----------|----------|
+| Event with 1 same-day live market and 4 non-live markets | Event qualifies, `market_count=5`, `same_day_live_market_count=1` |
+| Event with 0 same-day live markets | Not included (filtered by Engine 2) |
+| Market with no `event_ticker` | Log warning, skip market |
+| 100+ markets in one event | All included — no truncation at this stage |
+
+## Dependencies
+
+- `backend/core/models.py` — `Market`, `Event`
+
+## Testing
+
+```python
+async def test_groups_by_event_ticker():
+    """Markets with same event_ticker end up in same event."""
+    ...
+
+async def test_event_qualifies_with_one_live_market():
+    """Event qualifies even if only 1 of 5 markets is same-day live."""
+    ...
+
+async def test_empty_input_returns_empty():
+    """Empty list returns Engine3Output(events=[])."""
+    ...
+
+async def test_events_are_deterministic():
+    """Same input always produces same ordering."""
+    ...
+```
