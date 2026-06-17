@@ -75,7 +75,7 @@ Build a **Kalshi prediction market scanner platform** with:
 class Market:
     id: str                    # Kalshi: ticker
     event_id: str              # Kalshi: event_ticker
-    status: str                # "open" | "closed" | "settled" | "unopened"
+    status: str                # "active" | "closed" | "settled" | ... (Kalshi uses "active" for open markets)
     title: str
     open_time: str             # ISO 8601
     close_time: str
