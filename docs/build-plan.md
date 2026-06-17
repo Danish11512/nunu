@@ -59,7 +59,7 @@ Every file below is referenced from this build plan. Read them alongside the cor
 | `docs/engines/engine-6-progress-gate.md` | E6 spec: threshold gate + candidate creation | Phase 3.6 |
 | `docs/engines/engine-7-validation.md` | E7 spec: pre-trade validation | Phase 3.7 |
 | `docs/engines/engine-8-orchestration.md` | E8 spec: pipeline orchestrator | Phase 3.8 |
-| `docs/engines/strategy-system.md` | All 6 strategy profiles, registry, plugin pattern | Phase 4 |
+| `docs/engines/strategy-system.md` | All 7 strategy experiments, registry, backtesting framework | Phase 4 |
 | `docs/plans/generic-prediction-market-scanner-platform.md` | Main plan doc (goals, data model, architecture) | Overall context |
 
 ## Setup Steps (do once)
@@ -86,14 +86,15 @@ Phase 1:  Backend Core + Utils              — Steps 1–16
 Phase 2:  Kalshi Adapter (SOLID split)      — Steps 17–22
 Phase 3:  Engines + Live                     — Steps 23–33
 Phase 4:  Strategies + Registry              — Steps 34–41
-Phase 5:  Trading + Logging + Portfolio       — Steps 42–46
-Phase 6:  API Layer (DRY errors.py)         — Steps 47–49
-Phase 7:  Frontend lib (Types + API Client)  — Steps 50–51
-Phase 8:  Frontend Hooks                     — Steps 52–54
-Phase 9:  Frontend Pages                     — Steps 55–61
-Phase 10: Frontend Components                — Steps 62–71
-Phase 11: Test Infrastructure                — After all steps
-Phase 12: Docker + Integration               — After all steps
+Phase 5:  Backtesting Infrastructure         — Steps 42–46
+Phase 6:  Trading + Logging + Portfolio       — Steps 47–51
+Phase 7:  API Layer (DRY errors.py)         — Steps 52–54
+Phase 8:  Frontend lib (Types + API Client)  — Steps 55–56
+Phase 9:  Frontend Hooks                     — Steps 57–59
+Phase 10: Frontend Pages                     — Steps 60–66
+Phase 11: Frontend Components                — Steps 67–76
+Phase 12: Test Infrastructure                — After all steps
+Phase 13: Docker + Integration               — After all steps
 ```
 
 ### Dependency Graph
@@ -107,25 +108,27 @@ Phase 1: Core (models, interfaces, state)
     │           │
     │           └──▶ Phase 3: Engines (1→2→3→4→5→6→7→8 + live/)
     │                       │
-    │                       ├──▶ Phase 4: Strategies (6 profiles + registry)
+    │                       ├──▶ Phase 4: Strategies (7 experiments + registry)
+    │                       │       │
+    │                       │       └──▶ Phase 5: Backtesting Infrastructure
     │                       │
-    │                       └──▶ Phase 5: Trading + Logging
+    │                       └──▶ Phase 6: Trading + Logging
     │                                   │
-    │                                   └──▶ Phase 6: API Layer (FastAPI)
+    │                                   └──▶ Phase 7: API Layer (FastAPI)
     │                                               │
     └───────────────────────────────────────────────┘
                                                     │
-                                            Phase 7: Frontend Setup + Types
+                                            Phase 8: Frontend Setup + Types
                                                     │
-                                            Phase 8: Frontend Hooks
+                                            Phase 9: Frontend Hooks
                                                     │
-                                            Phase 9: Frontend Pages
+                                            Phase 10: Frontend Pages
                                                     │
-                                            Phase 10: Frontend Components
+                                            Phase 11: Frontend Components
                                                     │
-                                            Phase 11: Test Infrastructure
+                                            Phase 12: Test Infrastructure
                                                     │
-                                            Phase 12: Docker + Integration
+                                            Phase 13: Docker + Integration
 ```
 
 ---
@@ -205,7 +208,7 @@ KALSHI_FUNDER_ADDRESS=
 # Scanner
 SCANNER_DEFAULT_MODE=dry_run
 SCANNER_DEFAULT_THRESHOLD=65
-SCANNER_DEFAULT_STRATEGY=most-bet
+SCANNER_DEFAULT_STRATEGY=executed-volume-follower
 
 # Logging
 LOG_LEVEL=INFO
@@ -222,26 +225,29 @@ kalshi:
 
 scanner:
   default_mode: dry_run         # dry_run | read_only | live
-  default_threshold: 65
-  default_strategy: most-bet
+  default_threshold: 60
+  default_strategy: executed-volume-follower
   discovery_poll_interval: 30   # seconds
   progress_gate_interval: 10    # seconds
   max_candidate_age: 30         # seconds
 
 strategy:
-  active_profile: most-bet
-  profiles:
-    most-bet: {}
-    highest-volume: {}
-    widest-spread: {}
-    deepest-book: {}
-    momentum-shift:
-      lookback_seconds: 300
-    custom-threshold:
-      per_event_type:
-        default: 65
-        sports: 50
-        politics: 75
+  active_experiment: executed-volume-follower
+  experiments:
+    executed-volume-follower: {}
+    executed-volume-fade: {}
+    favorite-side-follower: {}
+    momentum-follower:
+      early_reference_progress: 0.40
+    liquidity-filtered-follower:
+      min_total_executed_volume: 500
+      min_trade_count: 20
+      max_spread_cents: 5
+      max_entry_price_cents: 85
+      min_entry_price_cents: 15
+      exclude_block_trades: true
+    resting-depth-follower: {}
+    hybrid-score-follower: {}
 
 validation:
   max_price_movement_percent: 10.0
@@ -997,7 +1003,7 @@ class KalshiConfig(BaseModel):
 class ScannerConfig(BaseModel):
     default_mode: str = "dry_run"
     default_threshold: int = 65
-    default_strategy: str = "most-bet"
+    default_strategy: str = "executed-volume-follower"
     discovery_poll_interval: int = 30
     progress_gate_interval: int = 10
     max_candidate_age: int = 30
@@ -2414,17 +2420,23 @@ print('All 8 engines import OK')
 
 ## Phase 4: Strategies
 
-> **Cross-ref:** `docs/engines/strategy-system.md` defines all 6 profiles,
-> the STRATEGY_REGISTRY pattern, and per-profile edge cases.
-> Build from the pseudocode below; consult the spec doc for untested profiles.
+> **Cross-ref:** `docs/engines/strategy-system.md` defines all 7 experiments,
+> the `EXPERIMENT_REGISTRY` pattern, and per-experiment pseudocode.
+> Build from the pseudocode below.
+
+**Critical change from earlier logic:** The old "most-bet" strategy used resting
+orderbook quantity as a proxy for "most bet." The new default uses **executed
+trade volume** from historical trades, which is a better signal for actual
+betting activity. Experiment F (resting-depth-follower) preserves the original
+logic for comparison.
 
 **Verification:** After building all strategy files, run:
 ```bash
 cd backend && python -c "
-from backend.strategies import get_strategy, STRATEGY_REGISTRY
-print('Available strategies:', list(STRATEGY_REGISTRY.keys()))
-strat = get_strategy('most-bet', {})
-print(f'Default strategy: {strat.name} — {strat.description}')
+from backend.strategies import get_experiment, EXPERIMENT_REGISTRY
+print('Available experiments:', list(EXPERIMENT_REGISTRY.keys()))
+exp = get_experiment('executed-volume-follower', {})
+print(f'Default experiment: {exp.name} — {exp.description}')
 "
 ```
 
@@ -2433,248 +2445,566 @@ print(f'Default strategy: {strat.name} — {strat.description}')
 ```python
 from abc import ABC, abstractmethod
 from typing import Optional
-from backend.core.models import RankedMarket, MarketOrderbookStats
+from dataclasses import dataclass, field
+from datetime import datetime
 
-class StrategyProfile(ABC):
+@dataclass
+class MarketFeatures:
+    market_ticker: str
+    market_title: str
+    result: Optional[str] = None
+    status: str = ""
+    total_executed_volume: float = 0.0
+    yes_executed_volume: float = 0.0
+    no_executed_volume: float = 0.0
+    trade_count: int = 0
+    yes_price: float = 0.0
+    no_price: float = 0.0
+    yes_best_bid: Optional[float] = None
+    no_best_bid: Optional[float] = None
+    yes_total_depth: Optional[float] = None
+    no_total_depth: Optional[float] = None
+    spread: Optional[float] = None
+    yes_price_momentum: Optional[float] = None
+    open_interest: Optional[float] = None
+
+@dataclass
+class EventFeatures:
+    event_ticker: str
+    event_title: str = ""
+    category: str = ""
+    event_progress: float = 0.0
+    threshold: float = 0.0
+    entry_time: Optional[datetime] = None
+    child_markets: list = field(default_factory=list)
+
+@dataclass
+class TradeDecision:
+    event_ticker: str = ""
+    market_ticker: str = ""
+    selected_side: str = ""
+    trade_decision: str = "SKIP"
+    skip_reason: Optional[str] = None
+    entry_price_cents: Optional[float] = None
+    entry_threshold: Optional[float] = None
+    event_progress_at_entry: Optional[float] = None
+    side_signal_strength: Optional[float] = None
+    market_signal_strength: Optional[float] = None
+    selected_market_reason: Optional[str] = None
+    selected_side_reason: Optional[str] = None
+    experiment_id: Optional[str] = None
+    estimated_fee_cents: float = 1.0
+    max_acceptable_price_cents: float = 85.0
+
+class StrategyExperiment(ABC):
     name: str = ""
     description: str = ""
     config: dict = {}
-    
+
     def __init__(self, config: dict = None):
         self.config = config or {}
-    
+
     @abstractmethod
-    def select_market(self, ranked_markets: list[RankedMarket]) -> Optional[RankedMarket]:
-        ...
-    
-    @abstractmethod
-    def select_side(self, market: RankedMarket, stats: MarketOrderbookStats) -> str:
+    def select_trade(self, event_features: EventFeatures) -> TradeDecision:
         ...
 ```
 
-### 4.2 — `backend/strategies/most_bet.py`
+### 4.2 — `backend/strategies/executed_volume_follower.py`
 
 ```python
 from typing import Optional
-from backend.core.models import RankedMarket, MarketOrderbookStats
-from .base import StrategyProfile
+from .base import StrategyExperiment, EventFeatures, TradeDecision
 
-class MostBetStrategy(StrategyProfile):
-    name = "most-bet"
-    description = "Highest resting order quantity → side with more orders"
-    
-    def select_market(self, ranked_markets: list[RankedMarket]) -> Optional[RankedMarket]:
-        return ranked_markets[0] if ranked_markets else None
-    
-    def select_side(self, market: RankedMarket, stats: MarketOrderbookStats) -> str:
-        if stats.yes_order_quantity > stats.no_order_quantity:
-            return "yes"
-        elif stats.no_order_quantity > stats.yes_order_quantity:
-            return "no"
-        elif stats.total_resting_order_quantity > 0:
-            return "tie"
-        return "none"
+class ExecutedVolumeFollower(StrategyExperiment):
+    name = "executed-volume-follower"
+    description = "Highest executed trade volume → most-bet side"
+
+    def select_trade(self, event_features: EventFeatures) -> TradeDecision:
+        valid = [m for m in event_features.child_markets if m.total_executed_volume > 0]
+        if not valid:
+            return TradeDecision(
+                event_ticker=event_features.event_ticker,
+                trade_decision="SKIP",
+                skip_reason="no_markets_with_volume",
+                experiment_id=f"EXP_A_{int(event_features.threshold * 100)}",
+            )
+        selected = max(valid, key=lambda m: m.total_executed_volume)
+        side = "YES" if selected.yes_executed_volume > selected.no_executed_volume else "NO"
+        return TradeDecision(
+            event_ticker=event_features.event_ticker,
+            market_ticker=selected.market_ticker,
+            selected_side=side,
+            trade_decision=f"BUY_{side}",
+            entry_price_cents=selected.yes_price if side == "YES" else selected.no_price,
+            entry_threshold=event_features.threshold,
+            event_progress_at_entry=event_features.event_progress,
+            selected_market_reason="highest_executed_volume",
+            selected_side_reason=f"{side.lower()}_executed_volume_gt_opposite",
+            experiment_id=f"EXP_A_{int(event_features.threshold * 100)}",
+        )
 ```
 
-### 4.3 — `backend/strategies/highest_volume.py`
+### 4.3 — `backend/strategies/executed_volume_fade.py`
 
 ```python
-from typing import Optional
-from backend.core.models import RankedMarket, MarketOrderbookStats
-from .base import StrategyProfile
+from .base import StrategyExperiment, EventFeatures, TradeDecision
 
-class HighestVolumeStrategy(StrategyProfile):
-    name = "highest-volume"
-    description = "Highest 24h volume → most-traded side"
-    
-    def select_market(self, ranked_markets: list[RankedMarket]) -> Optional[RankedMarket]:
-        if not ranked_markets:
-            return None
-        return max(ranked_markets, key=lambda r: r.orderbook_stats.volume_24h)
-    
-    def select_side(self, market: RankedMarket, stats: MarketOrderbookStats) -> str:
-        if stats.yes_order_quantity > stats.no_order_quantity:
-            return "yes"
-        elif stats.no_order_quantity > stats.yes_order_quantity:
-            return "no"
-        elif stats.total_resting_order_quantity > 0:
-            return "tie"
-        return "none"
+class ExecutedVolumeFade(StrategyExperiment):
+    name = "executed-volume-fade"
+    description = "Highest volume market → fade the dominant side"
+
+    def select_trade(self, event_features: EventFeatures) -> TradeDecision:
+        valid = [m for m in event_features.child_markets if m.total_executed_volume > 0]
+        if not valid:
+            return TradeDecision(event_ticker=event_features.event_ticker, trade_decision="SKIP", skip_reason="no_markets_with_volume", experiment_id=f"EXP_B_{int(event_features.threshold * 100)}")
+        selected = max(valid, key=lambda m: m.total_executed_volume)
+        dominant = "YES" if selected.yes_executed_volume > selected.no_executed_volume else "NO"
+        fade = "NO" if dominant == "YES" else "YES"
+        return TradeDecision(event_ticker=event_features.event_ticker, market_ticker=selected.market_ticker, selected_side=fade, trade_decision=f"BUY_{fade}", entry_price_cents=selected.yes_price if fade == "YES" else selected.no_price, selected_market_reason="highest_executed_volume", selected_side_reason=f"fade_dominant_{dominant.lower()}", experiment_id=f"EXP_B_{int(event_features.threshold * 100)}")
 ```
 
-### 4.4 — `backend/strategies/widest_spread.py`
+### 4.4 — `backend/strategies/favorite_side_follower.py`
 
 ```python
-from typing import Optional
-from backend.core.models import RankedMarket, MarketOrderbookStats
-from .base import StrategyProfile
+from .base import StrategyExperiment, EventFeatures, TradeDecision
 
-class WidestSpreadStrategy(StrategyProfile):
-    name = "widest-spread"
-    description = "Widest YES/NO price gap → bet the cheaper side (contrarian)"
-    
-    def _spread(self, stats: MarketOrderbookStats) -> float:
-        y = stats.best_yes_bid or 0
-        n = stats.best_no_bid or 0
-        return abs(y - n)
-    
-    def select_market(self, ranked_markets: list[RankedMarket]) -> Optional[RankedMarket]:
-        if not ranked_markets:
-            return None
-        return max(ranked_markets, key=lambda r: self._spread(r.orderbook_stats))
-    
-    def select_side(self, market: RankedMarket, stats: MarketOrderbookStats) -> str:
-        yes_bid = stats.best_yes_bid or 0
-        no_bid = stats.best_no_bid or 0
-        if yes_bid == 0 and no_bid == 0:
-            return "none"
-        if yes_bid < no_bid:
-            return "yes"   # YES is cheaper
-        elif no_bid < yes_bid:
-            return "no"    # NO is cheaper
-        return "tie"
+class FavoriteSideFollower(StrategyExperiment):
+    name = "favorite-side-follower"
+    description = "Highest volume market → buy the favorite (price > 50 = YES)"
+
+    def select_trade(self, event_features: EventFeatures) -> TradeDecision:
+        valid = [m for m in event_features.child_markets if m.total_executed_volume > 0]
+        if not valid:
+            return TradeDecision(event_ticker=event_features.event_ticker, trade_decision="SKIP", skip_reason="no_markets_with_volume", experiment_id=f"EXP_C_{int(event_features.threshold * 100)}")
+        selected = max(valid, key=lambda m: m.total_executed_volume)
+        side = "YES" if selected.yes_price > 50 else "NO"
+        return TradeDecision(event_ticker=event_features.event_ticker, market_ticker=selected.market_ticker, selected_side=side, trade_decision=f"BUY_{side}", entry_price_cents=selected.yes_price if side == "YES" else selected.no_price, selected_market_reason="highest_executed_volume", selected_side_reason=f"favorite_side_{side.lower()}", experiment_id=f"EXP_C_{int(event_features.threshold * 100)}")
 ```
 
-### 4.5 — `backend/strategies/deepest_book.py`
+### 4.5 — `backend/strategies/momentum_follower.py`
 
 ```python
-from typing import Optional
-from backend.core.models import RankedMarket, MarketOrderbookStats
-from .base import StrategyProfile
+from .base import StrategyExperiment, EventFeatures, TradeDecision
 
-class DeepestBookStrategy(StrategyProfile):
-    name = "deepest-book"
-    description = "Highest depth level count → deeper side"
-    
-    def select_market(self, ranked_markets: list[RankedMarket]) -> Optional[RankedMarket]:
-        if not ranked_markets:
-            return None
-        return max(ranked_markets, key=lambda r: r.orderbook_stats.depth_level_count)
-    
-    def select_side(self, market: RankedMarket, stats: MarketOrderbookStats) -> str:
-        if stats.yes_order_quantity > stats.no_order_quantity:
-            return "yes"
-        elif stats.no_order_quantity > stats.yes_order_quantity:
-            return "no"
-        elif stats.total_resting_order_quantity > 0:
-            return "tie"
-        return "none"
-```
+class MomentumFollower(StrategyExperiment):
+    name = "momentum-follower"
+    description = "Largest absolute price move → direction of movement"
 
-### 4.6 — `backend/strategies/momentum_shift.py`
-
-```python
-import time
-from typing import Optional
-from backend.core.models import RankedMarket, MarketOrderbookStats
-from .base import StrategyProfile
-
-class MomentumShiftStrategy(StrategyProfile):
-    """
-    Tracks historical snapshots of YES/NO bid ratios.
-    Selects market with biggest recent ratio change.
-    Bets with the momentum.
-    """
-    name = "momentum-shift"
-    description = "Biggest recent bid ratio change → momentum side"
-    
     def __init__(self, config: dict = None):
         super().__init__(config)
-        self.lookback = self.config.get("lookback_seconds", 300)
-        self.history: dict[str, list[tuple[float, float, float]]] = {}  # market_id → [(timestamp, yes_qty, no_qty)]
-    
-    def record_snapshot(self, market_id: str, yes_qty: float, no_qty: float):
-        now = time.time()
-        if market_id not in self.history:
-            self.history[market_id] = []
-        self.history[market_id].append((now, yes_qty, no_qty))
-        # Prune old
-        cutoff = now - self.lookback
-        self.history[market_id] = [e for e in self.history[market_id] if e[0] >= cutoff]
-    
-    def _momentum(self, market_id: str, current_yes: float, current_no: float) -> float:
-        if market_id not in self.history or len(self.history[market_id]) < 2:
-            return 0.0
-        oldest = self.history[market_id][0]
-        _, old_yes, old_no = oldest
-        old_total = old_yes + old_no
-        cur_total = current_yes + current_no
-        if old_total == 0 or cur_total == 0:
-            return 0.0
-        return (current_yes / cur_total) - (old_yes / old_total)
-    
-    def select_market(self, ranked_markets: list[RankedMarket]) -> Optional[RankedMarket]:
-        if not ranked_markets:
-            return None
-        scored = [(abs(self._momentum(r.market.ticker, r.orderbook_stats.yes_order_quantity, r.orderbook_stats.no_order_quantity)), r) for r in ranked_markets]
-        scored.sort(key=lambda x: x[0], reverse=True)
-        return scored[0][1]
-    
-    def select_side(self, market: RankedMarket, stats: MarketOrderbookStats) -> str:
-        score = self._momentum(market.market.ticker, stats.yes_order_quantity, stats.no_order_quantity)
-        if score > 0.01:
-            return "yes"
-        elif score < -0.01:
-            return "no"
-        # Fallback to most-bet
-        if stats.yes_order_quantity > stats.no_order_quantity:
-            return "yes"
-        elif stats.no_order_quantity > stats.yes_order_quantity:
-            return "no"
-        elif stats.total_resting_order_quantity > 0:
-            return "tie"
-        return "none"
+        self.early_reference = self.config.get("early_reference_progress", 0.40)
+
+    def select_trade(self, event_features: EventFeatures) -> TradeDecision:
+        with_momentum = [m for m in event_features.child_markets if m.yes_price_momentum is not None]
+        if not with_momentum:
+            return TradeDecision(event_ticker=event_features.event_ticker, trade_decision="SKIP", skip_reason="no_momentum_data", experiment_id=f"EXP_D_{int(event_features.threshold * 100)}")
+        selected = max(with_momentum, key=lambda m: abs(m.yes_price_momentum))
+        side = "YES" if selected.yes_price_momentum > 0 else "NO"
+        return TradeDecision(event_ticker=event_features.event_ticker, market_ticker=selected.market_ticker, selected_side=side, trade_decision=f"BUY_{side}", entry_price_cents=selected.yes_price if side == "YES" else selected.no_price, selected_market_reason="largest_absolute_price_move", selected_side_reason=f"momentum_toward_{side.lower()}", experiment_id=f"EXP_D_{int(event_features.threshold * 100)}")
 ```
 
-### 4.7 — `backend/strategies/custom_threshold.py`
+### 4.6 — `backend/strategies/liquidity_filtered_follower.py`
 
 ```python
-from typing import Optional
-from backend.core.models import RankedMarket, MarketOrderbookStats
-from .most_bet import MostBetStrategy
+from .base import StrategyExperiment, EventFeatures, TradeDecision
 
-class CustomThresholdStrategy(MostBetStrategy):
-    """
-    Same market/side selection as most-bet, but with per-event-type
-    progress thresholds. The threshold lookup is used by Engine 6.
-    """
-    name = "custom-threshold"
-    description = "Most-bet logic with per-event-type progress thresholds"
-    
-    def get_threshold_for_event(self, event_type: str) -> int:
-        return self.config.get("per_event_type", {}).get(event_type, self.config.get("per_event_type", {}).get("default", 65))
+class LiquidityFilteredFollower(StrategyExperiment):
+    name = "liquidity-filtered-follower"
+    description = "Volume follower with liquidity guards"
+
+    def __init__(self, config: dict = None):
+        super().__init__(config)
+        self.min_volume = self.config.get("min_total_executed_volume", 500)
+        self.min_trades = self.config.get("min_trade_count", 20)
+        self.max_spread = self.config.get("max_spread_cents", 5)
+        self.max_price = self.config.get("max_entry_price_cents", 85)
+        self.min_price = self.config.get("min_entry_price_cents", 15)
+
+    def _passes(self, m) -> bool:
+        if m.total_executed_volume < self.min_volume: return False
+        if m.trade_count < self.min_trades: return False
+        if m.spread is not None and m.spread > self.max_spread: return False
+        if m.yes_price > self.max_price or m.yes_price < self.min_price: return False
+        return True
+
+    def select_trade(self, event_features: EventFeatures) -> TradeDecision:
+        filtered = [m for m in event_features.child_markets if self._passes(m)]
+        if not filtered:
+            return TradeDecision(event_ticker=event_features.event_ticker, trade_decision="SKIP", skip_reason="no_markets_pass_filters", experiment_id=f"EXP_E_{int(event_features.threshold * 100)}")
+        selected = max(filtered, key=lambda m: m.total_executed_volume)
+        side = "YES" if selected.yes_executed_volume > selected.no_executed_volume else "NO"
+        return TradeDecision(event_ticker=event_features.event_ticker, market_ticker=selected.market_ticker, selected_side=side, trade_decision=f"BUY_{side}", entry_price_cents=selected.yes_price if side == "YES" else selected.no_price, selected_market_reason="highest_executed_volume_with_filters", experiment_id=f"EXP_E_{int(event_features.threshold * 100)}")
 ```
 
-### 4.8 — `backend/strategies/__init__.py`
+### 4.7 — `backend/strategies/resting_depth_follower.py`
 
 ```python
-from .base import StrategyProfile
-from .most_bet import MostBetStrategy
-from .highest_volume import HighestVolumeStrategy
-from .widest_spread import WidestSpreadStrategy
-from .deepest_book import DeepestBookStrategy
-from .momentum_shift import MomentumShiftStrategy
-from .custom_threshold import CustomThresholdStrategy
+from .base import StrategyExperiment, EventFeatures, TradeDecision
 
-STRATEGY_REGISTRY: dict[str, type[StrategyProfile]] = {
-    "most-bet": MostBetStrategy,
-    "highest-volume": HighestVolumeStrategy,
-    "widest-spread": WidestSpreadStrategy,
-    "deepest-book": DeepestBookStrategy,
-    "momentum-shift": MomentumShiftStrategy,
-    "custom-threshold": CustomThresholdStrategy,
+class RestingDepthFollower(StrategyExperiment):
+    name = "resting-depth-follower"
+    description = "Highest total resting depth → deeper side (original most-bet logic)"
+
+    def select_trade(self, event_features: EventFeatures) -> TradeDecision:
+        with_depth = [m for m in event_features.child_markets if m.yes_total_depth is not None and m.no_total_depth is not None]
+        if not with_depth:
+            return TradeDecision(event_ticker=event_features.event_ticker, trade_decision="SKIP", skip_reason="no_depth_data", experiment_id=f"EXP_F_{int(event_features.threshold * 100)}")
+        selected = max(with_depth, key=lambda m: (m.yes_total_depth or 0) + (m.no_total_depth or 0))
+        side = "YES" if (selected.yes_total_depth or 0) > (selected.no_total_depth or 0) else "NO"
+        return TradeDecision(event_ticker=event_features.event_ticker, market_ticker=selected.market_ticker, selected_side=side, trade_decision=f"BUY_{side}", entry_price_cents=selected.yes_price if side == "YES" else selected.no_price, selected_market_reason="highest_total_resting_depth", experiment_id=f"EXP_F_{int(event_features.threshold * 100)}")
+```
+
+### 4.8 — `backend/strategies/hybrid_score_follower.py`
+
+```python
+from .base import StrategyExperiment, EventFeatures, TradeDecision
+
+class HybridScoreFollower(StrategyExperiment):
+    name = "hybrid-score-follower"
+    description = "Weighted combination of volume, momentum, depth, and liquidity"
+
+    def select_trade(self, event_features: EventFeatures) -> TradeDecision:
+        child_markets = event_features.child_markets
+        if not child_markets:
+            return TradeDecision(event_ticker=event_features.event_ticker, trade_decision="SKIP", skip_reason="no_markets", experiment_id=f"EXP_G_{int(event_features.threshold * 100)}")
+
+        # Normalize values across markets for scoring
+        max_vol = max((m.total_executed_volume for m in child_markets), default=1)
+        max_trades = max((m.trade_count for m in child_markets), default=1)
+        max_momentum = max((abs(m.yes_price_momentum or 0) for m in child_markets), default=1)
+        max_depth = max(((m.yes_total_depth or 0) + (m.no_total_depth or 0) for m in child_markets), default=1)
+
+        def market_score(m):
+            return (
+                0.40 * (m.total_executed_volume / max_vol)
+                + 0.25 * (m.trade_count / max_trades)
+                + 0.20 * (abs(m.yes_price_momentum or 0) / max_momentum)
+                + 0.15 * (((m.yes_total_depth or 0) + (m.no_total_depth or 0)) / max_depth)
+            )
+
+        selected = max(child_markets, key=market_score)
+        side = "YES" if selected.yes_executed_volume > selected.no_executed_volume else "NO"
+        return TradeDecision(event_ticker=event_features.event_ticker, market_ticker=selected.market_ticker, selected_side=side, trade_decision=f"BUY_{side}", entry_price_cents=selected.yes_price if side == "YES" else selected.no_price, selected_market_reason="highest_hybrid_score", experiment_id=f"EXP_G_{int(event_features.threshold * 100)}")
+```
+
+### 4.9 — `backend/strategies/__init__.py`
+
+```python
+from .base import StrategyExperiment, EventFeatures, MarketFeatures, TradeDecision
+from .executed_volume_follower import ExecutedVolumeFollower
+from .executed_volume_fade import ExecutedVolumeFade
+from .favorite_side_follower import FavoriteSideFollower
+from .momentum_follower import MomentumFollower
+from .liquidity_filtered_follower import LiquidityFilteredFollower
+from .resting_depth_follower import RestingDepthFollower
+from .hybrid_score_follower import HybridScoreFollower
+
+EXPERIMENT_REGISTRY: dict[str, type[StrategyExperiment]] = {
+    "executed-volume-follower": ExecutedVolumeFollower,
+    "executed-volume-fade": ExecutedVolumeFade,
+    "favorite-side-follower": FavoriteSideFollower,
+    "momentum-follower": MomentumFollower,
+    "liquidity-filtered-follower": LiquidityFilteredFollower,
+    "resting-depth-follower": RestingDepthFollower,
+    "hybrid-score-follower": HybridScoreFollower,
 }
 
-def get_strategy(name: str, config: dict = None) -> StrategyProfile:
-    if name not in STRATEGY_REGISTRY:
-        raise ValueError(f"Unknown strategy: {name}. Available: {list(STRATEGY_REGISTRY.keys())}")
-    cls = STRATEGY_REGISTRY[name]
-    return cls(config or {})
+def get_experiment(name: str, config: dict = None) -> StrategyExperiment:
+    if name not in EXPERIMENT_REGISTRY:
+        raise ValueError(f"Unknown experiment: {name}. Available: {list(EXPERIMENT_REGISTRY.keys())}")
+    return EXPERIMENT_REGISTRY[name](config or {})
 ```
 
 ---
 
-## Phase 5: Trading + Logging + Portfolio
+## Phase 5: Backtesting Infrastructure
+
+> **Cross-ref:** `docs/engines/strategy-system.md` defines performance metrics
+> and decision thresholds. The backtesting engine runs all 7 experiments
+> against historical Kalshi data.
+
+**Verification:** After building backtesting files, run:
+```bash
+cd backend && python -c "
+from backend.strategies.backtesting.metrics import compute_metrics
+print('Backtesting metrics module OK')
+"
+```
+
+### 5.1 — `backend/strategies/backtesting/__init__.py`
+
+```python
+```
+
+### 5.2 — `backend/strategies/backtesting/feature_builder.py`
+
+```python
+from datetime import datetime
+from typing import Optional
+from backend.strategies.base import MarketFeatures
+
+def build_market_features(
+    market_ticker: str,
+    trades: list,
+    candles: list,
+    orderbook_snapshot: Optional[dict],
+    entry_time: datetime,
+    yes_price_at_entry: float,
+    no_price_at_entry: float,
+    reference_yes_price: Optional[float] = None,
+) -> MarketFeatures:
+    trades_before = [t for t in trades if t.trade_time < entry_time]
+    total_vol = sum(t.count for t in trades_before)
+    yes_vol = sum(t.count for t in trades_before if t.taker_side == "YES")
+    no_vol = sum(t.count for t in trades_before if t.taker_side == "NO")
+
+    return MarketFeatures(
+        market_ticker=market_ticker,
+        total_executed_volume=total_vol,
+        yes_executed_volume=yes_vol,
+        no_executed_volume=no_vol,
+        trade_count=len(trades_before),
+        yes_price=yes_price_at_entry,
+        no_price=no_price_at_entry,
+        yes_price_momentum=yes_price_at_entry - reference_yes_price if reference_yes_price else None,
+        yes_total_depth=orderbook_snapshot.get("yes_total_depth") if orderbook_snapshot else None,
+        no_total_depth=orderbook_snapshot.get("no_total_depth") if orderbook_snapshot else None,
+        spread=orderbook_snapshot.get("spread") if orderbook_snapshot else None,
+        yes_best_bid=orderbook_snapshot.get("yes_best_bid") if orderbook_snapshot else None,
+        no_best_bid=orderbook_snapshot.get("no_best_bid") if orderbook_snapshot else None,
+    )
+```
+
+### 5.3 — `backend/strategies/backtesting/entry_simulator.py`
+
+```python
+from dataclasses import dataclass
+from typing import Optional
+
+@dataclass
+class FillResult:
+    filled: bool
+    price_cents: float
+    fill_quantity: int
+    mode: str  # "taker" | "maker"
+    slippage_cents: float
+
+def simulate_taker_entry(side: str, price_cents: float, quantity: int, spread_cents: float = 0.0) -> FillResult:
+    execution_price = price_cents + (spread_cents if side == "YES" else spread_cents)
+    return FillResult(filled=True, price_cents=execution_price, fill_quantity=quantity, mode="taker", slippage_cents=spread_cents)
+
+def simulate_maker_entry(side: str, price_cents: float, quantity: int, best_bid: float, best_ask: float) -> FillResult:
+    limit_price = best_bid if side == "YES" else (100 - best_ask)
+    return FillResult(filled=True, price_cents=limit_price, fill_quantity=quantity, mode="maker", slippage_cents=0.0)
+```
+
+### 5.4 — `backend/strategies/backtesting/exit_simulator.py`
+
+```python
+from enum import Enum
+
+class ExitReason(Enum):
+    SETTLEMENT = "settlement"
+    PROFIT_TARGET = "profit_target"
+    STOP_LOSS = "stop_loss"
+    TIME_STOP = "time_stop"
+    EXIT_AT_PROGRESS = "exit_at_progress"
+
+@dataclass
+class ExitResult:
+    exit_price_cents: float
+    exit_reason: ExitReason
+    pnl_cents: float
+    roi_percent: float
+
+def hold_to_settlement(entry_price: float, side: str, settlement_result: str) -> ExitResult:
+    won = (side == settlement_result)
+    payout = 100.0 if won else 0.0
+    pnl = payout - entry_price
+    return ExitResult(exit_price_cents=payout, exit_reason=ExitReason.SETTLEMENT, pnl_cents=pnl, roi_percent=(pnl / entry_price) * 100)
+```
+
+### 5.5 — `backend/strategies/backtesting/metrics.py`
+
+```python
+from dataclasses import dataclass, field
+from typing import Optional
+import statistics
+
+@dataclass
+class TradeResult:
+    experiment_id: str
+    threshold: float
+    event_ticker: str
+    market_ticker: str
+    side: str
+    entry_price: float
+    exit_price: float
+    won: bool
+    pnl_cents: float
+    roi_percent: float
+    category: str = ""
+    fill_mode: str = "taker"
+
+@dataclass
+class StrategyMetrics:
+    experiment_id: str
+    threshold: float
+    total_trades: int
+    wins: int
+    losses: int
+    win_rate: float
+    avg_entry_price: float
+    breakeven_win_rate: float
+    gross_roi: float
+    net_roi: float
+    profit_factor: float
+    max_drawdown: float
+    sharpe_like: float
+    avg_roi_per_trade: float
+    category_rois: dict = field(default_factory=dict)
+
+def compute_metrics(results: list[TradeResult]) -> StrategyMetrics:
+    if not results:
+        return StrategyMetrics(experiment_id="", threshold=0, total_trades=0, wins=0, losses=0, win_rate=0, avg_entry_price=0, breakeven_win_rate=0, gross_roi=0, net_roi=0, profit_factor=0, max_drawdown=0, sharpe_like=0, avg_roi_per_trade=0)
+
+    wins = [r for r in results if r.won]
+    losses_list = [r for r in results if not r.won]
+    total_pnl = sum(r.pnl_cents for r in results)
+    gross_profit = sum(r.pnl_cents for r in wins)
+    gross_loss = abs(sum(r.pnl_cents for r in losses_list))
+
+    entry_prices = [r.entry_price for r in results]
+    rois = [r.roi_percent for r in results]
+
+    return StrategyMetrics(
+        experiment_id=results[0].experiment_id,
+        threshold=results[0].threshold,
+        total_trades=len(results),
+        wins=len(wins),
+        losses=len(losses_list),
+        win_rate=len(wins) / len(results) if results else 0,
+        avg_entry_price=statistics.mean(entry_prices) if entry_prices else 0,
+        breakeven_wr=statistics.mean(entry_prices) / 100 if entry_prices else 0,
+        gross_roi=gross_profit / (gross_profit + gross_loss) if (gross_profit + gross_loss) > 0 else 0,
+        net_roi=total_pnl / (statistics.mean(entry_prices) * len(results)) if entry_prices else 0,
+        profit_factor=gross_profit / gross_loss if gross_loss > 0 else float('inf'),
+        max_drawdown=0.0,
+        sharpe_like=statistics.mean(rois) / statistics.stdev(rois) if len(rois) > 1 and statistics.stdev(rois) > 0 else 0,
+        avg_roi_per_trade=statistics.mean(rois) if rois else 0,
+    )
+```
+
+### 5.6 — `backend/strategies/backtesting/backtest_engine.py`
+
+```python
+from datetime import datetime, timedelta
+from typing import Optional
+from backend.strategies import get_experiment, EXPERIMENT_REGISTRY
+from backend.strategies.base import EventFeatures
+from .feature_builder import build_market_features
+from .entry_simulator import simulate_taker_entry
+from .exit_simulator import hold_to_settlement
+from .metrics import compute_metrics, TradeResult
+
+def run_backtest(
+    historical_events: list,
+    get_trades_fn,
+    get_candles_fn,
+    thresholds: list[float] = None,
+    experiment_names: list[str] = None,
+    default_threshold: float = 0.60,
+) -> dict:
+    if thresholds is None:
+        thresholds = [0.50, 0.60, 0.65, 0.75, 0.85]
+    if experiment_names is None:
+        experiment_names = list(EXPERIMENT_REGISTRY.keys())
+
+    all_results = {}
+
+    for event in historical_events:
+        child_markets = event.get("child_markets", [])
+        event_start = event["start_time"]
+        event_end = event["end_time"]
+
+        for threshold in thresholds:
+            entry_time = event_start + (event_end - event_start) * threshold
+
+            market_features_list = []
+            for market in child_markets:
+                trades = get_trades_fn(market["ticker"], entry_time)
+                candles = get_candles_fn(market["ticker"], entry_time)
+                mf = build_market_features(
+                    market_ticker=market["ticker"],
+                    trades=trades,
+                    candles=candles,
+                    orderbook_snapshot=None,
+                    entry_time=entry_time,
+                    yes_price_at_entry=market.get("yes_price", 50),
+                    no_price_at_entry=market.get("no_price", 50),
+                )
+                market_features_list.append(mf)
+
+            event_features = EventFeatures(
+                event_ticker=event["event_ticker"],
+                event_title=event.get("title", ""),
+                category=event.get("category", ""),
+                event_progress=threshold,
+                threshold=threshold,
+                entry_time=entry_time,
+                child_markets=market_features_list,
+            )
+
+            for exp_name in experiment_names:
+                experiment = get_experiment(exp_name, {})
+                decision = experiment.select_trade(event_features)
+
+                if decision.trade_decision == "SKIP":
+                    continue
+
+                fill = simulate_taker_entry(
+                    side=decision.selected_side,
+                    price_cents=decision.entry_price_cents or 50,
+                    quantity=1,
+                )
+
+                exit_result = hold_to_settlement(
+                    entry_price=fill.price_cents,
+                    side=decision.selected_side,
+                    settlement_result=event.get("result", "NO"),
+                )
+
+                result = TradeResult(
+                    experiment_id=decision.experiment_id or exp_name,
+                    threshold=threshold,
+                    event_ticker=event["event_ticker"],
+                    market_ticker=decision.market_ticker,
+                    side=decision.selected_side,
+                    entry_price=fill.price_cents,
+                    exit_price=exit_result.exit_price_cents,
+                    won=exit_result.pnl_cents > 0,
+                    pnl_cents=exit_result.pnl_cents,
+                    roi_percent=exit_result.roi_percent,
+                    category=event.get("category", ""),
+                )
+
+                key = f"{exp_name}_{int(threshold * 100)}"
+                if key not in all_results:
+                    all_results[key] = []
+                all_results[key].append(result)
+
+    # Compute metrics per experiment × threshold
+    metrics = {}
+    for key, results in all_results.items():
+        exp_name, thresh_str = key.rsplit("_", 1)
+        metrics[key] = compute_metrics(results)
+
+    return metrics
+```
+
+---
+
+## Phase 6: Trading + Logging + Portfolio
 
 > **Inspired by:** polymarket-arbitrage `core/execution.py`, `core/portfolio.py`, `utils/logging_utils.py`
 > Uses signal-queue pattern with async processing loop, dry-run fill simulation,
@@ -3353,7 +3683,7 @@ from backend.config.settings import load_settings, Settings
 from backend.adapters.kalshi.client import KalshiClient
 from backend.adapters.kalshi.adapter import KalshiAdapter
 from backend.core.scanner_state import ScannerState
-from backend.strategies import get_strategy, StrategyProfile
+from backend.strategies import get_experiment, StrategyExperiment
 from backend.trading.portfolio import Portfolio
 from backend.trading.execution_engine import ExecutionEngine, ExecutionConfig
 from backend.logging.log_setup import setup_logging
@@ -3406,11 +3736,11 @@ class TradingBot:
         # 2. Adapter
         self.kalshi_adapter = KalshiAdapter(self.kalshi_client)
 
-        # 3. Strategy
-        active = self.settings.strategy.active_profile
-        self.strategy = get_strategy(
+        # 3. Experiment
+        active = self.settings.strategy.active_experiment
+        self.experiment = get_experiment(
             active,
-            self.settings.strategy.profiles.get(active, {}),
+            self.settings.strategy.experiments.get(active, {}),
         )
 
         # 4. Portfolio
@@ -3684,27 +4014,27 @@ async def switch_mode(mode: str, confirm: bool = False):
 
 @router.get("/config")
 async def get_config():
-    from backend.strategies import STRATEGY_REGISTRY
+    from backend.strategies import EXPERIMENT_REGISTRY
     return ok({
         "mode": bot.mode,
-        "strategy": {
-            "active_profile": bot.settings.strategy.active_profile,
+        "experiment": {
+            "active_experiment": bot.settings.strategy.active_experiment,
         },
         "threshold_percent": bot.settings.scanner.default_threshold,
-        "available_strategies": [
-            {"name": name, "description": cls("").description}
-            for name, cls in STRATEGY_REGISTRY.items()
+        "available_experiments": [
+            {"name": name, "description": cls({}).description}
+            for name, cls in EXPERIMENT_REGISTRY.items()
         ],
         "kalshi_connected": bot.kalshi_client is not None,
         "has_credentials": bool(bot.settings.kalshi_private_key),
     })
 
 @router.put("/config")
-async def update_config(strategy: str = None, threshold_percent: int = None):
-    if strategy:
-        from backend.strategies import get_strategy
-        bot.strategy = get_strategy(strategy, {})
-        bot.settings.strategy.active_profile = strategy
+async def update_config(experiment: str = None, threshold_percent: int = None):
+    if experiment:
+        from backend.strategies import get_experiment
+        bot.experiment = get_experiment(experiment, {})
+        bot.settings.strategy.active_experiment = experiment
     if threshold_percent:
         bot.settings.scanner.default_threshold = threshold_percent
     return await get_config()
@@ -4306,7 +4636,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from backend.config.settings import load_settings
 from backend.adapters.kalshi.client import KalshiClient
 from backend.adapters.kalshi.adapter import KalshiAdapter
-from backend.strategies import get_strategy
+from backend.strategies import get_experiment
 from backend.engines.engine8_orchestrator import run_one_shot
 
 
@@ -4318,8 +4648,8 @@ async def main():
         private_key=settings.kalshi_private_key,
     ) as client:
         adapter = KalshiAdapter(client)
-        strategy = get_strategy(settings.strategy.active_profile, {})
-        result = await run_one_shot(adapter, strategy, mode="dry_run")
+        experiment = get_experiment(settings.strategy.active_experiment, {})
+        result = await run_one_shot(adapter, experiment, mode="dry_run")
 
         print(f"\n{'='*60}")
         print(f"Scanner Result — {result.timestamp}")
@@ -4435,20 +4765,20 @@ import asyncio
 from backend.config.settings import load_settings
 from backend.adapters.kalshi.client import KalshiClient
 from backend.adapters.kalshi.adapter import KalshiAdapter
-from backend.strategies import get_strategy
+from backend.strategies import get_experiment
 from backend.engines.engine8_orchestrator import run_one_shot
 
 async def test():
     settings = load_settings()
     async with KalshiClient() as client:
         adapter = KalshiAdapter(client)
-        strategy = get_strategy('most-bet')
-        result = await run_one_shot(adapter, strategy, mode='dry_run')
+        experiment = get_experiment('executed-volume-follower')
+        result = await run_one_shot(adapter, experiment, mode='dry_run')
         print(f'Scanned: {result.scanned_market_count} markets')
         print(f'Events: {len(result.events)}')
         print(f'Actionable: {len(result.actionable)}')
         for c in result.actionable[:3]:
-            print(f'  {c.event_ticker}: {c.most_bet_side} @ {c.event_progress_percent:.1f}%')
+            print(f'  {c.event_ticker}: {c.selected_side} @ {c.event_progress_percent:.1f}%')
 
 asyncio.run(test())
 "

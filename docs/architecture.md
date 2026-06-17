@@ -17,7 +17,7 @@ graph TB
         ADAPTER["Kalshi Adapter<br/>HTTP + WS Client"]
         ENGINES["Engine Pipeline<br/>E1 → E2 → ... → E8"]
         STATE["Scanner State<br/>In-Memory"]
-        STRATEGIES["Strategy Profiles<br/>6 Pluggable Strategies"]
+        STRATEGIES["Strategy Experiments<br/>7 Research Experiments"]
         TRADING["Trade Executor<br/>Dry-Run / Read-Only / Live"]
         API["REST API + WebSocket<br/>FastAPI Routes"]
     end
@@ -49,7 +49,7 @@ graph TB
 | Kalshi Adapter | Python/httpx/websockets | Protocol translation, rate limiting |
 | Engine Pipeline | Python asyncio | 8 sequential processing stages |
 | Scanner State | Python dicts | In-memory runtime state |
-| Strategy Profiles | Python ABC | Pluggable market/side selection |
+| Strategy Experiments | Python ABC | Pluggable market/side selection via select_trade() |
 | Trade Executor | Python | Mode-aware order placement |
 | FastAPI | Python | REST + WebSocket server |
 | React UI | TypeScript/Vite | Browser dashboard |
@@ -78,15 +78,17 @@ graph BT
         ADAPTER["adapters/kalshi/adapter.py"]
     end
 
-    subgraph Strategies["Layer 2a: Strategies"]
+    subgraph Strategies["Layer 2a: Strategies (7 Experiments)"]
         BASE["strategies/base.py"]
-        MOST["strategies/most_bet.py"]
-        VOL["strategies/highest_volume.py"]
-        SPREAD["strategies/widest_spread.py"]
-        DEPTH["strategies/deepest_book.py"]
-        MOMENTUM["strategies/momentum_shift.py"]
-        CUSTOM["strategies/custom_threshold.py"]
+        EVF["strategies/executed_volume_follower.py"]
+        EVFD["strategies/executed_volume_fade.py"]
+        FAV["strategies/favorite_side_follower.py"]
+        MOM["strategies/momentum_follower.py"]
+        LQF["strategies/liquidity_filtered_follower.py"]
+        RDF["strategies/resting_depth_follower.py"]
+        HYB["strategies/hybrid_score_follower.py"]
         REGISTRY["strategies/__init__.py"]
+        BT["strategies/backtesting/"]
     end
 
     subgraph Engines["Layer 2b: Engines"]
@@ -126,12 +128,14 @@ graph BT
     WS --> ADAPTER
     
     MODELS --> BASE
-    BASE --> MOST --> REGISTRY
-    BASE --> VOL --> REGISTRY
-    BASE --> SPREAD --> REGISTRY
-    BASE --> DEPTH --> REGISTRY
-    BASE --> MOMENTUM --> REGISTRY
-    BASE --> CUSTOM --> REGISTRY
+    BASE --> EVF --> REGISTRY
+    BASE --> EVFD --> REGISTRY
+    BASE --> FAV --> REGISTRY
+    BASE --> MOM --> REGISTRY
+    BASE --> LQF --> REGISTRY
+    BASE --> RDF --> REGISTRY
+    BASE --> HYB --> REGISTRY
+    REGISTRY --> BT
 
     MODELS --> E2
     ADAPTER --> E1
@@ -238,24 +242,58 @@ flowchart LR
     style E8 fill:#7ED321,color:#fff
 ```
 
-### 2.4 Strategy Resolution
+### 2.4 Experiment Resolution
 
 ```mermaid
 flowchart TB
-    CONFIG["settings.yaml<br/>strategy.active_profile: most-bet"] --> REGISTRY
-    REGISTRY["strategies/__init__.py<br/>STRATEGY_REGISTRY"] --> FACTORY["get_strategy()"]
-    FACTORY --> MOST["MostBetStrategy ✅ tested"]
-    FACTORY --> HV["HighestVolumeStrategy ⏸"]
-    FACTORY --> WS["WidestSpreadStrategy ⏸"]
-    FACTORY --> DB["DeepestBookStrategy ⏸"]
-    FACTORY --> MS["MomentumShiftStrategy ⏸"]
-    FACTORY --> CT["CustomThresholdStrategy ⏸"]
+    CONFIG["settings.yaml<br/>strategy.active_experiment: executed-volume-follower"] --> REGISTRY
+    REGISTRY["strategies/__init__.py<br/>EXPERIMENT_REGISTRY"] --> FACTORY["get_experiment()"]
+    FACTORY --> EVF["ExecutedVolumeFollower ✅ primary target"]
+    FACTORY --> EVFD["ExecutedVolumeFade ⏸"]
+    FACTORY --> FAV["FavoriteSideFollower ⏸"]
+    FACTORY --> MOM["MomentumFollower ⏸"]
+    FACTORY --> LQF["LiquidityFilteredFollower ⏸"]
+    FACTORY --> RDF["RestingDepthFollower ⏸"]
+    FACTORY --> HYB["HybridScoreFollower ⏸"]
     
-    MOST --> E6["Engine 6<br/>Progress Gate"]
-    HV -.-> E6
-    WS -.-> E6
-    DB -.-> E6
-    MS -.-> E6
+    EVF --> E6["Engine 6<br/>Progress Gate"]
+    EVFD -.-> E6
+    FAV -.-> E6
+    MOM -.-> E6
+    LQF -.-> E6
+    RDF -.-> E6
+    HYB -.-> E6
+    
+    E6 --> BT["Backtesting Engine<br/>all 7 experiments × 5 thresholds"]
+```
+
+### 2.5 Backtesting Architecture
+
+```mermaid
+flowchart LR
+    subgraph Data["Historical Data"]
+        TRADES["HistoricalTrades<br/>Kalshi API"]
+        CANDLES["Candlesticks"]
+        SNAPSHOTS["OrderbookSnapshots<br/>(if available)"]
+    end
+
+    subgraph BT["Backtesting Pipeline"]
+        FB["Feature Builder<br/>executed_volume(),<br/>momentum(),<br/>depth(),<br/>spread()"]
+        EXP["Experiment Runner<br/>all 7 experiments<br/>× 5 thresholds"]
+        ENTRY["Entry Simulator<br/>taker / maker"]
+        EXIT["Exit Simulator<br/>settlement / profit target"]
+        METRICS["Metrics Engine<br/>win rate, ROI,<br/>drawdown, Sharpe"]
+    end
+
+    TRADES --> FB
+    CANDLES --> FB
+    SNAPSHOTS --> FB
+    FB --> EXP
+    EXP --> ENTRY
+    ENTRY --> EXIT
+    EXIT --> METRICS
+    METRICS --> RESULTS["Strategy Leaderboard<br/>result_table.csv"]
+```
     CT -.-> E6
     
     E6 -->|"select_market()"| MARKET["Picks market from ranked list"]
@@ -309,8 +347,7 @@ sequenceDiagram
     E5-->>E8: list[EventWithTopMarkets]
     
     E8->>E6: process_all_events()
-    E6->>E6: strategy.select_market()
-    E6->>E6: strategy.select_side()
+    E6->>E6: experiment.select_trade()
     E6-->>E8: list[ProgressBasedOrderCandidate]
     
     E8->>E7: validate_candidate() (per actionable)
@@ -359,8 +396,7 @@ sequenceDiagram
     loop Every 10s
         PG->>State: read ranked events
         PG->>PG: recalculate progress
-        PG->>PG: strategy.select_market()
-        PG->>PG: strategy.select_side()
+        PG->>PG: experiment.select_trade()
         PG->>State: update candidates
         alt candidate is actionable
             PG->>FE: WS: candidate:created
@@ -390,7 +426,7 @@ graph TB
         end
         
         subgraph Task3["Task: Progress Gate"]
-            PG_LOOP["while not stop_event:<br/>  for each ranked_event:<br/>    calculate_progress()<br/>    strategy.select_market()<br/>    strategy.select_side()<br/>    update_candidate()<br/>    if actionable: broadcast()<br/>  await asyncio.sleep(10)"]
+            PG_LOOP["while not stop_event:<br/>  for each ranked_event:<br/>    calculate_progress()<br/>    experiment.select_trade()<br/>    update_candidate()<br/>    if actionable: broadcast()<br/>  await asyncio.sleep(10)"]
         end
         
         subgraph Task4["Task: State Broadcast"]
