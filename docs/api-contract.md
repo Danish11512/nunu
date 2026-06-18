@@ -27,10 +27,10 @@ This document is the **binding contract** between the Python backend (FastAPI) a
 │  Port 5173                                                           │
 │  ┌──────────────┐    ┌──────────────────┐                           │
 │  │ REST Client   │    │ WebSocket Client │                           │
-│  │ (fetch/axios) │    │ (useWebSocket)   │                           │
+│  │ (Zustand API) │    │ (wsStore)        │                           │
 │  └──────────────┘    └──────────────────┘                           │
 │                                                                      │
-│  State: React Context + SWR/React Query                              │
+│  State: Zustand (WS status) + TanStack React Query (REST data)         │
 └─────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -311,36 +311,45 @@ Get full detail for a single event.
 ```python
 class EventDetail:
     event_ticker: str
-    market_count: int
-    same_day_live_market_count: int
-    total_event_resting_order_quantity: float
-    active_orderbook_market_count: int
-    event_progress_percent: float
-    threshold_percent: int
-    all_markets_ranked: list[MarketDetail]
-    active_candidate: ProgressBasedOrderCandidate | None
-
-class MarketDetail:
-    ticker: str
-    title: str
-    status: str
-    open_time: str
-    close_time: str
-    expected_expiration_time: str | None
-    latest_expiration_time: str | None
-    yes_bid: float | None
-    yes_ask: float | None
-    no_bid: float | None
-    no_ask: float | None
-    total_resting_order_quantity: float
-    yes_order_quantity: float
-    no_order_quantity: float
-    depth_level_count: int
-    best_yes_bid: float | None
-    best_no_bid: float | None
-    volume_24h: float
+    event_title: str
+    top_markets: list[RankedMarket]
     total_volume: float
+    num_top_markets: int
+    candidate: ValidatedOrderCandidate | None
+
+class RankedMarket:
+    market_ticker: str
+    volume: int
+    spread_cents: int
+    yes_price_cents: int
+    no_price_cents: int
+    yes_price: float
+    no_price: float
     rank: int
+    score: float
+```
+
+```typescript
+interface RankedMarket {
+  market_ticker: string;
+  volume: number;
+  spread_cents: number;
+  yes_price_cents: number;
+  no_price_cents: number;
+  yes_price: number;
+  no_price: number;
+  rank: number;
+  score: number;
+}
+
+interface EventDetail {
+  event_ticker: string;
+  event_title: string;
+  top_markets: RankedMarket[];
+  total_volume: number;
+  num_top_markets: number;
+  candidate: CandidateResponse | null;
+}
 ```
 
 ---
@@ -364,11 +373,12 @@ class OrderbookSnapshot:
     event_ticker: str
     yes_bids: list[OrderbookLevel]
     no_bids: list[OrderbookLevel]
-    timestamp: str
+    fetch_time: str | null
 
 class OrderbookLevel:
-    price: float
-    size: float
+    price: int       # cents
+    price_cents: int # cents (same as price, for clarity)
+    count: int       # contracts at this level
 ```
 
 ```typescript
@@ -377,34 +387,13 @@ interface OrderbookSnapshot {
   event_ticker: string;
   yes_bids: OrderbookLevel[];
   no_bids: OrderbookLevel[];
-  timestamp: string;
+  fetch_time: string | null;
 }
 
 interface OrderbookLevel {
   price: number;
-  size: number;
-}
-```
-
-**Example:**
-
-```json
-{
-  "success": true,
-  "data": {
-    "market_ticker": "EVTA-M2",
-    "event_ticker": "EVTA",
-    "yes_bids": [
-      {"price": 0.65, "size": 1000},
-      {"price": 0.64, "size": 500},
-      {"price": 0.63, "size": 200}
-    ],
-    "no_bids": [
-      {"price": 0.35, "size": 800},
-      {"price": 0.34, "size": 300}
-    ],
-    "timestamp": "2026-06-17T14:32:15-04:00"
-  }
+  price_cents: number;
+  count: number;
 }
 ```
 
@@ -424,38 +413,44 @@ List all progress-based order candidates.
 **Response `data`:**
 
 ```python
-# Same shape as ProgressBasedOrderCandidate from core/models.py
+# ValidatedOrderCandidate from backend/core/models/trading.py
 class CandidateResponse:
     event_ticker: str
-    threshold_percent: int
-    event_progress_percent: float
-    event_passes_progress_threshold: bool
-    selected_market_ticker: str | None
-    selected_market_title: str | None
-    most_bet_side: str              # "yes" | "no" | "tie" | "none"
-    yes_order_quantity: float
-    no_order_quantity: float
-    total_resting_order_quantity: float
-    should_create_order_candidate: bool
-    requires_manual_review: bool
-    reasons: list[str]
+    market_ticker: str
+    side: str                    # "yes" | "no"
+    price_cents: int             # entry price in cents
+    price: float                 # entry price in dollars
+    confidence: float            # 0-1
+    volume: int                  # estimated contract volume
+    progress_pct: float          # 0-100
+    is_valid: bool
+    validation_errors: list[str]
+    risk_score: float
+    estimated_entry_price_cents: int
+    estimated_entry_price: float
+    estimated_exit_price_cents: int
+    estimated_exit_price: float
+    max_contracts: int
 ```
 
 ```typescript
 interface CandidateResponse {
   event_ticker: string;
-  threshold_percent: number;
-  event_progress_percent: number;
-  event_passes_progress_threshold: boolean;
-  selected_market_ticker: string | null;
-  selected_market_title: string | null;
-  most_bet_side: "yes" | "no" | "tie" | "none";
-  yes_order_quantity: number;
-  no_order_quantity: number;
-  total_resting_order_quantity: number;
-  should_create_order_candidate: boolean;
-  requires_manual_review: boolean;
-  reasons: string[];
+  market_ticker: string;
+  side: string;
+  price_cents: number;
+  price: number;
+  confidence: number;
+  volume: number;
+  progress_pct: number;
+  is_valid: boolean;
+  validation_errors: string[];
+  risk_score: number;
+  estimated_entry_price_cents: number;
+  estimated_entry_price: number;
+  estimated_exit_price_cents: number;
+  estimated_exit_price: number;
+  max_contracts: number;
 }
 ```
 
@@ -477,10 +472,13 @@ class ApproveCandidateRequest:
 
 ```python
 class ApproveCandidateResult:
-    candidate_id: str
+    event_ticker: str
+    market_ticker: str
+    side: str
+    price_cents: int
+    price: float
+    volume: int
     approved: bool
-    validation: ValidationResult
-    order_result: OrderResult | None  # null in dry-run mode
 ```
 
 ---
@@ -512,32 +510,57 @@ Get trade history (real or dry-run simulated).
 
 **Response `data`:**
 
+The response wraps results in a paginated envelope:
+
 ```python
+class TradesResponse:
+    trades: list[TradeRecord]
+    total: int
+    limit: int
+    offset: int
+
 class TradeRecord:
     trade_id: str
     event_ticker: str
     market_ticker: str
     side: str                         # "yes" | "no"
-    price: float
-    size: float
-    mode: str                         # "dry_run" | "live"
-    status: str                       # "filled" | "partial" | "failed"
-    timestamp: str
-    validation_latency_ms: float
+    entry_price_cents: int
+    entry_price: float
+    exit_price_cents: int | None
+    exit_price: float | None
+    quantity: int
+    entry_time: str | None            # ISO 8601
+    exit_time: str | None             # ISO 8601
+    pnl: float
+    status: str                       # "open" | "closed" | "cancelled"
+    mode: str                         # "dry_run" | "live" | "read_only"
+    error: str
 ```
 
 ```typescript
+interface TradesResponse {
+  trades: TradeRecord[];
+  total: number;
+  limit: number;
+  offset: number;
+}
+
 interface TradeRecord {
   trade_id: string;
   event_ticker: string;
   market_ticker: string;
-  side: "yes" | "no";
-  price: number;
-  size: number;
-  mode: "dry_run" | "live";
-  status: "filled" | "partial" | "failed";
-  timestamp: string;
-  validation_latency_ms: number;
+  side: string;
+  entry_price_cents: number;
+  entry_price: number;
+  exit_price_cents: number | null;
+  exit_price: number | null;
+  quantity: number;
+  entry_time: string | null;
+  exit_time: string | null;
+  pnl: number;
+  status: TradeStatus;
+  mode: string;
+  error: string;
 }
 ```
 
@@ -551,33 +574,60 @@ Get current scanner configuration.
 
 ```python
 class ScannerConfigResponse:
-    mode: str
+    mode: str                                               # "dry_run" | "read_only" | "live"
     strategy: StrategyConfig
     threshold_percent: int
-    available_strategies: list[StrategyInfo]
-    kalshi_connected: bool
-    has_credentials: bool
+    available_strategies: list[str]                         # strategy names only
+    kalshi: KalshiConfig
+    scanner: ScannerConfig
+    risk: RiskConfig
 
 class StrategyConfig:
-    active_profile: str
-    profiles: dict
+    name: str | None
+    params: dict
 
-class StrategyInfo:
-    name: str
-    description: str
+class KalshiConfig:
+    connected: bool
+    base_url: str
+    rate_limit: int
+
+class ScannerConfig:
+    min_markets_per_event: int
+    min_volume_before_entry: int
+    min_side_signal_strength: float
+    poll_interval_seconds: int
+
+class RiskConfig:
+    max_position_size_per_market: int
+    max_total_positions: int
+    max_daily_trades: int
 ```
 
 ```typescript
 interface ScannerConfigResponse {
-  mode: string;
+  mode: ScannerMode;
   strategy: {
-    active_profile: string;
-    profiles: Record<string, unknown>;
+    name: string | null;
+    params: Record<string, unknown>;
   };
   threshold_percent: number;
-  available_strategies: Array<{ name: string; description: string }>;
-  kalshi_connected: boolean;
-  has_credentials: boolean;
+  available_strategies: string[];
+  kalshi: {
+    connected: boolean;
+    base_url: string;
+    rate_limit: number;
+  };
+  scanner: {
+    min_markets_per_event: number;
+    min_volume_before_entry: number;
+    min_side_signal_strength: number;
+    poll_interval_seconds: number;
+  };
+  risk: {
+    max_position_size_per_market: number;
+    max_total_positions: number;
+    max_daily_trades: number;
+  };
 }
 ```
 
@@ -641,17 +691,34 @@ class SwitchModeResult:
 ### Connection
 
 ```
-ws://localhost:8000/api/v1/ws/{channel}
+ws://localhost:5173/api/v1/ws/{channel}
 ```
 
+In development, the Vite dev server proxies `/api` → `localhost:8000` with WebSocket passthrough (`ws: true`), so the frontend connects to the same origin as the page.
+
 Where `{channel}` is one of: `scanner`, `events`, `candidates`, `trades`.
+
+### Connection Architecture (App-level)
+
+WebSocket connections are **established at app startup** by `initialize()` in `wsStore.ts` (called in `main.tsx`), not per-hook. The Zustand store manages:
+
+- 4 persistent connections (`scanner`, `events`, `candidates`, `trades`)
+- Automatic reconnection with 3s delay
+- Ping/pong heartbeat every 30s
+- Reactive `connectedChannels` state available via `useWSStore`
+
+Hooks (`useWebSocket`) only register/unregister message listeners — they never open or close WebSocket connections. This prevents mount/unmount reconnect storms.
+
+### Ping / Pong
+
+The frontend sends `{"type": "ping"}` every 30 seconds on each open channel. The backend responds with `{"type": "pong"}`. Pong messages are silently dropped (not forwarded to listeners).
 
 ### Authentication
 
 WebSocket connections do not require auth for read-only/dry-run modes. Live mode may require a token passed as a query param:
 
 ```
-ws://localhost:8000/api/v1/ws/events?token=...
+ws://localhost:5173/api/v1/ws/events?token=...
 ```
 
 ### Message Envelope
@@ -744,18 +811,21 @@ Broadcasts candidate creation and status changes.
   "type": "candidate:created",
   "data": {
     "event_ticker": "EVTA",
-    "threshold_percent": 65,
-    "event_progress_percent": 68.75,
-    "event_passes_progress_threshold": true,
-    "selected_market_ticker": "EVTA-M2",
-    "selected_market_title": "Will X happen?",
-    "most_bet_side": "no",
-    "yes_order_quantity": 50,
-    "no_order_quantity": 100,
-    "total_resting_order_quantity": 150,
-    "should_create_order_candidate": true,
-    "requires_manual_review": false,
-    "reasons": []
+    "market_ticker": "EVTA-M2",
+    "side": "no",
+    "price_cents": 65,
+    "price": 0.65,
+    "confidence": 0.82,
+    "volume": 500,
+    "progress_pct": 68.75,
+    "is_valid": true,
+    "validation_errors": [],
+    "risk_score": 0.15,
+    "estimated_entry_price_cents": 65,
+    "estimated_entry_price": 0.65,
+    "estimated_exit_price_cents": 55,
+    "estimated_exit_price": 0.55,
+    "max_contracts": 400
   },
   "timestamp": "2026-06-17T14:32:15-04:00"
 }
@@ -838,13 +908,12 @@ class OrderbookLevel:
 class MarketOrderbookStats:
     market_ticker: str           # NOT market_id
     event_ticker: str            # NOT event_id
-    total_resting_order_quantity: int = 0
-    yes_order_quantity: float = 0
-    no_order_quantity: float = 0
-    depth_level_count: int = 0
-    best_yes_bid: int | None = None
-    best_no_bid: int | None = None
-    volume_24h: int | None = None
+    spread_cents: int | None = None
+    yes_bid: int | None = None
+    yes_ask: int | None = None
+    no_bid: int | None = None
+    no_ask: int | None = None
+    last_price: int | None = None
     volume: int = 0
     open_interest: int = 0
 ```
@@ -854,21 +923,8 @@ class MarketOrderbookStats:
 
 interface OrderbookLevel {
   price: number;    // cents
+  price_cents: number;
   count: number;    // contracts
-}
-
-interface MarketOrderbookStats {
-  market_ticker: string;
-  event_ticker: string;
-  total_resting_order_quantity: number;
-  yes_order_quantity: number;
-  no_order_quantity: number;
-  depth_level_count: number;
-  best_yes_bid: number | null;
-  best_no_bid: number | null;
-  volume_24h: number | null;
-  volume: number;
-  open_interest: number;
 }
 ```
 

@@ -30,8 +30,14 @@ cp backend/.env.example backend/.env
 
 > **⚠️ Implementation status (2026-06-18):** Phases 0–8 are complete.
 > Phase 9 (Frontend Pages — Dashboard + Settings) is complete.
-> Phase 10 (Frontend Components — Badge, ConfirmDialog, ProgressBar, ThresholdSlider, ModeSelector) is complete.
-> Phases 11–13 are **not yet implemented**.
+> Phase 10 (Frontend Components + API Contract Alignment + App-level WebSocket Handshake) is complete.
+>   - Badge, ConfirmDialog, ProgressBar, ThresholdSlider, ModeSelector
+>   - API contract alignment: frontend `types.ts` refactored to match actual backend Pydantic response shapes
+>   - App-level WebSocket via Zustand: `wsStore.ts` manages connections at app startup, hooks only listen
+>   - Vite proxy config (`/api` → `localhost:8000` with `ws: true`) for unified dev server
+>   - Backend websocket_handler DRYed with shared `_ping_loop` + `pong` replies
+> Phase 11 (Test Infrastructure) — **not yet implemented**.
+> Phase 12 (Docker + Integration) — **not yet implemented**.
 
 ---
 
@@ -91,7 +97,7 @@ Phase 6:  Trading + Logging + Portfolio             — Steps 47–51     ✅
 Phase 7:  API Layer (DRY errors.py)                — Steps 52–54     ✅
 Phase 8:  Frontend lib (Types + API Client)         — Steps 55–56     ✅
 Phase 9:  Frontend Hooks + Pages                    — Steps 57–66     ✅
-Phase 10: Frontend Components                       — Steps 67–76     ✅
+Phase 10: Frontend Components + API Alignment       — Steps 67–76     ✅
 Phase 11: Test Infrastructure                       — After all steps ⬜
 Phase 12: Docker + Integration                      — After all steps ⬜
 ```
@@ -119,15 +125,13 @@ Phase 1: Core (models, interfaces, state)
                                                     │
                                             Phase 8: Frontend Setup + Types
                                                     │
-                                            Phase 9: Frontend Hooks
+                                            Phase 9: Frontend Hooks + Pages
                                                     │
-                                            Phase 10: Frontend Pages
+                                            Phase 10: Frontend Components + API Alignment
                                                     │
-                                            Phase 11: Frontend Components
+                                            Phase 11: Test Infrastructure
                                                     │
-                                            Phase 12: Test Infrastructure
-                                                    │
-                                            Phase 13: Docker + Integration
+                                            Phase 12: Docker + Integration
 ```
 
 ---
@@ -4778,7 +4782,9 @@ export function useWebSocket<T = unknown>(
 
 ---
 
-## Phase 9: Frontend Pages
+## Phase 9: Frontend Pages (✅ Complete)
+
+**Commit:** `5b848d0`
 
 ### 9.1 — Pages (key pseudocode)
 
@@ -4850,7 +4856,9 @@ Layout:
 
 ---
 
-## Phase 10: Frontend Components
+## Phase 10: Frontend Components + API Contract Alignment (✅ Complete)
+
+**Commit:** `ad25701` (Components) + `28e42ba` (API alignment + WS store)
 
 ### 10.1 — Key Components
 
@@ -4923,9 +4931,31 @@ Renders:
   - YES = green, NO = red, tie = yellow, dry_run = amber, live = green, read_only = gray
 ```
 
+### 10.2 — What was actually built (Phase 10 real scope)
+
+Beyond the components above, Phase 10 included critical integration work:
+
+**Vite proxy config** — `frontend/vite.config.ts` added `/api` → `http://localhost:8000` proxy with `ws: true`, so the frontend dev server forwards all API + WS calls to the backend. Single URL for both.
+
+**Zustand WebSocket store** — `frontend/src/stores/wsStore.ts` manages all WS connections at the **app level** (not per-hook):
+- Module-level maps hold WebSocket instances, listeners, and reconnect timers
+- `initialize()` in `main.tsx` pre-connects all 4 channels: `scanner`, `events`, `candidates`, `trades`
+- `connect()` / `disconnect()` / `scheduleReconnect()` manage connection lifecycle
+- `ensurePing()` fires a `{ type: "ping" }` every 30s; backend replies with `{ type: "pong" }`
+- Reactive status via Zustand `useWSStore` — components subscribe to `connectedChannels`
+
+**`useWebSocket` simplified** — hooks only register/unregister listeners; they no longer create or manage WS connections. This eliminates mount/unmount reconnect storms.
+
+**Backend `websocket_handler.py` DRYed** — all 4 WS endpoints share a single `_ping_loop()` that handles ping/pong, error recovery, and disconnect.
+
+**API contract alignment** — `frontend/src/lib/types.ts` refactored to match actual backend response shapes:
+- `EventSummary` / `EventDetail` / `CandidateResponse` / `TradeRecord` / `ScannerConfigResponse` all aligned with backend Pydantic dataclasses
+- Removed incorrect enum types (`Side`, `CandidateSide`, `MarketStatus`, `TradeStatus` values)
+- Added `RankedMarket`, `TradesResponse` (wraps `trades` + `total` + `limit` + `offset`)
+
 ---
 
-## Phase 11: Test Infrastructure
+## Phase 11: Test Infrastructure (⬜ Not Yet Implemented)
 
 ### 11.1 — Test setup
 
