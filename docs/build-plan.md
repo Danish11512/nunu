@@ -3639,7 +3639,7 @@ class PortfolioPosition:
     event_ticker: str
     market_ticker: str
     side: str                           # "yes" | "no"
-    size: float = 0.0                   # Contracts held
+    size: int = 0                       # Contracts held
     avg_entry_price: float = 0.0
     realized_pnl: float = 0.0
     cost_basis: float = 0.0
@@ -3702,22 +3702,20 @@ class Portfolio:
             self._positions[key] = pos
 
         # Update position
-        new_size = pos.size + trade.size
-        total_cost = (pos.avg_entry_price * pos.size) + (trade.price * trade.size)
+        new_size = pos.size + trade.quantity
+        total_cost = (pos.avg_entry_price * pos.size) + (trade.entry_price * trade.quantity)
         pos.avg_entry_price = total_cost / new_size if new_size > 0 else 0
         pos.size = new_size
         pos.trade_count += 1
-        self.cash_balance -= trade.price * trade.size
+        self.cash_balance -= trade.entry_price * trade.quantity
 
         # Track trade
         self._trades.append(trade)
         self.stats.total_trades += 1
-        self.stats.total_volume += trade.price * trade.size
+        self.stats.total_volume += trade.entry_price * trade.quantity
 
-        if trade.price > pos.avg_entry_price:
-            self.stats.winning_trades += 1
-        else:
-            self.stats.losing_trades += 1
+        # TODO: Track win/loss on exit (position close), not on individual fills.
+        # Comparing entry prices against a running average is misleading.
 
     def get_position(self, market_ticker: str, side: str) -> Optional[PortfolioPosition]:
         return self._positions.get(f"{market_ticker}:{side}")
@@ -3753,7 +3751,7 @@ import asyncio
 import logging
 import uuid
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Optional, Callable
 
 from backend.core.models import (
@@ -3886,13 +3884,14 @@ class ExecutionEngine:
         validated = await validate_candidate(
             candidate, self.adapter, self.strategy, ValidationConfig()
         )
-        if not validated.can_trade:
-            logger.info(f"Signal rejected by validation: {candidate.event_ticker} — {validated.reason}")
+        if not validated.is_valid:
+            reasons = "; ".join(validated.validation_errors)
+            logger.info(f"Signal rejected by validation: {candidate.event_ticker} — {reasons}")
             return
 
-        side = validated.confirmed_side or candidate.most_bet_side
-        price = candidate.selected_market_stats.best_yes_bid or 0.5
-        size = candidate.total_resting_order_quantity
+        side = validated.original_candidate.side
+        price = candidate.price
+        size = candidate.volume
 
         if self.mode == "dry_run":
             await self._execute_dry_run(candidate, validated, side, price, size)
@@ -3910,54 +3909,54 @@ class ExecutionEngine:
         trade = TradeRecord(
             trade_id=trade_id,
             event_ticker=candidate.event_ticker,
-            market_ticker=candidate.selected_market.ticker,
+            market_ticker=candidate.market_ticker,
             side=side,
-            price=price,
-            size=size if is_filled else 0,
-            mode="dry_run",
+            entry_price=price,
+            quantity=size if is_filled else 0,
+            mode=self.mode,
             status="filled" if is_filled else "failed",
-            timestamp=validated.validation_timestamp,
-            validation_latency_ms=validated.validation_latency_ms,
+            entry_time=datetime.now(timezone.utc),
+            validation_latency_ms=0.0,
         )
         self._open_orders[trade_id] = trade
-        self._order_timestamps[trade_id] = datetime.utcnow()
+        self._order_timestamps[trade_id] = datetime.now(timezone.utc)
         self.stats.orders_placed += 1
         if is_filled:
             self.stats.orders_filled += 1
             self.portfolio.record_fill(trade)
         logger.info(
             f"[DRY-RUN] {'FILLED' if is_filled else 'REJECTED'}: "
-            f"{candidate.event_ticker} {side} {size:.2f}x@{price:.4f}"
+            f"{candidate.event_ticker} {side} {size}x@{price}¢"
         )
 
     async def _execute_live(self, candidate, validated, side, price, size):
         """Place a real order on Kalshi."""
         try:
             result = await self.adapter.place_order(
-                ticker=candidate.selected_market.ticker,
+                ticker=candidate.market_ticker,
                 side=side,
                 price=price,
-                size=size,
+                count=size,
             )
             trade_id = result.get("order_id", f"live_{uuid.uuid4().hex[:12]}")
             trade = TradeRecord(
                 trade_id=trade_id,
                 event_ticker=candidate.event_ticker,
-                market_ticker=candidate.selected_market.ticker,
+                market_ticker=candidate.market_ticker,
                 side=side,
-                price=price,
-                size=size,
-                mode="live",
+                entry_price=price,
+                quantity=size,
+                mode=self.mode,
                 status="filled",
-                timestamp=validated.validation_timestamp,
-                validation_latency_ms=validated.validation_latency_ms,
+                entry_time=datetime.now(timezone.utc),
+                validation_latency_ms=0.0,
             )
             self._open_orders[trade_id] = trade
-            self._order_timestamps[trade_id] = datetime.utcnow()
+            self._order_timestamps[trade_id] = datetime.now(timezone.utc)
             self.stats.orders_placed += 1
             self.stats.orders_filled += 1
             self.portfolio.record_fill(trade)
-            logger.info(f"[LIVE] ORDER PLACED: {candidate.event_ticker} {side} {size:.2f}x@{price:.4f}")
+            logger.info(f"[LIVE] ORDER PLACED: {candidate.event_ticker} {side} {size}x@{price}¢")
         except Exception as e:
             logger.error(f"[LIVE] ORDER FAILED: {candidate.event_ticker} — {e}")
             self.stats.orders_rejected += 1
@@ -3967,7 +3966,7 @@ class ExecutionEngine:
         while self._running:
             try:
                 await asyncio.sleep(5.0)
-                now = datetime.utcnow()
+                now = datetime.now(timezone.utc)
                 expired = [
                     oid for oid, ts in self._order_timestamps.items()
                     if (now - ts).total_seconds() > self.config.order_timeout_seconds
@@ -4013,8 +4012,12 @@ class TradeExecutor:
         self.engine = engine
 
     async def execute(self, candidate: ProgressBasedOrderCandidate):
+        """Submit a candidate to the execution engine.
+
+        Returns (None, None) — results flow through portfolio + stats.
+        """
         await self.engine.submit_signal(candidate)
-        return None, None  # Results now flow through portfolio + stats
+        return None, None
 ```
 
 ### 5.4 — `backend/logging/log_setup.py`
@@ -4136,16 +4139,15 @@ class CSVLogger:
     def _ensure_files(self):
         self._init_csv("candidates.csv", [
             "timestamp", "event_ticker", "market_ticker", "side",
-            "progress_pct", "threshold_pct", "total_orders",
-            "yes_orders", "no_orders", "actionable", "manual_review", "reasons",
+            "progress_pct", "threshold_pct", "total_orders", "reasons",
         ])
         self._init_csv("trades.csv", [
-            "timestamp", "trade_id", "event_ticker", "market_ticker",
-            "side", "price", "size", "mode", "status", "latency_ms", "error",
+            "entry_time", "trade_id", "event_ticker", "market_ticker",
+            "side", "entry_price", "quantity", "mode", "status", "latency_ms", "error",
         ])
         self._init_csv("opportunities.csv", [
             "timestamp", "event_ticker", "market_ticker", "side",
-            "progress_pct", "total_orders", "yes_orders", "no_orders", "edge",
+            "progress_pct", "total_orders", "edge",
         ])
 
     def _init_csv(self, name: str, headers: list[str]):
@@ -4159,20 +4161,19 @@ class CSVLogger:
         with open(path, "a", newline="") as f:
             csv.writer(f).writerow([
                 datetime.now().isoformat(), c.event_ticker,
-                c.selected_market.ticker if c.selected_market else "",
-                c.most_bet_side, f"{c.event_progress_percent:.1f}",
-                c.threshold_percent, c.total_resting_order_quantity,
-                c.yes_order_quantity, c.no_order_quantity,
-                c.should_create_order_candidate, c.requires_manual_review,
-                "; ".join(c.reasons),
+                c.market_ticker,
+                c.most_bet_side, f"{c.progress_pct:.1f}",
+                c.threshold_pct, c.volume,
+                c.reason,
             ])
 
     def log_trade(self, t: TradeRecord):
         path = os.path.join(self.log_dir, "trades.csv")
         with open(path, "a", newline="") as f:
             csv.writer(f).writerow([
-                t.timestamp, t.trade_id, t.event_ticker, t.market_ticker,
-                t.side, t.price, t.size, t.mode, t.status,
+                t.entry_time.isoformat() if t.entry_time else "", t.trade_id,
+                t.event_ticker, t.market_ticker,
+                t.side, t.entry_price, t.quantity, t.mode, t.status,
                 f"{t.validation_latency_ms:.1f}", t.error or "",
             ])
 ```

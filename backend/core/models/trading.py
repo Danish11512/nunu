@@ -79,6 +79,9 @@ class TradeRecord:
     pnl: float = 0.0
     status: str = "open"  # "open" | "closed" | "cancelled"
     trade_id: str = ""
+    mode: str = ""                        # "dry_run" | "live" | "read_only"
+    validation_latency_ms: float = 0.0    # time spent in validation (ms)
+    error: str = ""                        # error message if trade failed
 
 
 @dataclass
