@@ -103,7 +103,7 @@ bot = TradingBot()
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Startup / shutdown lifecycle."""
-    from backend.logging.log_setup import setup_logging
+    from backend.logutils.log_setup import setup_logging
 
     settings = load_settings()
     log_dir = (

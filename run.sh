@@ -24,6 +24,14 @@ PHASE="${PHASE:-1}"  # default phase, overridable via env or --phase
 #     3 |      ✅ |        ✅ |      ✅ | Containerized
 # ──────────────────────────────────────────────────────────────────────────────
 
+# ─── Detect virtual environment ──────────────────────────────────────────────
+VENV_DIR="$SCRIPT_DIR/venv"
+if [[ -d "$VENV_DIR" ]]; then
+    PYTHON="$VENV_DIR/bin/python"
+else
+    PYTHON="python3"
+fi
+
 # ─── Parse arguments ──────────────────────────────────────────────────────────
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -69,9 +77,9 @@ check_pip_deps() {
         return
     fi
     # Quick check — if pydantic isn't installed (Phase 1 dep), install deps
-    if ! python3 -c "import pydantic" 2>/dev/null; then
-        echo "Installing backend dependencies..."
-        pip3 install -r "$SCRIPT_DIR/backend/requirements.txt"
+    if ! "$PYTHON" -c "import pydantic" 2>/dev/null; then
+        echo "Installing backend dependencies into venv..."
+        "$PYTHON" -m pip install -r "$SCRIPT_DIR/backend/requirements.txt"
     fi
 }
 
@@ -80,14 +88,13 @@ start_backend() {
     if [[ ! -f "$SCRIPT_DIR/backend/main.py" ]]; then
         echo "INFO: backend/main.py not yet created (Phase 7)."
         echo "      Phase 1 code can be verified with:"
-        echo "      python -c 'from backend.core.models import Market; print(\"Phase 1 OK\")'"
+        echo "      $PYTHON -c 'from backend.core.models import Market; print("Phase 1 OK")'"
         return
     fi
     echo "Starting backend (uvicorn)..."
-    cd "$SCRIPT_DIR/backend"
-    python3 -m uvicorn main:app --reload --host 0.0.0.0 --port 8000 &
-    BACKEND_PID=$!
     cd "$SCRIPT_DIR"
+    "$PYTHON" -m uvicorn backend.main:app --reload --host 0.0.0.0 --port 8000 &
+    BACKEND_PID=$!
     echo "Backend running on http://localhost:8000 (PID: $BACKEND_PID)"
 }
 

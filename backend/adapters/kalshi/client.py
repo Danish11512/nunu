@@ -14,11 +14,20 @@ from .http_client import KalshiHttpClient
 logger = logging.getLogger(__name__)
 
 
+class KalshiAuthError(Exception):
+    """Raised when an authenticated Kalshi API call is attempted without credentials."""
+
+
 class KalshiClient:
     """Kalshi REST API client — endpoint-specific methods only.
 
     Uses **RSA-PSS** signing (from :mod:`backend.utils.auth_utils`) for REST auth.
     WebSocket auth uses the PKCS1v15 signer from :mod:`.auth` instead.
+
+    When no credentials are provided (``api_key_id`` / ``private_key`` empty),
+    the client operates in **unauthenticated** mode. Public read endpoints
+    (markets, events, orderbooks) work, but trading endpoints raise
+    :class:`KalshiAuthError`.
     """
 
     def __init__(
@@ -35,6 +44,11 @@ class KalshiClient:
         if private_key:
             self.signer = KalshiSigner(private_key_pem=private_key)
 
+    @property
+    def has_credentials(self) -> bool:
+        """Whether the client has API credentials configured."""
+        return self.signer is not None
+
     async def __aenter__(self) -> KalshiClient:
         await self.http.__aenter__()
         return self
@@ -45,7 +59,17 @@ class KalshiClient:
     # ── Auth helpers ──────────────────────────────────────────────────────
 
     def _sign_headers(self, method: str, path: str, body: str = "") -> dict[str, str]:
-        """Generate KALSHI-ACCESS-* headers using RSA-PSS signer."""
+        """Generate KALSHI-ACCESS-* headers using RSA-PSS signer.
+
+        Raises:
+            KalshiAuthError: If no signer is configured (credentials missing).
+        """
+        if self.signer is None:
+            raise KalshiAuthError(
+                "Kalshi API credentials not configured. "
+                "Set KALSHI_API_KEY_ID and KALSHI_PRIVATE_KEY environment variables "
+                "or configure them in settings.yaml under kalshi.key_id / kalshi.private_key."
+            )
         ts = KalshiSigner.generate_timestamp()
         message = ts + method.upper() + path + body
         sig = self.signer.sign(message)
@@ -120,7 +144,15 @@ class KalshiClient:
 
         Returns:
             dict with order response (e.g. ``{"order_id": "..."}``).
+
+        Raises:
+            KalshiAuthError: If no credentials are configured.
         """
+        if self.signer is None:
+            raise KalshiAuthError(
+                "Cannot place orders without Kalshi API credentials. "
+                "Set KALSHI_API_KEY_ID and KALSHI_PRIVATE_KEY."
+            )
         body: dict[str, Any] = {
             "ticker": ticker,
             "side": side,
@@ -136,13 +168,31 @@ class KalshiClient:
         return await self.http.request("POST", path, headers=headers, content=payload)
 
     async def cancel_order(self, order_id: str, **kwargs: Any) -> dict[str, Any]:
-        """Cancel an existing order by ID."""
+        """Cancel an existing order by ID.
+
+        Raises:
+            KalshiAuthError: If no credentials are configured.
+        """
+        if self.signer is None:
+            raise KalshiAuthError(
+                "Cannot cancel orders without Kalshi API credentials. "
+                "Set KALSHI_API_KEY_ID and KALSHI_PRIVATE_KEY."
+            )
         path = f"/portfolio/orders/{order_id}"
         headers = self._sign_headers("DELETE", path)
         return await self.http.request("DELETE", path, headers=headers)
 
     async def get_positions(self, **kwargs: Any) -> list[dict[str, Any]]:
-        """Get current positions."""
+        """Get current positions.
+
+        Raises:
+            KalshiAuthError: If no credentials are configured.
+        """
+        if self.signer is None:
+            raise KalshiAuthError(
+                "Cannot fetch positions without Kalshi API credentials. "
+                "Set KALSHI_API_KEY_ID and KALSHI_PRIVATE_KEY."
+            )
         path = "/portfolio/positions"
         headers = self._sign_headers("GET", path)
         data = await self.http.request("GET", path, headers=headers)

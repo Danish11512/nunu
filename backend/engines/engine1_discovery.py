@@ -20,5 +20,9 @@ async def fetch_all_open_markets(client: MarketReader) -> list[Market]:
         raw_markets = await client.fetch_markets(status="open", limit=1000)
         return [parse_market(m) for m in raw_markets] if raw_markets else []
     except Exception as e:
-        logger.error(f"Engine 1 failed: {e}")
+        logger.error(
+            "Engine 1 (discovery) failed: %s. "
+            "Check that Kalshi API credentials are configured and the API is reachable.",
+            e,
+        )
         return []

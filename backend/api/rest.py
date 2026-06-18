@@ -118,10 +118,11 @@ async def get_scanner_status(bot: Any = Depends(get_bot)):
     if state.started_at:
         uptime = (datetime.now(timezone.utc) - state.started_at).total_seconds()
 
+    has_creds = bot.kalshi_client.signer is not None if hasattr(bot, "kalshi_client") else False
     return ok({
         "mode": bot.mode,
         "is_running": state.is_running,
-        "connected_to_kalshi": bot.kalshi_adapter is not None,
+        "connected_to_kalshi": has_creds,
         "uptime_seconds": uptime,
         "markets_tracked": len(state.markets),
         "events_tracked": len(state.ranked_events),
