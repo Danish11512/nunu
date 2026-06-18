@@ -1,24 +1,5 @@
 export const API_BASE = "/api/v1";
 
-export const SCANNER_MODES = {
-  DRY_RUN: "dry_run",
-  READ_ONLY: "read_only",
-  LIVE: "live",
-} as const;
-
-export const CANDIDATE_SIDES = {
-  YES: "yes",
-  NO: "no",
-  TIE: "tie",
-  NONE: "none",
-} as const;
-
-export const TRADE_STATUSES = {
-  OPEN: "open",
-  CLOSED: "closed",
-  CANCELLED: "cancelled",
-} as const;
-
 export const CANDIDATE_FILTERS = {
   ALL: "all",
   ACTIONABLE: "actionable",

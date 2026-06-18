@@ -8,11 +8,11 @@ import type {
   EventSummary,
   EventDetail,
   OrderbookSnapshot,
-  ValidatedCandidate,
+  CandidateResponse,
   ApproveCandidateRequest,
-  ApproveResult,
+  ApproveCandidateResult,
   RejectCandidateRequest,
-  TradeListResponse,
+  TradeRecord,
   UpdateConfigRequest,
   ScannerConfigResponse,
   SwitchModeRequest,
@@ -109,8 +109,8 @@ class ScannerAPI {
   async getCandidates(
     status?: string,
     eventTicker?: string,
-  ): Promise<APIResponse<ValidatedCandidate[]>> {
-    return this.request<ValidatedCandidate[]>(
+  ): Promise<APIResponse<CandidateResponse[]>> {
+    return this.request<CandidateResponse[]>(
       "GET",
       "/candidates",
       undefined,
@@ -121,8 +121,8 @@ class ScannerAPI {
   async approveCandidate(
     eventTicker: string,
     req?: ApproveCandidateRequest,
-  ): Promise<APIResponse<ApproveResult>> {
-    return this.request<ApproveResult>(
+  ): Promise<APIResponse<ApproveCandidateResult>> {
+    return this.request<ApproveCandidateResult>(
       "POST",
       `/candidates/${encodeURIComponent(eventTicker)}/approve`,
       req,
@@ -146,8 +146,8 @@ class ScannerAPI {
     mode?: string,
     limit?: number,
     offset?: number,
-  ): Promise<APIResponse<TradeListResponse>> {
-    return this.request<TradeListResponse>(
+  ): Promise<APIResponse<TradeRecord[]>> {
+    return this.request<TradeRecord[]>(
       "GET",
       "/trades",
       undefined,

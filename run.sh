@@ -1,46 +1,37 @@
 #!/usr/bin/env bash
 # ──────────────────────────────────────────────────────────────────────────────
-# Nunu — Unified dev runner
-# 
-# Phase 1: Backend only (FastAPI + uvicorn)
-# Phase 2: + Frontend (Vite dev server)
-# Phase 3: + Docker compose
-# Phase 4: + Other services
+# Nunu — Dev runner
+#
+# Starts the backend (uvicorn) and frontend (Vite) in parallel.
+# Auto-installs missing dependencies for both.
 #
 # Usage:
-#   ./run.sh                # Start everything (current phase)
-#   ./run.sh --phase N      # Set phase explicitly
-#   ./run.sh --help         # Show this message
+#   ./run.sh          # Start backend + frontend
+#   ./run.sh --help   # Show this message
+#   ./run.sh --docker # Also start Docker Compose
 # ──────────────────────────────────────────────────────────────────────────────
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-PHASE="${PHASE:-1}"  # default phase, overridable via env or --phase
+DOCKER="${DOCKER:-}"
 
-# ─── Phase table ─────────────────────────────────────────────────────────────
-# Phase | Backend | Frontend | Docker | Notes
-#     1 |      ✅ |        ❌ |      ❌ | Python-only, CLI testing
-#     2 |      ✅ |        ✅ |      ❌ | Full-stack dev
-#     3 |      ✅ |        ✅ |      ✅ | Containerized
-# ──────────────────────────────────────────────────────────────────────────────
-
-# ─── Detect virtual environment ──────────────────────────────────────────────
+# ─── Virtual environment ─────────────────────────────────────────────────────
 VENV_DIR="$SCRIPT_DIR/venv"
 if [[ -d "$VENV_DIR" ]]; then
     PYTHON="$VENV_DIR/bin/python"
 else
-    PYTHON="python3"
+    echo "Creating virtual environment at $VENV_DIR..."
+    python3 -m venv "$VENV_DIR"
+    PYTHON="$VENV_DIR/bin/python"
+    echo "Virtual environment created."
 fi
 
 # ─── Parse arguments ──────────────────────────────────────────────────────────
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --phase) PHASE="$2"; shift 2 ;;
+        --docker) DOCKER="1"; shift ;;
         --help|-h)
-            sed -n '2,12p' "$0"
-            echo ""
-            echo "Current phase: $PHASE"
-            echo "PHASE can also be set via environment variable."
+            sed -n '2,10p' "$0"
             exit 0
             ;;
         *) echo "Unknown option: $1"; exit 1 ;;
@@ -78,8 +69,19 @@ check_pip_deps() {
     fi
     # Quick check — if pydantic isn't installed (Phase 1 dep), install deps
     if ! "$PYTHON" -c "import pydantic" 2>/dev/null; then
-        echo "Installing backend dependencies into venv..."
+        echo "Installing backend dependencies..."
         "$PYTHON" -m pip install -r "$SCRIPT_DIR/backend/requirements.txt"
+    fi
+}
+
+check_frontend_deps() {
+    if [[ ! -d "$SCRIPT_DIR/frontend" ]]; then
+        return
+    fi
+    if [[ ! -f "$SCRIPT_DIR/frontend/node_modules/react/package.json" ]]; then
+        echo "Installing frontend dependencies (bun install)..."
+        cd "$SCRIPT_DIR/frontend" && bun install
+        cd "$SCRIPT_DIR"
     fi
 }
 
@@ -105,20 +107,14 @@ start_frontend() {
         return
     fi
 
-    if ! command -v npm &>/dev/null; then
-        echo "WARNING: npm not found. Skipping frontend." >&2
+    if ! command -v bun &>/dev/null; then
+        echo "WARNING: bun not found. Skipping frontend." >&2
         return
-    fi
-
-    if [[ ! -d "$SCRIPT_DIR/frontend/node_modules" ]]; then
-        echo "Installing frontend dependencies..."
-        cd "$SCRIPT_DIR/frontend" && npm install
-        cd "$SCRIPT_DIR"
     fi
 
     echo "Starting frontend (Vite)..."
     cd "$SCRIPT_DIR/frontend"
-    npx vite --host 0.0.0.0 --port 5173 &
+    bun run dev --host 0.0.0.0 --port 5173 &
     FRONTEND_PID=$!
     cd "$SCRIPT_DIR"
     echo "Frontend running on http://localhost:5173 (PID: $FRONTEND_PID)"
@@ -135,32 +131,17 @@ start_docker() {
 }
 
 # ─── Main ────────────────────────────────────────────────────────────────────
-echo "═══ Nunu — Phase $PHASE ═══"
+echo "═══ Nunu ═══"
 
-case "$PHASE" in
-    1)
-        check_python
-        check_pip_deps
-        start_backend
-        echo ""
-        echo "Phase 1 running. Press Ctrl+C to stop."
-        wait $BACKEND_PID
-        ;;
-    2)
-        check_python
-        check_pip_deps
-        start_backend
-        start_frontend
-        echo ""
-        echo "Phase 2 running. Press Ctrl+C to stop."
-        wait $BACKEND_PID $FRONTEND_PID 2>/dev/null
-        ;;
-    3)
-        start_docker
-        echo "Phase 3 running. Use 'docker compose down' to stop."
-        ;;
-    *)
-        echo "Unknown phase: $PHASE. Valid: 1, 2, 3" >&2
-        exit 1
-        ;;
-esac
+check_python
+check_pip_deps
+check_frontend_deps
+start_backend
+start_frontend
+if [[ -n "$DOCKER" ]]; then
+    start_docker
+fi
+
+echo ""
+echo "Running. Press Ctrl+C to stop."
+wait $BACKEND_PID $FRONTEND_PID 2>/dev/null

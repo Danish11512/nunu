@@ -22,8 +22,8 @@ pip install -r backend/requirements.txt
 cp backend/.env.example backend/.env
 # → Edit backend/.env with your Kalshi API credentials
 
-# 5. Start development (Phase 1 = backend only)
-./run.sh --phase 1
+# 5. Start development (backend + frontend)
+./run.sh
 
 # 6. Follow phases below — each tells you what to build and how to verify
 ```
@@ -157,8 +157,8 @@ scripts/
 
 ### 0.1 — `run.sh` (project root)
 
-Already exists at project root. Phase-gated startup script — backend-only by default.
-No changes needed.
+Already exists at project root. Starts backend + frontend in parallel.
+Auto-installs missing Python and JS dependencies.
 
 ### 0.2 — `backend/requirements.txt`
 
@@ -5297,7 +5297,7 @@ cd backend && python scripts/test_connection.py
 cd backend && python scripts/run_simulation.py
 
 # Full stack via run.sh
-./run.sh --phase 2
+./run.sh
 ```
 
 ---
@@ -5350,14 +5350,11 @@ CMD ["uvicorn", "backend.main:app", "--host", "0.0.0.0", "--port", "8000"]
 The project root has a single `run.sh` script that starts everything:
 
 ```bash
-# Phase 1: Backend only (uvicorn on :8000)
+# Default: backend + frontend
 ./run.sh
 
-# Phase 2: Backend + Frontend
-PHASE=2 ./run.sh
-
-# Phase 3: Docker Compose
-PHASE=3 ./run.sh
+# Include Docker Compose
+./run.sh --docker
 ```
 
 ### 12.4 — Testing Script

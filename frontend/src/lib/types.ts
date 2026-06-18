@@ -1,10 +1,57 @@
 // ============================================================
-// Enum / Literal Types
+// Constants (enforced by backend/kalshi docs)
 // ============================================================
 
-export type ScannerMode = "dry_run" | "read_only" | "live";
-export type CandidateSide = "yes" | "no" | "tie" | "none";
-export type TradeStatus = "open" | "closed" | "cancelled";
+/** Base side values matching Kalshi API docs */
+export const Side = {
+  YES: "yes",
+  NO: "no",
+} as const;
+export type Side = (typeof Side)[keyof typeof Side];
+
+/** Extended side used by CandidateResponse (adds tie/none) */
+export const CandidateSide = {
+  ...Side,
+  TIE: "tie",
+  NONE: "none",
+} as const;
+export type CandidateSide = (typeof CandidateSide)[keyof typeof CandidateSide];
+
+export const ScannerMode = {
+  DRY_RUN: "dry_run",
+  READ_ONLY: "read_only",
+  LIVE: "live",
+} as const;
+export type ScannerMode = (typeof ScannerMode)[keyof typeof ScannerMode];
+
+/** "one-shot" | "live" — used by StartScannerRequest */
+export const StartMode = {
+  ONE_SHOT: "one-shot",
+  LIVE: "live",
+} as const;
+export type StartMode = (typeof StartMode)[keyof typeof StartMode];
+
+/** "dry_run" | "live" — used by SwitchModeRequest and TradeRecord */
+export const LiveMode = {
+  DRY_RUN: "dry_run",
+  LIVE: "live",
+} as const;
+export type LiveMode = (typeof LiveMode)[keyof typeof LiveMode];
+
+export const TradeStatus = {
+  FILLED: "filled",
+  PARTIAL: "partial",
+  FAILED: "failed",
+} as const;
+export type TradeStatus = (typeof TradeStatus)[keyof typeof TradeStatus];
+
+export const MarketStatus = {
+  UNOPENED: "unopened",
+  OPEN: "open",
+  CLOSED: "closed",
+  SETTLED: "settled",
+} as const;
+export type MarketStatus = (typeof MarketStatus)[keyof typeof MarketStatus];
 
 // ============================================================
 // Response Envelope
@@ -18,7 +65,7 @@ export interface APIError {
 
 export interface ResponseMeta {
   timestamp: string;
-  duration_ms?: number;
+  duration_ms: number;
 }
 
 export interface APIResponse<T> {
@@ -36,7 +83,7 @@ export interface ScannerStatus {
   mode: ScannerMode;
   is_running: boolean;
   connected_to_kalshi: boolean;
-  uptime_seconds: number | null;
+  uptime_seconds: number;
   markets_tracked: number;
   events_tracked: number;
   active_candidates: number;
@@ -49,7 +96,7 @@ export interface ScannerStatus {
 // ============================================================
 
 export interface StartScannerRequest {
-  mode?: string;
+  mode?: StartMode;
   strategy?: string;
   threshold_percent?: number;
 }
@@ -57,14 +104,11 @@ export interface StartScannerRequest {
 export interface StartResult {
   scanner_id: string;
   started_at: string;
-  events_processed: number;
-  candidates_generated: number;
-  trades_executed: number;
 }
 
 export interface StopResult {
   stopped_at: string;
-  scan_duration_seconds: number | null;
+  scan_duration_seconds: number;
   events_processed: number;
   candidates_generated: number;
 }
@@ -76,7 +120,7 @@ export interface StopResult {
 export interface EventsQueryParams {
   min_progress?: number;
   has_candidate?: boolean;
-  sort_by?: "progress" | "market_count" | "total_orders";
+  sort_by?: "total_orders" | "progress" | "market_count";
 }
 
 export interface MarketSummary {
@@ -99,51 +143,62 @@ export interface EventSummary {
   top_markets: MarketSummary[];
   event_progress_percent: number;
   has_active_candidate: boolean;
-  candidate_side: string | null;
+  candidate_side: Side | null;
 }
 
 // ============================================================
 // Event Detail (GET /api/v1/events/{event_ticker})
 // ============================================================
 
-export interface RankedMarket {
-  market_ticker: string;
-  volume: number;
-  spread_cents: number;
-  yes_price_cents: number;
-  no_price_cents: number;
-  yes_price: number;
-  no_price: number;
+export interface MarketDetail {
+  ticker: string;
+  title: string;
+  status: MarketStatus;
+  open_time: string;
+  close_time: string;
+  expected_expiration_time: string | null;
+  latest_expiration_time: string | null;
+  yes_bid: number | null;
+  yes_ask: number | null;
+  no_bid: number | null;
+  no_ask: number | null;
+  total_resting_order_quantity: number;
+  yes_order_quantity: number;
+  no_order_quantity: number;
+  depth_level_count: number;
+  best_yes_bid: number | null;
+  best_no_bid: number | null;
+  volume_24h: number;
+  total_volume: number;
   rank: number;
-  score: number;
 }
 
-export interface ValidatedCandidate {
+export interface CandidateResponse {
   event_ticker: string;
-  market_ticker: string;
-  side: string;
-  price_cents: number;
-  price: number;
-  confidence: number;
-  volume: number;
-  progress_pct: number;
-  is_valid: boolean;
-  validation_errors: string[];
-  risk_score: number;
-  estimated_entry_price_cents: number;
-  estimated_entry_price: number;
-  estimated_exit_price_cents: number;
-  estimated_exit_price: number;
-  max_contracts: number;
+  threshold_percent: number;
+  event_progress_percent: number;
+  event_passes_progress_threshold: boolean;
+  selected_market_ticker: string | null;
+  selected_market_title: string | null;
+  most_bet_side: CandidateSide;
+  yes_order_quantity: number;
+  no_order_quantity: number;
+  total_resting_order_quantity: number;
+  should_create_order_candidate: boolean;
+  requires_manual_review: boolean;
+  reasons: string[];
 }
 
 export interface EventDetail {
   event_ticker: string;
-  event_title: string;
-  top_markets: RankedMarket[];
-  total_volume: number;
-  num_top_markets: number;
-  candidate: ValidatedCandidate | null;
+  market_count: number;
+  same_day_live_market_count: number;
+  total_event_resting_order_quantity: number;
+  active_orderbook_market_count: number;
+  event_progress_percent: number;
+  threshold_percent: number;
+  all_markets_ranked: MarketDetail[];
+  active_candidate: CandidateResponse | null;
 }
 
 // ============================================================
@@ -152,8 +207,7 @@ export interface EventDetail {
 
 export interface OrderbookLevel {
   price: number;
-  price_cents: number;
-  count: number;
+  size: number;
 }
 
 export interface OrderbookSnapshot {
@@ -161,7 +215,7 @@ export interface OrderbookSnapshot {
   event_ticker: string;
   yes_bids: OrderbookLevel[];
   no_bids: OrderbookLevel[];
-  fetch_time: string | null;
+  timestamp: string;
 }
 
 // ============================================================
@@ -173,14 +227,11 @@ export interface ApproveCandidateRequest {
   size_override?: number;
 }
 
-export interface ApproveResult {
-  event_ticker: string;
-  market_ticker: string;
-  side: string;
-  price_cents: number;
-  price: number;
-  volume: number;
+export interface ApproveCandidateResult {
+  candidate_id: string;
   approved: boolean;
+  validation: Record<string, unknown>;
+  order_result: Record<string, unknown> | null;
 }
 
 export interface RejectCandidateRequest {
@@ -195,25 +246,13 @@ export interface TradeRecord {
   trade_id: string;
   event_ticker: string;
   market_ticker: string;
-  side: string;
-  entry_price_cents: number;
-  entry_price: number;
-  exit_price_cents: number | null;
-  exit_price: number | null;
-  quantity: number;
-  entry_time: string | null;
-  exit_time: string | null;
-  pnl: number;
+  side: Side;
+  price: number;
+  size: number;
+  mode: LiveMode;
   status: TradeStatus;
-  mode: string;
-  error: string | null;
-}
-
-export interface TradeListResponse {
-  trades: TradeRecord[];
-  total: number;
-  limit: number;
-  offset: number;
+  timestamp: string;
+  validation_latency_ms: number;
 }
 
 // ============================================================
@@ -226,29 +265,15 @@ export interface UpdateConfigRequest {
 }
 
 export interface ScannerConfigResponse {
-  mode: string;
+  mode: ScannerMode;
   strategy: {
-    name: string | null;
-    params: Record<string, unknown>;
+    active_profile: string;
+    profiles: Record<string, unknown>;
   };
-  available_strategies: string[];
   threshold_percent: number;
-  kalshi: {
-    connected: boolean;
-    base_url: string;
-    rate_limit: number;
-  };
-  scanner: {
-    min_markets_per_event: number;
-    min_volume_before_entry: number;
-    min_side_signal_strength: number;
-    poll_interval_seconds: number;
-  };
-  risk: {
-    max_position_size_per_market: number;
-    max_total_positions: number;
-    max_daily_trades: number;
-  };
+  available_strategies: Array<{ name: string; description: string }>;
+  kalshi_connected: boolean;
+  has_credentials: boolean;
 }
 
 // ============================================================
@@ -256,7 +281,7 @@ export interface ScannerConfigResponse {
 // ============================================================
 
 export interface SwitchModeRequest {
-  mode: ScannerMode;
+  mode: LiveMode;
   confirm?: boolean;
 }
 
