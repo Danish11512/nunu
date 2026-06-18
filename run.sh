@@ -68,8 +68,8 @@ check_pip_deps() {
         echo "WARNING: backend/requirements.txt not found. Skipping pip check." >&2
         return
     fi
-    # Quick check — if uvicorn isn't installed, try to install deps
-    if ! python3 -c "import fastapi" 2>/dev/null; then
+    # Quick check — if pydantic isn't installed (Phase 1 dep), install deps
+    if ! python3 -c "import pydantic" 2>/dev/null; then
         echo "Installing backend dependencies..."
         pip3 install -r "$SCRIPT_DIR/backend/requirements.txt"
     fi
@@ -77,6 +77,12 @@ check_pip_deps() {
 
 # ─── Phase 1: Backend ────────────────────────────────────────────────────────
 start_backend() {
+    if [[ ! -f "$SCRIPT_DIR/backend/main.py" ]]; then
+        echo "INFO: backend/main.py not yet created (Phase 7)."
+        echo "      Phase 1 code can be verified with:"
+        echo "      python -c 'from backend.core.models import Market; print(\"Phase 1 OK\")'"
+        return
+    fi
     echo "Starting backend (uvicorn)..."
     cd "$SCRIPT_DIR/backend"
     python3 -m uvicorn main:app --reload --host 0.0.0.0 --port 8000 &

@@ -8,7 +8,7 @@
 ## Quick Start (start here)
 
 ```bash
-# 1. Prerequisites: Python 3.11+, bun (or npm), Docker (optional)
+# 1. Prerequisites: Python 3.11+
 
 # 2. Create directories
 bash scripts/scaffold.sh
@@ -22,14 +22,14 @@ pip install -r backend/requirements.txt
 cp backend/.env.example backend/.env
 # → Edit backend/.env with your Kalshi API credentials
 
-# 5. Install frontend deps
-cd frontend && bun install && cd ..
-
-# 6. Start development (Phase 1 = backend only)
+# 5. Start development (Phase 1 = backend only)
 ./run.sh --phase 1
 
-# 7. Follow phases below — each tells you what to build and how to verify
+# 6. Follow phases below — each tells you what to build and how to verify
 ```
+
+> **Note:** Frontend (bun/npm) and Docker are not needed yet. They will be
+> scaffolded in Phases 8 and 13 respectively.
 
 ---
 
@@ -38,8 +38,6 @@ cd frontend && bun install && cd ..
 | Tool | Version | Purpose |
 |------|---------|---------|
 | Python | 3.11+ | Backend runtime |
-| bun (or npm) | Latest | Frontend package management |
-| Docker | Latest (optional) | Containerized deployment |
 | Kalshi API keys | — | Required for live/trading modes |
 
 ## Document Map — Cross-References
@@ -135,6 +133,9 @@ Phase 1: Core (models, interfaces, state)
 
 ## Phase 0: Project Scaffolding
 
+> **Scope**: Only what Phase 1 needs. Frontend (Phases 8–11) and Docker
+> (Phase 13) will scaffold their files when those phases begin.
+
 ### Files to Create
 
 ```
@@ -143,23 +144,9 @@ backend/
   .env.example
   __init__.py
 
-frontend/
-  package.json
-  vite.config.ts
-  tsconfig.json
-  tsconfig.node.json
-  index.html
-  postcss.config.js
-  tailwind.config.js
-  src/
-    styles/
-      globals.css
-    vite-env.d.ts
-
 config/
   settings.yaml
 
-docker-compose.yml
 .gitignore
 
 scripts/
@@ -168,31 +155,28 @@ scripts/
 
 ### 0.1 — `run.sh` (project root)
 
-See the actual file at `run.sh`. It contains phase-gated startup for backend,
-frontend, and Docker. Initially runs backend only — edit `PHASE` or pass
-`--phase N` to add more services.
-
-**Phase progression:**
-- `./run.sh --phase 1` — Backend only (current, Phase 1 implementation)
-- `./run.sh --phase 2` — Backend + Frontend (Phase 2+)
-- `./run.sh --phase 3` — Docker Compose (Phase 4+)
-
-**No changes needed during implementation.** The script is pre-built to handle
-all phases. Just update `PHASE="${PHASE:-1}"` at the top of `run.sh` when
-you're ready to enable frontend.
+Already exists at project root. Phase-gated startup script — backend-only by default.
+No changes needed.
 
 ### 0.2 — `backend/requirements.txt`
 
+> **Phase-scoped**: Only Phase 1 deps listed here. Phase 2+ deps (fastapi,
+> websockets, etc.) are added to this file when those phases begin.
+
 ```
-fastapi==0.111.0
-uvicorn[standard]==0.30.1
-httpx==0.27.0
-websockets==12.0
+# Phase 1: Backend Core (models, interfaces, utils, config)
 pydantic==2.7.4
 pydantic-settings==2.3.4
-python-dotenv==1.0.1
+httpx==0.27.0
 pyyaml==6.0.1
+cryptography==42.0.8
+
+# Phase 2+: Kalshi Adapter, API, WebSocket
+fastapi==0.111.0
+uvicorn[standard]==0.30.1
+websockets==12.0
 python-dateutil==2.9.0
+python-dotenv==1.0.1
 ```
 
 ### 0.2 — `backend/.env.example`
@@ -216,50 +200,23 @@ CSV_LOG_PATH=logs/scanner.csv
 TRADE_HISTORY_PATH=logs/trades.json
 ```
 
-### 0.3 — `backend/config/settings.yaml`
+### 0.3 — `config/settings.yaml`
+
+> **Phase-scoped**: Only `kalshi`, `scanner`, `logging` sections needed for Phase 1.
+> `strategy`, `validation`, `risk` sections are added when their phases begin.
 
 ```yaml
 kalshi:
   base_url: "https://external-api.kalshi.com/trade-api/v2"
-  rate_limit: 10  # requests per second
+  rate_limit: 10              # requests per second
 
 scanner:
-  default_mode: dry_run         # dry_run | read_only | live
-  default_threshold: 60
+  default_mode: dry_run        # dry_run | read_only | live
+  default_threshold: 65        # matches settings.py default
   default_strategy: executed-volume-follower
-  discovery_poll_interval: 30   # seconds
-  progress_gate_interval: 10    # seconds
-  max_candidate_age: 30         # seconds
-
-strategy:
-  active_experiment: executed-volume-follower
-  experiments:
-    executed-volume-follower: {}
-    executed-volume-fade: {}
-    favorite-side-follower: {}
-    momentum-follower:
-      early_reference_progress: 0.40
-    liquidity-filtered-follower:
-      min_total_executed_volume: 500
-      min_trade_count: 20
-      max_spread_cents: 5
-      max_entry_price_cents: 85
-      min_entry_price_cents: 15
-      exclude_block_trades: true
-    resting-depth-follower: {}
-    hybrid-score-follower: {}
-
-validation:
-  max_price_movement_percent: 10.0
-  max_spread_width: 0.05
-  min_liquidity: 100.0
-  allow_partial_fill: true
-
-risk:
-  max_exposure_per_market: 1000.0
-  max_total_exposure: 5000.0
-  max_positions: 10
-  daily_loss_limit: 500.0
+  discovery_poll_interval: 30  # seconds
+  progress_gate_interval: 10   # seconds
+  max_candidate_age: 30        # seconds
 
 logging:
   level: INFO
@@ -267,57 +224,7 @@ logging:
   trade_history_path: "logs/trades.json"
 ```
 
-### 0.4 — `frontend/package.json`
 
-```json
-{
-  "name": "nunu-frontend",
-  "private": true,
-  "version": "0.1.0",
-  "type": "module",
-  "scripts": {
-    "dev": "vite",
-    "build": "tsc && vite build",
-    "preview": "vite preview"
-  },
-  "dependencies": {
-    "react": "^18.3.1",
-    "react-dom": "^18.3.1",
-    "react-router-dom": "^6.26.0",
-    "recharts": "^2.12.7"
-  },
-  "devDependencies": {
-    "@types/react": "^18.3.3",
-    "@types/react-dom": "^18.3.0",
-    "@vitejs/plugin-react": "^4.3.1",
-    "autoprefixer": "^10.4.19",
-    "postcss": "^8.4.39",
-    "tailwindcss": "^3.4.6",
-    "typescript": "^5.5.3",
-    "vite": "^5.4.0"
-  }
-}
-```
-
-### 0.5 — `frontend/vite.config.ts`
-
-```typescript
-import { defineConfig } from 'vite';
-import react from '@vitejs/plugin-react';
-
-export default defineConfig({
-  plugins: [react()],
-  server: {
-    port: 5173,
-    proxy: {
-      '/api': {
-        target: 'http://localhost:8000',
-        changeOrigin: true,
-      },
-    },
-  },
-});
-```
 
 ---
 
@@ -326,7 +233,7 @@ export default defineConfig({
 ### SOLID Changes
 - **SRP**: Split monolithic `models.py` into domain-specific modules (market, classification, trading)
 - **DIP**: Extract abstract `Engine` interface from concrete engines
-- **ISP**: Segregate `StrategyProfile` into `MarketSelector` + `SideSelector`
+- **ISP**: Segregated `StrategyProfile` into single-method `select_trade()` interface (per ADR-018)
 
 ### Files (in creation order)
 
@@ -335,20 +242,19 @@ backend/core/
   __init__.py
   models/
     __init__.py               # Re-exports all models
-    market.py                 # Market, Orderbook, OrderbookLevel
+    market.py                 # Market, Orderbook, OrderbookLevel, MarketOrderbookStats
     classification.py         # MarketClassification, ClassifiedEvent
-    trading.py                # OrderCandidate, TradeRecord, configs
+    trading.py                # OrderCandidate, TradeRecord, ValidationConfig, RiskConfig
   interfaces/
     __init__.py               # Re-exports all interfaces
     adapter.py                # AbstractMarketAdapter (ISP: read-only vs trading)
-    strategy.py               # IMarketSelector, ISideSelector (ISP: segregated)
+    strategy.py               # StrategyProfile with select_trade() (per ADR-018)
     engine.py                 # AbstractEngine (single-method interface)
   scanner_state.py
 
 backend/config/
   __init__.py
-  settings.py
-  defaults.py
+  settings.py                  # Pydantic models for YAML + env config
 
 backend/utils/
   __init__.py
@@ -356,14 +262,16 @@ backend/utils/
   http_utils.py               # RateLimiter, RetryHandler
   auth_utils.py               # RSA-PSS signer (extracted from client)
   poller.py                   # Generic async poller loop (used by live/ modules)
-  logging_utils.py            # Logger setup, custom log levels
 ```
+
+> **Note:** `config/defaults.py` and `utils/logging_utils.py` removed — their responsibilities
+> are covered by `config/settings.py` (pydantic defaults) and `backend/logging/log_setup.py` (Phase 6).
 
 **Verification:**
 ```bash
 cd backend && python -c "
 from backend.core.models import Market, OrderCandidate, MarketClassification
-from backend.core.interfaces import AbstractMarketAdapter, IMarketSelector, AbstractEngine
+from backend.core.interfaces import AbstractMarketAdapter, StrategyProfile, AbstractEngine
 from backend.utils.datetime_utils import parse_date, calculate_progress
 from backend.utils.http_utils import RateLimiter
 from backend.utils.auth_utils import KalshiSigner
@@ -417,7 +325,7 @@ class Orderbook:
 class MarketOrderbookStats:
     """Derived statistics from an orderbook."""
     market_id: str
-    event_id: str
+    event_ticker: str              # event_id, stored as event_ticker for consistency
     total_resting_order_quantity: float
     yes_order_quantity: float
     no_order_quantity: float
@@ -427,33 +335,7 @@ class MarketOrderbookStats:
     volume_24h: float = 0.0
     total_volume: float = 0.0
     series_ticker: Optional[str] = None
-
-@dataclass
-class OrderbookLevel:
-    """Single price level in an orderbook."""
-    price: float     # In dollars
-    size: float      # Quantity at this level
-
-@dataclass
-class Orderbook:
-    """Resting bids for YES and NO outcomes."""
-    market_id: str
-    yes_bids: list[OrderbookLevel] = field(default_factory=list)
-    no_bids: list[OrderbookLevel] = field(default_factory=list)
-
-@dataclass
-class MarketClassification:
-    """Result of same-day-live classification for one market."""
-    ticker: str
-    event_ticker: str
-    live_now: bool
-    expected_to_resolve_today: bool
-    latest_expiration_today: bool
-    same_day_live_market: bool
-    overtime_category: str = "standard"      # "standard" | "overtime_short" | "overtime_medium" | "overtime_long" | "composite"
-    overtime_window_hours: float = 0.0       # Gap between expected and latest expiration
-    progress_percent: float = 0.0            # % time elapsed between open and expected_exp
-    reasons: list[str] = field(default_factory=list)
+```
 
 ### 1.2 — `backend/core/models/classification.py`
 
@@ -656,39 +538,93 @@ class AbstractMarketAdapter(MarketReader, Trader):
     pass
 ```
 
-#### `backend/core/interfaces/strategy.py` (ISP: segregated selection)
+#### `backend/core/interfaces/strategy.py` (single `select_trade()` per ADR-018)
+
+> **ADR-018**: Single `select_trade()` replaces separate `select_market()` + `select_side()`.
+> Strategies receive all pre-computed child market features and return a complete
+> BUY_YES / BUY_NO / SKIP decision. The old split interfaces are removed.
 
 ```python
 from abc import ABC, abstractmethod
+from dataclasses import dataclass, field
 from typing import Optional
-from ..models.trading import RankedMarket
-from ..models.market import MarketOrderbookStats
+from datetime import datetime
 
 
-class IMarketSelector(ABC):
-    """Single-responsibility: pick the best market from ranked list."""
+@dataclass
+class MarketFeatures:
+    """Pre-computed features for a single child market, passed to strategies."""
+    market_ticker: str
+    market_title: str
+    result: Optional[str] = None
+    status: str = ""
+    total_executed_volume: float = 0.0
+    yes_executed_volume: float = 0.0
+    no_executed_volume: float = 0.0
+    trade_count: int = 0
+    yes_price: float = 0.0
+    no_price: float = 0.0
+    yes_best_bid: Optional[float] = None
+    no_best_bid: Optional[float] = None
+    yes_total_depth: Optional[float] = None
+    no_total_depth: Optional[float] = None
+    spread: Optional[float] = None
+    yes_price_momentum: Optional[float] = None
+    open_interest: Optional[float] = None
+
+
+@dataclass
+class EventFeatures:
+    """All child markets for an event, pre-computed for strategy decision."""
+    event_ticker: str
+    event_title: str = ""
+    category: str = ""
+    event_progress: float = 0.0
+    threshold: float = 0.0
+    entry_time: Optional[datetime] = None
+    child_markets: list[MarketFeatures] = field(default_factory=list)
+
+
+@dataclass
+class TradeDecision:
+    """Result of a strategy's select_trade() call."""
+    event_ticker: str = ""
+    market_ticker: str = ""
+    selected_side: str = ""         # "YES" | "NO"
+    trade_decision: str = "SKIP"    # "BUY_YES" | "BUY_NO" | "SKIP"
+    skip_reason: Optional[str] = None
+    entry_price_cents: Optional[float] = None
+    entry_threshold: Optional[float] = None
+    event_progress_at_entry: Optional[float] = None
+    side_signal_strength: Optional[float] = None
+    market_signal_strength: Optional[float] = None
+    selected_market_reason: Optional[str] = None
+    selected_side_reason: Optional[str] = None
+    experiment_id: Optional[str] = None
+    estimated_fee_cents: float = 1.0
+    max_acceptable_price_cents: float = 85.0
+
+
+class StrategyProfile(ABC):
+    """Single-method interface for market/side selection strategies.
     
-    @abstractmethod
-    def select_market(self, ranked_markets: list[RankedMarket]) -> Optional[RankedMarket]:
-        ...
-
-
-class ISideSelector(ABC):
-    """Single-responsibility: pick YES/NO for a given market."""
-    
-    @abstractmethod
-    def select_side(self, market: RankedMarket, stats: MarketOrderbookStats) -> str:
-        ...
-
-
-class StrategyProfile(IMarketSelector, ISideSelector):
-    """Combined strategy (extends both interfaces for convenience)."""
+    All 7 experiments (Phase 4) implement this interface.
+    Engines E6 and E7 depend on this, not on concrete strategy classes.
+    """
     name: str = ""
     description: str = ""
     config: dict = {}
 
     def __init__(self, config: dict = None):
         self.config = config or {}
+
+    @abstractmethod
+    def select_trade(self, event_features: EventFeatures) -> TradeDecision:
+        """
+        Given all pre-computed child market features for an event,
+        return a trade decision (BUY_YES / BUY_NO / SKIP).
+        """
+        ...
 ```
 
 #### `backend/core/interfaces/engine.py` (OCP: new engines via implementation)
@@ -716,7 +652,7 @@ class AbstractEngine(ABC):
 
 ```python
 from .adapter import AbstractMarketAdapter, MarketReader, Trader
-from .strategy import StrategyProfile, IMarketSelector, ISideSelector
+from .strategy import StrategyProfile, EventFeatures, MarketFeatures, TradeDecision
 from .engine import AbstractEngine
 ```
 
@@ -939,11 +875,7 @@ class AsyncPoller:
 
 #### `backend/config/settings.py`
 
-(Content unchanged — pydantic-settings loader.)
-
-#### `backend/config/defaults.py`
-
-(Content unchanged — default config values.)
+(Content unchanged — pydantic-settings loader. See full listing below.)
 
 ### 1.3 — `backend/core/scanner_state.py`
 
@@ -1025,9 +957,15 @@ class LoggingConfig(BaseModel):
     csv_path: str = "logs/scanner.csv"
     trade_history_path: str = "logs/trades.json"
 
+class StrategyConfig(BaseModel):
+    """Strategy experiment config — used by TradingBot in Phase 4+."""
+    active_experiment: str = "executed-volume-follower"
+    experiments: dict = {}
+
 class Settings(BaseSettings):
     kalshi: KalshiConfig = KalshiConfig()
     scanner: ScannerConfig = ScannerConfig()
+    strategy: StrategyConfig = StrategyConfig()
     validation: ValidationConfig = ValidationConfig()
     risk: RiskConfig = RiskConfig()
     logging: LoggingConfig = LoggingConfig()
@@ -1050,6 +988,8 @@ def load_settings(config_path: str = "config/settings.yaml") -> Settings:
             settings.kalshi = KalshiConfig(**yaml_config["kalshi"])
         if "scanner" in yaml_config:
             settings.scanner = ScannerConfig(**yaml_config["scanner"])
+        if "strategy" in yaml_config:
+            settings.strategy = StrategyConfig(**yaml_config["strategy"])
         if "validation" in yaml_config:
             settings.validation = ValidationConfig(**yaml_config["validation"])
         if "risk" in yaml_config:
@@ -1238,6 +1178,8 @@ import asyncio
 import json
 import logging
 from typing import Optional
+
+import httpx
 
 from .auth import KalshiSigner
 from .http_client import KalshiHttpClient
@@ -1553,8 +1495,12 @@ backend/engines/live/                     # Live update modules (use utils/polle
 ### 3.1 — `backend/engines/engine1_discovery.py`
 
 ```python
+import logging
+
 from backend.adapters.kalshi.adapter import KalshiAdapter
 from backend.core.models import Market
+
+logger = logging.getLogger(__name__)
 
 async def fetch_all_open_markets(adapter: KalshiAdapter) -> list[Market]:
     """
@@ -1908,6 +1854,10 @@ def rank_all_events(
 
 ### 3.6 — `backend/engines/engine6_progress_gate.py`
 
+> **Updated per ADR-018**: Uses `strategy.select_trade(event_features)` instead of
+> separate `select_market()` + `select_side()`. Builds `EventFeatures` from ranked
+> event data and passes it to the strategy for a holistic decision.
+
 ```python
 from datetime import datetime
 from zoneinfo import ZoneInfo
@@ -1916,7 +1866,7 @@ from backend.core.models import (
     EventWithTopMarkets, Market, ProgressBasedOrderCandidate,
     MarketOrderbookStats,
 )
-from backend.core.interfaces import StrategyProfile
+from backend.core.interfaces import StrategyProfile, EventFeatures, MarketFeatures, TradeDecision
 from backend.engines.engine2_classification import classify_market, parse_date
 
 ET = ZoneInfo("America/New_York")
@@ -1949,6 +1899,45 @@ def calculate_progress(market: Market, now: datetime) -> float:
     
     return max(0.0, min(100.0, (elapsed_ms / total_ms) * 100))
 
+
+def _build_event_features(
+    event: EventWithTopMarkets,
+    threshold_percent: int,
+    now: datetime,
+) -> EventFeatures:
+    """Build EventFeatures from a ranked event for strategy consumption."""
+    child_markets = []
+    for rm in event.all_same_day_live_markets_ranked:
+        mf = MarketFeatures(
+            market_ticker=rm.market.ticker,
+            market_title=rm.market.title,
+            status=rm.market.status,
+            total_executed_volume=0.0,  # Populated from trade data if available
+            yes_executed_volume=0.0,
+            no_executed_volume=0.0,
+            yes_price=float(rm.market.yes_bid or 0),
+            no_price=float(rm.market.no_bid or 0),
+            yes_best_bid=rm.orderbook_stats.best_yes_bid,
+            no_best_bid=rm.orderbook_stats.best_no_bid,
+            yes_total_depth=rm.orderbook_stats.yes_order_quantity,
+            no_total_depth=rm.orderbook_stats.no_order_quantity,
+            spread=(
+                (rm.orderbook_stats.best_yes_bid or 0) - (rm.orderbook_stats.best_no_bid or 0)
+                if rm.orderbook_stats.best_yes_bid and rm.orderbook_stats.best_no_bid
+                else None
+            ),
+        )
+        child_markets.append(mf)
+    
+    return EventFeatures(
+        event_ticker=event.event_ticker,
+        event_progress=0.0,  # Calculated per-market below
+        threshold=threshold_percent,
+        entry_time=now,
+        child_markets=child_markets,
+    )
+
+
 def create_candidate(
     event: EventWithTopMarkets,
     strategy: StrategyProfile,
@@ -1958,52 +1947,63 @@ def create_candidate(
     """
     Engine 6: Create order candidate if event passes threshold.
     
-    1. Strategy selects market from ranked list
-    2. Calculate event progress
-    3. Re-classify market as same-day-live
-    4. Strategy selects side (YES/NO)
-    5. Return candidate with creation decision
+    1. Build EventFeatures from ranked event markets
+    2. Call strategy.select_trade() for holistic decision
+    3. Map TradeDecision back to ProgressBasedOrderCandidate
     """
     if now is None:
         now = datetime.now(ET)
     
     reasons: list[str] = []
     
-    selected = strategy.select_market(event.all_same_day_live_markets_ranked)
-    if not selected:
+    event_features = _build_event_features(event, threshold_percent, now)
+    decision = strategy.select_trade(event_features)
+    
+    if decision.trade_decision == "SKIP":
         return ProgressBasedOrderCandidate(
             event_ticker=event.event_ticker,
             threshold_percent=threshold_percent,
             event_progress_percent=0,
             event_passes_progress_threshold=False,
             should_create_order_candidate=False,
-            reasons=["No market selected by strategy."],
+            reasons=[decision.skip_reason or "Strategy returned SKIP."],
         )
     
-    market = selected.market
-    stats = selected.orderbook_stats
+    # Find the selected market in ranked list to get stats
+    selected_market = None
+    selected_stats = None
+    for rm in event.all_same_day_live_markets_ranked:
+        if rm.market.ticker == decision.market_ticker:
+            selected_market = rm.market
+            selected_stats = rm.orderbook_stats
+            break
     
-    progress = calculate_progress(market, now)
+    if not selected_market or not selected_stats:
+        return ProgressBasedOrderCandidate(
+            event_ticker=event.event_ticker,
+            threshold_percent=threshold_percent,
+            event_progress_percent=0,
+            event_passes_progress_threshold=False,
+            should_create_order_candidate=False,
+            reasons=[f"Selected market {decision.market_ticker} not in ranked list."],
+        )
+    
+    progress = calculate_progress(selected_market, now)
     passes = progress >= threshold_percent
     
     if not passes:
         reasons.append(f"Progress {progress:.1f}% < threshold {threshold_percent}%.")
     
-    classification = classify_market(market, now)
+    classification = classify_market(selected_market, now)
     still_live = classification.same_day_live_market
     if not still_live:
         reasons.append("Market no longer same-day live.")
     
-    has_orders = stats.total_resting_order_quantity > 0
+    has_orders = selected_stats.total_resting_order_quantity > 0
     if not has_orders:
         reasons.append("Market has zero resting order quantity.")
     
-    side = strategy.select_side(selected, stats)
-    if side == "tie":
-        reasons.append("YES/NO tied.")
-    elif side == "none":
-        reasons.append("No order activity.")
-    
+    side = decision.selected_side.lower() if decision.selected_side else "none"
     should_create = passes and still_live and has_orders and side in ("yes", "no")
     
     return ProgressBasedOrderCandidate(
@@ -2011,16 +2011,17 @@ def create_candidate(
         threshold_percent=threshold_percent,
         event_progress_percent=progress,
         event_passes_progress_threshold=passes,
-        selected_market=market,
-        selected_market_stats=stats,
+        selected_market=selected_market,
+        selected_market_stats=selected_stats,
         most_bet_side=side,
-        yes_order_quantity=stats.yes_order_quantity,
-        no_order_quantity=stats.no_order_quantity,
-        total_resting_order_quantity=stats.total_resting_order_quantity,
+        yes_order_quantity=selected_stats.yes_order_quantity,
+        no_order_quantity=selected_stats.no_order_quantity,
+        total_resting_order_quantity=selected_stats.total_resting_order_quantity,
         should_create_order_candidate=should_create,
-        requires_manual_review=(side == "tie"),
+        requires_manual_review=False,
         reasons=reasons,
     )
+
 
 def process_all_events(
     events: list[EventWithTopMarkets],
@@ -2048,6 +2049,9 @@ def process_all_events(
 
 ### 3.7 — `backend/engines/engine7_validation.py`
 
+> **Updated per ADR-018**: Uses `strategy.select_trade()` via rebuilt `EventFeatures`
+> to recalculate side, instead of the removed `select_side()` method.
+
 ```python
 import time
 from datetime import datetime
@@ -2056,12 +2060,14 @@ from typing import Optional
 from backend.adapters.kalshi.adapter import KalshiAdapter
 from backend.core.models import (
     ProgressBasedOrderCandidate, ValidatedOrderCandidate, ValidationConfig,
+    Market, MarketOrderbookStats, EventWithTopMarkets,
 )
-from backend.core.interfaces import StrategyProfile
+from backend.core.interfaces import StrategyProfile, EventFeatures, MarketFeatures
 from backend.engines.engine2_classification import classify_market
 from backend.adapters.kalshi.types import calculate_orderbook_stats
 
 ET = ZoneInfo("America/New_York")
+
 
 async def validate_candidate(
     candidate: ProgressBasedOrderCandidate,
@@ -2078,7 +2084,7 @@ async def validate_candidate(
     2. Re-classify same-day-live
     3. Re-fetch orderbook
     4. Recalculate stats
-    5. Recalculate side
+    5. Recalculate side via strategy.select_trade()
     6. Check price movement
     7. Check liquidity
     
@@ -2125,10 +2131,33 @@ async def validate_candidate(
     orderbook = await adapter.get_orderbook(ticker)
     stats = calculate_orderbook_stats(market, orderbook)
     
-    # Recalculate side
-    from backend.engines.engine5_ranking import RankedMarket
-    ranked = RankedMarket(market=market, classification=classification, orderbook_stats=stats)
-    current_side = strategy.select_side(ranked, stats)
+    # Recalculate side via strategy.select_trade()
+    event_features = EventFeatures(
+        event_ticker=candidate.event_ticker,
+        event_progress=candidate.event_progress_percent,
+        threshold=candidate.threshold_percent,
+        entry_time=now,
+        child_markets=[
+            MarketFeatures(
+                market_ticker=market.ticker,
+                market_title=market.title,
+                status=market.status,
+                yes_price=float(market.yes_bid or 0),
+                no_price=float(market.no_bid or 0),
+                yes_best_bid=stats.best_yes_bid,
+                no_best_bid=stats.best_no_bid,
+                yes_total_depth=stats.yes_order_quantity,
+                no_total_depth=stats.no_order_quantity,
+                spread=(
+                    (stats.best_yes_bid or 0) - (stats.best_no_bid or 0)
+                    if stats.best_yes_bid and stats.best_no_bid
+                    else None
+                ),
+            ),
+        ],
+    )
+    current_decision = strategy.select_trade(event_features)
+    current_side = current_decision.selected_side.lower() if current_decision.selected_side else "none"
     
     if current_side != candidate.most_bet_side:
         return ValidatedOrderCandidate(
@@ -2365,11 +2394,13 @@ def rerank_event(event: ClassifiedEvent, orderbooks: dict[str, Orderbook]) -> Ev
 # Periodically re-runs Engine 6 for all ranked events
 
 import asyncio
+import logging
 from datetime import datetime
 from zoneinfo import ZoneInfo
 from backend.core.interfaces import StrategyProfile
 from backend.engines.engine6_progress_gate import create_candidate
 
+logger = logging.getLogger(__name__)
 ET = ZoneInfo("America/New_York")
 
 class ProgressGateLoop:
@@ -2442,71 +2473,27 @@ print(f'Default experiment: {exp.name} — {exp.description}')
 
 ### 4.1 — `backend/strategies/base.py`
 
+> `StrategyExperiment` extends `StrategyProfile` from `core/interfaces/strategy.py`.
+> Data classes (`MarketFeatures`, `EventFeatures`, `TradeDecision`) are defined in
+> `interfaces/strategy.py` and imported here to avoid duplication.
+
 ```python
-from abc import ABC, abstractmethod
-from typing import Optional
-from dataclasses import dataclass, field
-from datetime import datetime
+from backend.core.interfaces.strategy import (
+    StrategyProfile, MarketFeatures, EventFeatures, TradeDecision,
+)
 
-@dataclass
-class MarketFeatures:
-    market_ticker: str
-    market_title: str
-    result: Optional[str] = None
-    status: str = ""
-    total_executed_volume: float = 0.0
-    yes_executed_volume: float = 0.0
-    no_executed_volume: float = 0.0
-    trade_count: int = 0
-    yes_price: float = 0.0
-    no_price: float = 0.0
-    yes_best_bid: Optional[float] = None
-    no_best_bid: Optional[float] = None
-    yes_total_depth: Optional[float] = None
-    no_total_depth: Optional[float] = None
-    spread: Optional[float] = None
-    yes_price_momentum: Optional[float] = None
-    open_interest: Optional[float] = None
 
-@dataclass
-class EventFeatures:
-    event_ticker: str
-    event_title: str = ""
-    category: str = ""
-    event_progress: float = 0.0
-    threshold: float = 0.0
-    entry_time: Optional[datetime] = None
-    child_markets: list = field(default_factory=list)
-
-@dataclass
-class TradeDecision:
-    event_ticker: str = ""
-    market_ticker: str = ""
-    selected_side: str = ""
-    trade_decision: str = "SKIP"
-    skip_reason: Optional[str] = None
-    entry_price_cents: Optional[float] = None
-    entry_threshold: Optional[float] = None
-    event_progress_at_entry: Optional[float] = None
-    side_signal_strength: Optional[float] = None
-    market_signal_strength: Optional[float] = None
-    selected_market_reason: Optional[str] = None
-    selected_side_reason: Optional[str] = None
-    experiment_id: Optional[str] = None
-    estimated_fee_cents: float = 1.0
-    max_acceptable_price_cents: float = 85.0
-
-class StrategyExperiment(ABC):
-    name: str = ""
-    description: str = ""
-    config: dict = {}
-
-    def __init__(self, config: dict = None):
-        self.config = config or {}
-
-    @abstractmethod
-    def select_trade(self, event_features: EventFeatures) -> TradeDecision:
-        ...
+class StrategyExperiment(StrategyProfile):
+    """
+    Base class for all 7 strategy experiments.
+    
+    Extends StrategyProfile from core/interfaces, which defines:
+    - name, description, config fields
+    - abstract select_trade(event_features) -> TradeDecision
+    
+    Each experiment overrides select_trade() with its specific logic.
+    """
+    pass
 ```
 
 ### 4.2 — `backend/strategies/executed_volume_follower.py`
@@ -2690,7 +2677,7 @@ class HybridScoreFollower(StrategyExperiment):
 ### 4.9 — `backend/strategies/__init__.py`
 
 ```python
-from .base import StrategyExperiment, EventFeatures, MarketFeatures, TradeDecision
+from backend.core.interfaces import StrategyProfile, EventFeatures, MarketFeatures, TradeDecision
 from .executed_volume_follower import ExecutedVolumeFollower
 from .executed_volume_fade import ExecutedVolumeFade
 from .favorite_side_follower import FavoriteSideFollower
@@ -2699,7 +2686,7 @@ from .liquidity_filtered_follower import LiquidityFilteredFollower
 from .resting_depth_follower import RestingDepthFollower
 from .hybrid_score_follower import HybridScoreFollower
 
-EXPERIMENT_REGISTRY: dict[str, type[StrategyExperiment]] = {
+EXPERIMENT_REGISTRY: dict[str, type[StrategyProfile]] = {
     "executed-volume-follower": ExecutedVolumeFollower,
     "executed-volume-fade": ExecutedVolumeFade,
     "favorite-side-follower": FavoriteSideFollower,
@@ -2709,7 +2696,7 @@ EXPERIMENT_REGISTRY: dict[str, type[StrategyExperiment]] = {
     "hybrid-score-follower": HybridScoreFollower,
 }
 
-def get_experiment(name: str, config: dict = None) -> StrategyExperiment:
+def get_experiment(name: str, config: dict = None) -> StrategyProfile:
     if name not in EXPERIMENT_REGISTRY:
         raise ValueError(f"Unknown experiment: {name}. Available: {list(EXPERIMENT_REGISTRY.keys())}")
     return EXPERIMENT_REGISTRY[name](config or {})
@@ -3683,7 +3670,7 @@ from backend.config.settings import load_settings, Settings
 from backend.adapters.kalshi.client import KalshiClient
 from backend.adapters.kalshi.adapter import KalshiAdapter
 from backend.core.scanner_state import ScannerState
-from backend.strategies import get_experiment, StrategyExperiment
+from backend.strategies import get_experiment
 from backend.trading.portfolio import Portfolio
 from backend.trading.execution_engine import ExecutionEngine, ExecutionConfig
 from backend.logging.log_setup import setup_logging
@@ -3736,12 +3723,9 @@ class TradingBot:
         # 2. Adapter
         self.kalshi_adapter = KalshiAdapter(self.kalshi_client)
 
-        # 3. Experiment
+        # 3. Strategy experiment
         active = self.settings.strategy.active_experiment
-        self.experiment = get_experiment(
-            active,
-            self.settings.strategy.experiments.get(active, {}),
-        )
+        self.strategy = get_experiment(active, self.settings.strategy.experiments.get(active, {}))
 
         # 4. Portfolio
         initial_balance = 10000.0 if self.mode == "dry_run" else 0.0
@@ -4811,11 +4795,10 @@ Step 11: backend/utils/http_utils.py                # No deps (stdlib + httpx)
 Step 12: backend/utils/auth_utils.py                # No deps (cryptography)
 Step 13: backend/utils/poller.py                    # No deps (stdlib asyncio)
 Step 14: backend/utils/__init__.py                  # Package marker
-Step 15: backend/config/settings.py                 # No deps
-Step 16: backend/config/defaults.py                 # Depends on settings.py
+Step 15: backend/config/settings.py                 # No deps (pydantic-settings loader)
 
 # ─── Phase 2: Kalshi Adapter (SRP: auth/http/client split) ────────────
-Step 17: backend/adapters/kalshi/auth.py            # No deps (RSA-PSS signing)
+Step 16: backend/adapters/kalshi/auth.py            # No deps (RSA-PSS signing)
 Step 18: backend/adapters/kalshi/http_client.py     # No deps (HTTP transport)
 Step 19: backend/adapters/kalshi/types.py           # Depends on core/models/
 Step 20: backend/adapters/kalshi/client.py          # Depends on auth.py, http_client.py
@@ -4835,37 +4818,38 @@ Step 31: backend/engines/live/discovery_poller.py   # Depends on utils/poller.py
 Step 32: backend/engines/live/event_reranker.py     # Depends on E5
 Step 33: backend/engines/live/progress_gate_loop.py # Depends on utils/poller.py
 
-# ─── Phase 4: Strategies (implement ISideSelector + IMarketSelector) ───
-Step 34: backend/strategies/base.py                 # Depends on core/interfaces/
-Step 35: backend/strategies/most_bet.py             # Depends on base.py
-Step 36: backend/strategies/highest_volume.py       # Depends on base.py
-Step 37: backend/strategies/widest_spread.py        # Depends on base.py
-Step 38: backend/strategies/deepest_book.py         # Depends on base.py
-Step 39: backend/strategies/momentum_shift.py       # Depends on base.py
-Step 40: backend/strategies/custom_threshold.py     # Depends on most_bet.py
-Step 41: backend/strategies/__init__.py             # Depends on all strategies
+# ─── Phase 4: Strategies (7 experiments, single select_trade() per ADR-018) ──
+Step 34: backend/strategies/base.py                              # Depends on core/interfaces/
+Step 35: backend/strategies/executed_volume_follower.py          # Depends on base.py
+Step 36: backend/strategies/executed_volume_fade.py              # Depends on base.py
+Step 37: backend/strategies/favorite_side_follower.py            # Depends on base.py
+Step 38: backend/strategies/momentum_follower.py                 # Depends on base.py
+Step 39: backend/strategies/liquidity_filtered_follower.py       # Depends on base.py
+Step 40: backend/strategies/resting_depth_follower.py            # Depends on base.py
+Step 41: backend/strategies/hybrid_score_follower.py             # Depends on base.py
+Step 42: backend/strategies/__init__.py                          # Depends on all experiments
 
-# ─── Phase 5: Trading + Logging + Portfolio ────────────────────────────
-Step 42: backend/trading/portfolio.py               # No deps (core dataclasses)
-Step 43: backend/trading/execution_engine.py        # Depends on portfolio, adapter, E7
-Step 44: backend/trading/trade_executor.py          # Thin facade over execution_engine
-Step 45: backend/logging/log_setup.py               # No deps (stdlib logging)
-Step 46: backend/logging/csv_logger.py              # Depends on models
+# ─── Phase 5: Backtesting Infrastructure ────────────────────────────────
+Step 43: backend/strategies/backtesting/__init__.py
+Step 44: backend/strategies/backtesting/feature_builder.py     # Depends on base.py
+Step 45: backend/strategies/backtesting/entry_simulator.py     # Depends on base.py
+Step 46: backend/strategies/backtesting/exit_simulator.py      # Depends on base.py
+Step 47: backend/strategies/backtesting/metrics.py             # Depends on base.py
+Step 48: backend/strategies/backtesting/backtest_engine.py     # Depends on all above
 
-# ─── Phase 6: API Layer (DRY: shared errors.py) ────────────────────────
-Step 47: backend/api/errors.py                      # No deps
-Step 48: backend/api/rest.py                        # Depends on everything above
-Step 49: backend/main.py                            # Depends on everything above
+# ─── Phase 6: Trading + Logging + Portfolio ────────────────────────────
+Step 49: backend/trading/portfolio.py               # No deps (core dataclasses)
+Step 50: backend/trading/execution_engine.py        # Depends on portfolio, adapter, E7
+Step 51: backend/trading/trade_executor.py          # Thin facade over execution_engine
+Step 52: backend/logging/log_setup.py               # No deps (stdlib logging)
+Step 53: backend/logging/csv_logger.py              # Depends on models
 
-# ─── Phase 7-10: Frontend ──────────────────────────────────────────────
-Step 50: frontend/src/lib/types.ts                  # No deps (mirrors API contract)
-Step 51: frontend/src/lib/api.ts                    # Depends on types.ts
-Step 52: frontend/src/hooks/useWebSocket.ts         # No deps
-Step 53: frontend/src/hooks/useScanner.ts           # Depends on api.ts
-Step 54: frontend/src/hooks/useCandidates.ts        # Depends on api.ts
-Step 55: frontend/src/App.tsx                       # Depends on all pages
-Step 56-61: frontend/src/pages/*.tsx                # Depends on hooks, api
-Step 62-71: frontend/src/components/**/*.tsx        # Depends on types
+# ─── Phase 7: API Layer (DRY: shared errors.py) ────────────────────────
+Step 54: backend/api/errors.py                      # No deps
+Step 55: backend/api/rest.py                        # Depends on everything above
+Step 56: backend/main.py                            # Depends on everything above
+
+# ─── Phase 8+: Frontend — scaffolded when those phases begin ──────────
 ```
 
 ---
@@ -4876,10 +4860,10 @@ Step 62-71: frontend/src/components/**/*.tsx        # Depends on types
 #!/bin/bash
 # scripts/scaffold.sh — Create all directories
 
-# SOLID: Separate dirs for models/, interfaces/, utils/ (was flat core/)
 mkdir -p backend/{config,core/{models,interfaces},utils,adapters/kalshi,engines/live,strategies,trading,logging,api}
-mkdir -p frontend/src/{lib,hooks,pages,components/{Dashboard,Orderbook,Candidates,Trading,Controls,Common},styles}
-mkdir -p config tests logs scripts
+mkdir -p config tests scripts
+
+# Note: frontend/ and logs/ scaffolded in Phases 8 and 6 respectively
 
 # Core package (models/, interfaces/, utils/ each have __init__.py below)
 touch backend/__init__.py
@@ -4900,5 +4884,5 @@ touch tests/__init__.py
 
 echo "Scaffold complete. Directories created:"
 find backend -type d | sort
-find frontend -type d | sort
+find config tests -type d 2>/dev/null | sort
 ```

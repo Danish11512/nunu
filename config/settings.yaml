@@ -1,0 +1,19 @@
+# Phase 1+ config — only what settings.py and Phase 1 code actually uses
+# Phase 4+ sections (strategy experiments, validation, risk) added when those phases begin
+
+kalshi:
+  base_url: "https://external-api.kalshi.com/trade-api/v2"
+  rate_limit: 10              # requests per second
+
+scanner:
+  default_mode: dry_run        # dry_run | read_only | live
+  default_threshold: 65        # matches settings.py default
+  default_strategy: executed-volume-follower
+  discovery_poll_interval: 30  # seconds
+  progress_gate_interval: 10   # seconds
+  max_candidate_age: 30        # seconds
+
+logging:
+  level: INFO
+  csv_path: "logs/scanner.csv"
+  trade_history_path: "logs/trades.json"
