@@ -784,7 +784,7 @@ graph TB
         subgraph Storage["Persistent Storage"]
             LOGS["logs/<br/>scanner.csv + trades.json"]
             CONFIG_FILES["config/<br/>settings.yaml"]
-            ENV["backend/.env<br/>API keys"]
+            ENV[".env<br/>API keys"]
         end
     end
     

@@ -1,10 +1,12 @@
 import { useState, useCallback } from 'react';
+import { useNavigate } from 'react-router-dom';
 import { useEvents } from '../hooks/useEvents';
 import { useWebSocket } from '../hooks/useWebSocket';
 import { useWSStore } from '../stores/wsStore';
 import { useScannerConfig } from '../hooks/useScannerConfig';
 import ProgressBar from '../components/ProgressBar';
 import Badge from '../components/Badge';
+import { ROUTES } from '../lib/routes';
 import type { EventSummary } from '../lib/types';
 
 function EventCard({ event }: { event: EventSummary }) {
@@ -44,6 +46,7 @@ function EventCard({ event }: { event: EventSummary }) {
 }
 
 export default function Dashboard() {
+  const navigate = useNavigate();
   const [events, setEvents] = useState<EventSummary[]>([]);
   const wsConnected = useWSStore((s) => s.connectedChannels.events ?? false);
 
@@ -81,7 +84,7 @@ export default function Dashboard() {
             {wsConnected ? 'Connected' : 'Disconnected'}
           </span>
           <span className="text-gray-400">Mode: <span className="text-blue-300">{currentMode}</span></span>
-          <a href="/settings" className="text-blue-400 hover:text-blue-300 underline">Settings</a>
+          <button onClick={() => navigate(ROUTES.SETTINGS)} className="text-blue-400 hover:text-blue-300 underline bg-transparent border-none cursor-pointer">Settings</button>
         </div>
       </header>
 

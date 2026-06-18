@@ -5,8 +5,14 @@ from pathlib import Path
 from typing import Any
 
 import yaml
+from dotenv import load_dotenv
 from pydantic import Field
 from pydantic_settings import BaseSettings
+
+# Load .env from project root (where this file is at backend/config/)
+_ENV_PATH = Path(__file__).resolve().parent.parent.parent / ".env"
+if _ENV_PATH.exists():
+    load_dotenv(_ENV_PATH)
 
 
 # YAML → model field name translation for keys that differ.
@@ -203,10 +209,22 @@ def load_settings(config_path: str | None = None) -> Settings:
 
         def _filter_known(section: str, model: type[BaseSettings],
                           data: dict[str, Any]) -> dict[str, Any]:
-            """Translate YAML keys and keep only fields the model recognises."""
+            """Translate YAML keys and keep only fields the model recognises.
+
+            Returns kwargs keyed by the field's *alias* (not python name) so
+            that ``pydantic-settings`` doesn't see a conflict between an env
+            var (resolved by the alias) and a positional kwarg (resolved by
+            the python name).
+            """
             known = set(model.model_fields)
             translated = _translate_yaml_section(section, data)
-            return {k: v for k, v in translated.items() if k in known}
+            filtered = {k: v for k, v in translated.items() if k in known}
+            # Map python names → alias names when an alias is defined
+            out: dict[str, Any] = {}
+            for k, v in filtered.items():
+                field = model.model_fields[k]
+                out[field.alias if field.alias else k] = v
+            return out
 
         # Map YAML sections to settings (with key translation + unknown filtering)
         if "kalshi" in yaml_config:

@@ -1,10 +1,13 @@
 import { useState } from 'react';
+import { useNavigate } from 'react-router-dom';
 import { useScannerConfig } from '../hooks/useScannerConfig';
 import { ScannerMode } from '../lib/types';
+import { ROUTES } from '../lib/routes';
 import ModeSelector from '../components/ModeSelector';
 import ThresholdSlider from '../components/ThresholdSlider';
 
 export default function Settings() {
+  const navigate = useNavigate();
   const { config, updateConfig, switchMode } = useScannerConfig();
   const [threshold, setThreshold] = useState<number | null>(null);
   const [selectedStrategy, setSelectedStrategy] = useState<string | null>(null);
@@ -26,7 +29,7 @@ export default function Settings() {
     <div className="min-h-screen bg-gray-900 text-gray-100">
       <header className="bg-gray-800 border-b border-gray-700 px-6 py-3 flex items-center justify-between">
         <div className="flex items-center gap-4">
-          <a href="/" className="text-blue-400 hover:text-blue-300">&larr; Dashboard</a>
+          <button onClick={() => navigate(ROUTES.DASHBOARD)} className="text-blue-400 hover:text-blue-300 bg-transparent border-none cursor-pointer">&larr; Dashboard</button>
           <h1 className="text-xl font-bold">Settings</h1>
         </div>
       </header>

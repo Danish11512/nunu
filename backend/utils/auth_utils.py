@@ -8,6 +8,30 @@ from cryptography.hazmat.primitives.asymmetric import padding, rsa
 from cryptography.hazmat.primitives.asymmetric.rsa import RSAPrivateKey
 
 
+def _normalise_pem(pem: str) -> str:
+    """Reformat single-line PEM to standard 64-char line breaks.
+
+    ``cryptography``'s ``load_pem_private_key`` requires line breaks every
+    64 characters.  Environment variables often store the PEM as a single
+    line, so this helper inserts newlines when the body lacks them.
+    """
+    if "-----BEGIN" not in pem or "-----END" not in pem:
+        return pem
+    header_end = pem.index("-----END")
+    before_end = pem[:header_end]
+    if "\n" not in before_end.strip("-----BEGIN ") and len(pem) > 150:
+        b64 = (
+            pem.replace("-----BEGIN RSA PRIVATE KEY-----", "")
+            .replace("-----END RSA PRIVATE KEY-----", "")
+            .strip()
+        )
+        fixed = "-----BEGIN RSA PRIVATE KEY-----\n"
+        fixed += "\n".join(b64[i : i + 64] for i in range(0, len(b64), 64))
+        fixed += "\n-----END RSA PRIVATE KEY-----"
+        return fixed
+    return pem
+
+
 class KalshiSigner:
     """RSA-PSS signer for Kalshi API authentication.
 
@@ -20,9 +44,14 @@ class KalshiSigner:
         Args:
             private_key_pem: PEM-encoded private key string or bytes.
                 Can include or exclude the PEM header/footer.
+                Single-line PEM (all base64 on one line without newlines)
+                is automatically reformatted to 64-char lines.
         """
         if isinstance(private_key_pem, str):
             private_key_pem = private_key_pem.encode("utf-8")
+
+        decoded = private_key_pem.decode("utf-8")
+        private_key_pem = _normalise_pem(decoded).encode("utf-8")
 
         self._private_key: RSAPrivateKey = serialization.load_pem_private_key(
             private_key_pem,

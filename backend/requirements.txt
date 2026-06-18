@@ -7,3 +7,4 @@ cryptography==42.0.8
 
 # Phase 2+: Kalshi Adapter, API, WebSocket
 websockets==12.0
+python-dotenv>=1.0.0

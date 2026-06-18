@@ -8,6 +8,8 @@ from typing import Optional
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding
 
+from backend.utils.auth_utils import _normalise_pem
+
 logger = logging.getLogger(__name__)
 
 
@@ -44,10 +46,11 @@ class KalshiSigner:
         timestamp = str(int(time.time() * 1000))
         message = timestamp + method.upper() + path + body
 
+        normalised = _normalise_pem(self.private_key_pem)
         key_bytes = (
-            self.private_key_pem.encode("utf-8")
-            if isinstance(self.private_key_pem, str)
-            else self.private_key_pem
+            normalised.encode("utf-8")
+            if isinstance(normalised, str)
+            else normalised
         )
         private_key = serialization.load_pem_private_key(key_bytes, password=None)
         signature = private_key.sign(

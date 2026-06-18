@@ -19,8 +19,8 @@ source venv/bin/activate
 pip install -r backend/requirements.txt
 
 # 4. Configure environment
-cp backend/.env.example backend/.env
-# → Edit backend/.env with your Kalshi API credentials
+cp .env.example .env
+# → Edit .env with your Kalshi API credentials
 
 # 5. Start development (backend + frontend)
 ./run.sh
@@ -38,6 +38,20 @@ cp backend/.env.example backend/.env
 >   - Backend websocket_handler DRYed with shared `_ping_loop` + `pong` replies
 > Phase 11 (Test Infrastructure) — **not yet implemented**.
 > Phase 12 (Docker + Integration) — **not yet implemented**.
+>
+> **Pipeline bugfix — Kalshi API V2 field name alignment (2026-06-19):**
+> `parse_market()` in `backend/adapters/kalshi/types.py` was using V1 API field names
+> (`create_date`, `close_date`, `yes_ask`, `volume`) which don't exist in the V2 API.
+> Fixed to use V2 equivalents (`created_time`, `close_time`, `yes_ask_dollars`,
+> `volume_fp`, etc.). Added `_to_int()` helper for `_fp` string-to-int conversion.
+> This was the root cause of the "zero same-day-live events" bug.
+>
+> **Auth resilience — one-line PEM format support (2026-06-19):**
+> Added `_normalise_pem()` helper in `backend/utils/auth_utils.py` that reformats
+> single-line PEM private keys (common in `.env` files) into the standard
+> multi-line format required by `cryptography`. Both REST signer
+> (`utils/auth_utils.KalshiSigner`) and WS signer
+> (`adapters/kalshi/auth.KalshiSigner`) now use the shared helper.
 
 ---
 
@@ -71,7 +85,7 @@ Every file below is referenced from this build plan. Read them alongside the cor
 ## Setup Steps (do once)
 
 1. **Generate Kalshi API keys** at `https://kalshi.com/account/api` → generate RSA keypair
-2. **Copy env template**: `cp backend/.env.example backend/.env`
+2. **Copy env template**: `cp .env.example .env`
 3. **Fill in `.env`**: `KALSHI_API_KEY_ID`, `KALSHI_PRIVATE_KEY` (PEM), `KALSHI_FUNDER_ADDRESS`
 4. **Create venv**: `python3 -m venv venv && source venv/bin/activate`
 5. **Install Python deps**: `pip install -r backend/requirements.txt`
@@ -184,7 +198,7 @@ python-dateutil==2.9.0
 python-dotenv==1.0.1
 ```
 
-### 0.2 — `backend/.env.example`
+### 0.2 — `.env.example`
 
 ```
 # Kalshi API
@@ -5345,7 +5359,7 @@ services:
     ports:
       - "8000:8000"
     env_file:
-      - ./backend/.env
+      - ./.env
     volumes:
       - ./logs:/app/logs
       - ./config:/app/config

@@ -31,10 +31,23 @@ def _to_int_cents(val: Any) -> int | None:
     return None
 
 
-def parse_market(raw: dict[str, Any]) -> Market:
-    """Map a Kalshi API market dict → :class:`Market` dataclass.
+def _to_int(val: Any) -> int:
+    """Convert a string float (e.g. ``"1500.50"``) or number to int."""
+    if val is None:
+        return 0
+    if isinstance(val, str):
+        return int(float(val))
+    return int(val)
 
-    Handles all nullable fields with ``.get()`` and ``None`` defaults.
+
+def parse_market(raw: dict[str, Any]) -> Market:
+    """Map a Kalshi API V2 market dict → :class:`Market` dataclass.
+
+    Kalshi Trade API V2 uses ``*_dollars`` for prices and ``*_fp`` for
+    fixed-point volumes. Old field names (``yes_ask``, ``volume``,
+    ``create_date``, ``close_date``, etc.) are **not present** in V2
+    responses — always use the suffixed variants.
+
     Prices are normalized to integer cents via :func:`_to_int_cents`.
     Timestamps are parsed via :func:`backend.utils.datetime_utils.parse_date`.
     """
@@ -43,22 +56,26 @@ def parse_market(raw: dict[str, Any]) -> Market:
         event_ticker=raw.get("event_ticker", ""),
         title=raw.get("title", ""),
         status=raw.get("status", ""),
-        yes_ask=_to_int_cents(raw.get("yes_ask")),
-        yes_bid=_to_int_cents(raw.get("yes_bid")),
-        no_ask=_to_int_cents(raw.get("no_ask")),
-        no_bid=_to_int_cents(raw.get("no_bid")),
-        volume=int(raw.get("volume", 0)),
-        open_interest=int(raw.get("open_interest", 0)),
+        # Prices: Kalshi V2 returns *_dollars strings
+        yes_ask=_to_int_cents(raw.get("yes_ask_dollars")),
+        yes_bid=_to_int_cents(raw.get("yes_bid_dollars")),
+        no_ask=_to_int_cents(raw.get("no_ask_dollars")),
+        no_bid=_to_int_cents(raw.get("no_bid_dollars")),
+        # Volumes: Kalshi V2 returns *_fp strings
+        volume=_to_int(raw.get("volume_fp")),
+        open_interest=_to_int(raw.get("open_interest_fp")),
+        # Expiry
         expiry=parse_date(raw.get("expected_expiration_time")),
         expiry_iso=raw.get("expected_expiration_time"),
-        create_date=raw.get("create_date"),
-        settlement_date=raw.get("settlement_date"),
-        close_date=raw.get("close_date"),
+        # Dates: Kalshi V2 uses *_time, NOT *_date
+        create_date=raw.get("created_time"),
+        settlement_date=None,  # Not present in V2 markets response
+        close_date=raw.get("close_time"),
         result=raw.get("result"),
         rules_primary=raw.get("rules_primary"),
-        rule_key=raw.get("rule_key"),
-        volume_24h=_to_int_cents(raw.get("volume_24h")),
-        volume_24h_adjusted=_to_int_cents(raw.get("volume_24h_adjusted")),
+        rule_key=None,  # Not present in V2 markets response
+        volume_24h=_to_int(raw.get("volume_24h_fp")),
+        volume_24h_adjusted=None,  # Not present in V2 markets response
     )
 
 
