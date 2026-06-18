@@ -62,26 +62,34 @@ graph TB
 
 ### 2.1 Module Dependency Hierarchy
 
+> **✅ Green** = implemented. **⬜ White** = planned (not yet implemented).
+
 ```mermaid
 graph BT
-    subgraph Core["Layer 0: Core"]
+    subgraph Core["Layer 0: Core ✅"]
         MODELS["core/models/"]
         INTERFACES["core/interfaces/"]
         STATE["core/scanner_state.py"]
         SETTINGS["config/settings.py"]
     end
 
-    subgraph Adapter["Layer 1: Kalshi Adapter"]
+    subgraph Utils["Layer 0: Utils ✅"]
+        DT["utils/datetime_utils.py"]
+        HTTP["utils/http_utils.py"]
+        AUTH["utils/auth_utils.py"]
+        POLLER["utils/poller.py"]
+    end
+
+    subgraph Adapter["Layer 1: Kalshi Adapter ✅"]
         CLIENT["adapters/kalshi/client.py"]
         TYPES["adapters/kalshi/types.py"]
         WS["adapters/kalshi/websocket.py"]
         ADAPTER["adapters/kalshi/adapter.py"]
     end
 
-    subgraph Strategies["Layer 2a: Strategies (7 Experiments)"]
+    subgraph Strategies["Layer 2a: Strategies (7 Experiments) ⬜"]
         BASE["strategies/base.py"]
         EVF["strategies/executed_volume_follower.py"]
-        EVFD["strategies/executed_volume_fade.py"]
         FAV["strategies/favorite_side_follower.py"]
         MOM["strategies/momentum_follower.py"]
         LQF["strategies/liquidity_filtered_follower.py"]
@@ -91,7 +99,7 @@ graph BT
         BT["strategies/backtesting/"]
     end
 
-    subgraph Engines["Layer 2b: Engines"]
+    subgraph Engines["Layer 2b: Engines ⬜"]
         E1["engine1_discovery.py"]
         E2["engine2_classification.py"]
         E3["engine3_grouping.py"]
@@ -103,15 +111,15 @@ graph BT
         LIVE["engines/live/*"]
     end
 
-    subgraph Trading["Layer 3: Trading"]
+    subgraph Trading["Layer 3: Trading ⬜"]
         EXECUTOR["trading/trade_executor.py"]
     end
 
-    subgraph Logging["Layer 3: Logging"]
+    subgraph Logging["Layer 3: Logging ⬜"]
         CSV["logging/csv_logger.py"]
     end
 
-    subgraph API_Layer["Layer 4: API"]
+    subgraph API_Layer["Layer 4: API ⬜"]
         REST["api/rest.py"]
         WS_HANDLER["api/websocket_handler.py"]
         MAIN["main.py"]
@@ -121,54 +129,51 @@ graph BT
     MODELS --> STATE
     SETTINGS --> MAIN
 
-    MODELS --> TYPES
-    MODELS --> CLIENT
-    CLIENT --> ADAPTER
-    TYPES --> ADAPTER
-    WS --> ADAPTER
+    MODELS --> TYPES ✅
+    MODELS --> CLIENT ✅
+    HTTPCLIENT ✅ --> CLIENT ✅
+    CLIENT ✅ --> ADAPTER ✅
+    TYPES ✅ --> ADAPTER ✅
+    WS ✅ --> ADAPTER ✅
+    AUTH ✅ --> WS ✅
     
-    MODELS --> BASE
-    BASE --> EVF --> REGISTRY
-    BASE --> EVFD --> REGISTRY
-    BASE --> FAV --> REGISTRY
-    BASE --> MOM --> REGISTRY
-    BASE --> LQF --> REGISTRY
-    BASE --> RDF --> REGISTRY
-    BASE --> HYB --> REGISTRY
-    REGISTRY --> BT
+    MODELS --> BASE ⬜
+    BASE ⬜ --> REGISTRY ⬜
+    REGISTRY ⬜ --> BT ⬜
 
-    MODELS --> E2
-    ADAPTER --> E1
-    ADAPTER --> E4
-    E2 --> E3
-    E3 --> E4
-    E4 --> E5
-    E2 --> E6
-    STRATEGIES --> E6
-    E5 --> E6
-    E6 --> E7
-    ADAPTER --> E7
-    STRATEGIES --> E7
-    E1 --> E8
-    E2 --> E8
-    E3 --> E8
-    E4 --> E8
-    E5 --> E8
-    E6 --> E8
-    E7 --> E8
-    E8 --> LIVE
+    MODELS ✅ --> E2 ⬜
+    ADAPTER ✅ --> E1 ⬜
+    ADAPTER ✅ --> E4 ⬜
+    DT ✅ --> E2 ⬜
+    E2 ⬜ --> E3 ⬜
+    E3 ⬜ --> E4 ⬜
+    E4 ⬜ --> E5 ⬜
+    E2 ⬜ --> E6 ⬜
+    STRATEGIES ⬜ --> E6 ⬜
+    E5 ⬜ --> E6 ⬜
+    E6 ⬜ --> E7 ⬜
+    ADAPTER ✅ --> E7 ⬜
+    STRATEGIES ⬜ --> E7 ⬜
+    E1 ⬜ --> E8 ⬜
+    E2 ⬜ --> E8 ⬜
+    E3 ⬜ --> E8 ⬜
+    E4 ⬜ --> E8 ⬜
+    E5 ⬜ --> E8 ⬜
+    E6 ⬜ --> E8 ⬜
+    E7 ⬜ --> E8 ⬜
+    E8 ⬜ --> LIVE ⬜
 
-    E7 --> EXECUTOR
-    ADAPTER --> EXECUTOR
-    STRATEGIES --> EXECUTOR
-    EXECUTOR --> REST
-    STATE --> REST
-    E8 --> REST
-    REST --> MAIN
-    WS_HANDLER --> MAIN
+    E7 ⬜ --> EXECUTOR ⬜
+    ADAPTER ✅ --> EXECUTOR ⬜
+    STRATEGIES ⬜ --> EXECUTOR ⬜
+    EXECUTOR ⬜ --> REST ⬜
+    STATE ✅ --> REST ⬜
+    E8 ⬜ --> REST ⬜
+    REST ⬜ --> MAIN ⬜
+    WS_HANDLER ⬜ --> MAIN ⬜
 ```
 
-> **Note on forward-looking files:** Strategy files (`strategies/executed_volume_follower.py`, `strategies/favorite_side_follower.py`, etc.), engine files (`engine1_discovery.py` … `engine8_orchestrator.py`), and `trading/trade_executor.py` are documented here as the target architecture but do not yet exist in the codebase. See Phase 4 (Strategies) and Phase 5 (Engines) of the build plan for implementation status.
+> **⚠️ Implementation status (2026-06-17):** Phase 1 (core models, interfaces, utils, config) and Phase 2 (Kalshi adapter) are **complete**. Phase 3 (engines), Phase 4 (strategies), Phase 5 (backtesting), Phase 6 (trading/logging), Phase 7 (API layer), and Phases 8-11 (frontend) are **not yet implemented**. All adapter files exist (`client.py`, `http_client.py`, `websocket.py`, `types.py`, `adapter.py`, `auth.py`) and `KalshiAdapter` extends `AbstractMarketAdapter` correctly. See `docs/build-plan.md` for the full phase breakdown. The diagrams below represent the target architecture.
 
 ### 2.2 Engine Pipeline — Detailed Flow
 

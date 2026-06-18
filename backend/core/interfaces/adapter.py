@@ -1,8 +1,6 @@
 from abc import ABC, abstractmethod
 from typing import Any
 
-import httpx
-
 
 class MarketReader(ABC):
     """Read-only market data access."""

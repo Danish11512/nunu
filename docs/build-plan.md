@@ -28,8 +28,10 @@ cp backend/.env.example backend/.env
 # 6. Follow phases below — each tells you what to build and how to verify
 ```
 
-> **Note:** Frontend (bun/npm) and Docker are not needed yet. They will be
-> scaffolded in Phases 8 and 13 respectively.
+> **⚠️ Implementation status (2026-06-17):** Phase 1 (Core + Utils) is complete.
+> Phase 2 (Kalshi Adapter) is complete. Phases 3–13 are **not yet implemented**. No frontend/ directory exists yet.
+> The `frontend/` scaffolding will be created in Phase 8 using `create-vite` with React+TypeScript.
+> See `docs/api-contract.md` for the frontend contract that must be implemented.
 
 ---
 
@@ -1368,75 +1370,116 @@ def load_settings(config_path: str | None = None) -> Settings:
 
 ## Phase 2: Kalshi Adapter (SOLID refactored)
 
-> **SRP**: Split monolithic `client.py` into three single-responsibility modules.
+> **SRP**: Split monolithic `client.py` into single-responsibility modules.
 > **DIP**: `KalshiAdapter` implements `AbstractMarketAdapter` from `core/interfaces/`.
+> **Auth split**: REST uses RSA-PSS `KalshiSigner` from `backend.utils.auth_utils`;
+> WebSocket uses PKCS1v15 `KalshiSigner` from `.auth`.
 > **Cross-ref:** `docs/adapters/adapter-contract.md`.
 
 ### Files (in creation order)
 
 ```
 backend/adapters/kalshi/
-  __init__.py
-  auth.py              # RSA-PSS signing (was embedded in client)
-  http_client.py       # Raw HTTP + rate limiting + retry (was in client)
-  client.py            # Kalshi REST methods (thin, delegates auth+http)
-  types.py             # Parsers + stats calculators
-  websocket.py         # WS client (uses auth.py for connect signing)
-  adapter.py           # Facade: implements AbstractMarketAdapter
+  __init__.py           # Exports public API
+  auth.py               # PKCS1v15 signing — WebSocket ONLY
+  http_client.py        # Raw HTTP + rate limiting + retry (uses utils.RateLimiter)
+  client.py             # Kalshi REST methods (uses utils.auth_utils KalshiSigner for RSA-PSS)
+  types.py              # Parsers + stats calculators
+  websocket.py          # WS client (uses auth.py for PKCS1v15 connect signing)
+  adapter.py            # Facade: implements AbstractMarketAdapter fully
 ```
 
 **Verification:**
 ```bash
 cd backend && python -c "
-from backend.adapters.kalshi.auth import KalshiSigner
+from backend.adapters.kalshi.auth import KalshiSigner as WsSigner
 from backend.adapters.kalshi.http_client import KalshiHttpClient
 from backend.adapters.kalshi.client import KalshiClient
-from backend.adapters.kalshi.types import parse_market, parse_orderbook
+from backend.adapters.kalshi.types import parse_market, parse_orderbook, calculate_orderbook_stats
+from backend.adapters.kalshi.websocket import KalshiWebSocket
 from backend.adapters.kalshi.adapter import KalshiAdapter
+from backend.adapters.kalshi import KalshiAdapter as ExportedAdapter
 from backend.core.interfaces import AbstractMarketAdapter
+
 print('Kalshi adapter classes import OK')
 assert issubclass(KalshiAdapter, AbstractMarketAdapter), 'KalshiAdapter must implement AbstractMarketAdapter'
+
+# Verify all ABC methods are implemented
+import inspect
+missing = [m for m in ('fetch_markets', 'fetch_orderbook', 'fetch_event', 'fetch_events',
+                        'place_order', 'cancel_order', 'get_positions')
+           if not hasattr(KalshiAdapter, m) or not inspect.iscoroutinefunction(getattr(KalshiAdapter, m))]
+assert not missing, f'Missing ABC methods: {missing}'
+
+# Verify convenience methods
+for m in ('get_all_open_markets', 'get_market', 'get_orderbook', 'get_orderbook_stats'):
+    assert hasattr(KalshiAdapter, m), f'Missing convenience method: {m}'
+
+# Verify properties
+k = KalshiAdapter.__new__(KalshiAdapter)
+assert k.name == 'kalshi'
+assert k.timezone == 'US/Eastern'
+assert k.supports_trading is True
+assert k.supports_websocket is True
+
+print('All Phase 2 interface contracts verified ✓')
 "
 ```
 
 ### 2.1 — `backend/adapters/kalshi/auth.py`
 
-> **SRP**: Single responsibility — RSA-PKCS1v15 request signing. Extracted from
-> the original `client.py._sign_request()`. Now also used by `websocket.py`.
-> Uses PKCS1v15 padding.
+> **SRP**: Single responsibility — RSA-PKCS1v15 request signing. Used ONLY by
+> WebSocket (`websocket.py`). REST calls use the RSA-PSS signer from
+> `backend.utils.auth_utils` instead.
+> Raises immediately if credentials are missing — no silent fallback.
 
 ```python
+from __future__ import annotations
+
 import base64
+import logging
 import time
 from typing import Optional
 
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding
 
+logger = logging.getLogger(__name__)
+
+
 class KalshiSigner:
-    """RSA-PKCS1v15 request signing for Kalshi API authentication.
-    
+    """RSA-PKCS1v15 request signing for Kalshi WebSocket authentication.
+
     Uses three headers: KALSHI-ACCESS-KEY, KALSHI-ACCESS-SIGNATURE,
-    KALSHI-ACCESS-TIMESTAMP.
+    KALSHI-ACCESS-TIMESTAMP. PKCS1v15 padding is correct for WebSocket auth.
+
+    NOTE: This signer is WebSocket-only. REST API calls use the RSA-PSS
+    signer from `backend.utils.auth_utils.KalshiSigner`.
     """
-    
+
     def __init__(self, api_key_id: str = "", private_key_pem: Optional[str] = None):
+        if not api_key_id:
+            raise ValueError("KalshiSigner: api_key_id is required")
+        if not private_key_pem:
+            raise ValueError("KalshiSigner: private_key_pem is required")
         self.api_key_id = api_key_id
         self.private_key_pem = private_key_pem
-    
+
     def sign(self, method: str, path: str, body: str = "") -> tuple[str, str, str]:
-        """
-        Sign a Kalshi API request.
+        """Sign a Kalshi API request.
+
         Returns (api_key_id, signature_b64, timestamp_ms).
+        Raises ValueError if private key is not configured.
         """
+        if not self.private_key_pem:
+            raise ValueError("KalshiSigner: private_key_pem not configured — cannot sign")
+
         timestamp = str(int(time.time() * 1000))
         message = timestamp + method.upper() + path + body
-        
-        if not self.private_key_pem:
-            return self.api_key_id or "", "", timestamp
-        
+
         private_key = serialization.load_pem_private_key(
-            self.private_key_pem.encode(), password=None,
+            self.private_key_pem.encode("utf-8") if isinstance(self.private_key_pem, str) else self.private_key_pem,
+            password=None,
         )
         signature = private_key.sign(
             message.encode(),
@@ -1444,7 +1487,7 @@ class KalshiSigner:
             hashes.SHA256(),
         )
         return self.api_key_id, base64.b64encode(signature).decode(), timestamp
-    
+
     def get_headers(self, method: str, path: str, body: str = "") -> dict[str, str]:
         """Convenience: returns dict of KALSHI-ACCESS-* headers."""
         key, sig, ts = self.sign(method, path, body)
@@ -1459,295 +1502,533 @@ class KalshiSigner:
 
 > **SRP**: Single responsibility — raw HTTP transport with rate limiting and
 > retry logic. No knowledge of Kalshi endpoints or auth.
+> Uses `RateLimiter` from `backend.utils.http_utils` instead of inline semaphore.
 
 ```python
-import httpx
+from __future__ import annotations
+
 import asyncio
-import json
 import logging
-from typing import Optional
+from typing import Any, Optional
+
+import httpx
+
+from backend.utils.http_utils import RateLimiter, retry_with_backoff
 
 logger = logging.getLogger(__name__)
 
 
 class KalshiHttpClient:
     """Raw HTTP transport for Kalshi API.
-    
+
     - Connection pooling via httpx.AsyncClient
-    - Rate limiting via asyncio.Semaphore
-    - Retry with exponential backoff
+    - Rate limiting via backend.utils.http_utils.RateLimiter
+    - Retry with exponential backoff via backend.utils.http_utils.retry_with_backoff
     - Auth headers injected at call time (caller provides signer)
     """
-    
-    BASE_URL = "https://external-api.kalshi.com/trade-api/v2"
-    
-    def __init__(self, base_url: str = None, rate_limit: int = 10, timeout: float = 30.0):
+
+    BASE_URL = "https://api.elections.kalshi.com/trade-api/v2"
+
+    def __init__(
+        self,
+        base_url: str | None = None,
+        rate_limit: int = 10,
+        timeout: float = 30.0,
+        max_retries: int = 3,
+    ):
         self.base_url = (base_url or self.BASE_URL).rstrip("/")
         self._client: Optional[httpx.AsyncClient] = None
-        self._semaphore = asyncio.Semaphore(rate_limit)
+        self._rate_limiter = RateLimiter(max_per_second=rate_limit)
         self.timeout = timeout
-    
-    async def __aenter__(self):
+        self.max_retries = max_retries
+
+    async def __aenter__(self) -> KalshiHttpClient:
         self._client = httpx.AsyncClient(timeout=self.timeout)
         return self
-    
-    async def __aexit__(self, *args):
+
+    async def __aexit__(self, *args: Any) -> None:
         if self._client:
             await self._client.aclose()
-    
+
     @property
     def client(self) -> httpx.AsyncClient:
         if self._client is None:
             raise RuntimeError("HTTP client not initialized. Use 'async with'.")
         return self._client
-    
-    async def request(self, method: str, path: str, auth_headers: dict = None, **kwargs) -> dict:
+
+    async def request(
+        self,
+        method: str,
+        path: str,
+        auth_headers: dict[str, str] | None = None,
+        **kwargs: Any,
+    ) -> dict[str, Any]:
         """Rate-limited request with retry. Auth headers injected by caller."""
-        async with self._semaphore:
+        async with self._rate_limiter:
             url = f"{self.base_url}{path}"
-            headers = kwargs.pop("headers", {}) | (auth_headers or {})
-            
-            for attempt in range(3):
-                try:
-                    response = await self.client.request(method, url, headers=headers, **kwargs)
-                    
-                    if response.status_code == 429:
-                        retry_after = int(response.headers.get("retry-after", str(2 ** attempt)))
-                        logger.warning(f"Rate limited. Retrying in {retry_after}s.")
-                        await asyncio.sleep(retry_after)
-                        continue
-                    
-                    response.raise_for_status()
-                    return response.json()
-                
-                except httpx.TimeoutException:
-                    if attempt == 2:
+            headers = {**(kwargs.pop("headers", {})), **(auth_headers or {})}
+
+            async def _do_request() -> dict[str, Any]:
+                response = await self.client.request(method, url, headers=headers, **kwargs)
+                response.raise_for_status()
+                return response.json()
+
+            async def _request_with_retry() -> dict[str, Any]:
+                for attempt in range(self.max_retries):
+                    try:
+                        return await _do_request()
+                    except httpx.HTTPStatusError as e:
+                        if e.response.status_code == 429:
+                            # Rate limited — parse retry-after, cap at 30s
+                            raw = e.response.headers.get("retry-after", "1")
+                            try:
+                                retry_after = min(int(raw), 30)
+                            except (ValueError, TypeError):
+                                retry_after = min(2**attempt, 30)
+                            logger.warning(
+                                "Rate limited (attempt %d/%d). Retrying in %ds.",
+                                attempt + 1, self.max_retries, retry_after,
+                            )
+                            await asyncio.sleep(retry_after)
+                            continue
+                        # Non-retryable status — propagate immediately
                         raise
-                    await asyncio.sleep(1)
-                
-                except httpx.HTTPStatusError as e:
-                    if e.response.status_code >= 500 and attempt < 2:
-                        await asyncio.sleep(2 ** attempt)
+                    except (httpx.TimeoutException, httpx.NetworkError) as e:
+                        if attempt == self.max_retries - 1:
+                            raise
+                        delay = min(2**attempt, 10)
+                        logger.warning(
+                            "Request error (attempt %d/%d): %s. Retrying in %ds.",
+                            attempt + 1, self.max_retries, e, delay,
+                        )
+                        await asyncio.sleep(delay)
                         continue
-                    raise
-            
-            raise RuntimeError("Request failed after 3 retries.")
+                raise RuntimeError(f"Request failed after {self.max_retries} retries.")
+
+            return await _request_with_retry()
 ```
 
 ### 2.3 — `backend/adapters/kalshi/client.py`
 
-> **SRP**: Kalshi-specific REST methods only. Uses `KalshiSigner` for auth,
-> `KalshiHttpClient` for transport. Thin — delegates to components.
+> **SRP**: Kalshi-specific REST methods only. Uses the **RSA-PSS** `KalshiSigner`
+> from `backend.utils.auth_utils` for REST auth headers (NOT `auth.py`, which is
+> PKCS1v15 for WebSocket only). Delegates transport to `KalshiHttpClient`.
+> Thin — delegates signing and HTTP to components.
 
 ```python
-import asyncio
+from __future__ import annotations
+
 import json
 import logging
-from typing import Optional
+from typing import Any, Optional
 
 import httpx
 
-from .auth import KalshiSigner
+from backend.utils.auth_utils import KalshiSigner  # RSA-PSS signer for REST
+
 from .http_client import KalshiHttpClient
 
 logger = logging.getLogger(__name__)
 
 
 class KalshiClient:
-    """Kalshi REST API client — endpoint-specific methods only."""
-    
+    """Kalshi REST API client — endpoint-specific methods only.
+
+    Uses RSA-PSS signing (from backend.utils.auth_utils) for REST auth.
+    WebSocket auth uses the PKCS1v15 signer from `.auth` instead.
+    """
+
     def __init__(
         self,
-        base_url: str = None,
-        api_key: str = None,
-        private_key: str = None,
+        base_url: str | None = None,
+        api_key_id: str = "",
+        private_key: str = "",
         rate_limit: int = 10,
     ):
-        self.http = KalshiHttpClient(base_url, rate_limit)
-        self.signer = KalshiSigner(api_key, private_key)
-    
-    async def __aenter__(self):
+        self.http = KalshiHttpClient(base_url=base_url, rate_limit=rate_limit)
+        # RSA-PSS signer for REST — NOT the PKCS1v15 one from .auth
+        self.signer = KalshiSigner(private_key_pem=private_key)
+        self.api_key_id = api_key_id
+
+    async def __aenter__(self) -> KalshiClient:
         await self.http.__aenter__()
         return self
-    
-    async def __aexit__(self, *args):
+
+    async def __aexit__(self, *args: Any) -> None:
         await self.http.__aexit__(*args)
-    
-    async def list_markets(self, status: str = "open", limit: int = 1000, cursor: str = None) -> dict:
-        params = {"status": status, "limit": limit}
+
+    # ── Auth helpers ──────────────────────────────────────────────
+
+    def _sign_headers(self, method: str, path: str, body: str = "") -> dict[str, str]:
+        """Generate KALSHI-ACCESS-* headers using RSA-PSS signer."""
+        ts = KalshiSigner.generate_timestamp()
+        message = ts + method.upper() + path + body
+        sig = self.signer.sign(message)
+        return {
+            "KALSHI-ACCESS-KEY": self.api_key_id,
+            "KALSHI-ACCESS-SIGNATURE": sig,
+            "KALSHI-ACCESS-TIMESTAMP": ts,
+        }
+
+    # ── Market endpoints ──────────────────────────────────────────
+
+    async def list_markets(
+        self, status: str = "open", limit: int = 1000, cursor: str | None = None
+    ) -> dict[str, Any]:
+        params: dict[str, Any] = {"status": status, "limit": limit}
         if cursor:
             params["cursor"] = cursor
-        headers = self.signer.get_headers("GET", "/markets")
+        headers = self._sign_headers("GET", "/markets")
         return await self.http.request("GET", "/markets", headers=headers, params=params)
-    
-    async def get_market(self, ticker: str) -> Optional[dict]:
+
+    async def get_market(self, ticker: str) -> Optional[dict[str, Any]]:
         path = f"/markets/{ticker}"
-        headers = self.signer.get_headers("GET", path)
+        headers = self._sign_headers("GET", path)
         try:
             data = await self.http.request("GET", path, headers=headers)
-            return data.get("market")  # Unwrap response wrapper
+            return data.get("market")
         except httpx.HTTPStatusError as e:
             if e.response.status_code == 404:
                 return None
             raise
-    
-    async def get_orderbook(self, ticker: str) -> dict:
+
+    async def get_event(self, event_ticker: str) -> Optional[dict[str, Any]]:
+        """Fetch a single event by ticker (wraps /events/{event_ticker})."""
+        path = f"/events/{event_ticker}"
+        headers = self._sign_headers("GET", path)
+        try:
+            data = await self.http.request("GET", path, headers=headers)
+            return data.get("event")
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code == 404:
+                return None
+            raise
+
+    async def list_events(
+        self, status: str = "open", limit: int = 100, cursor: str | None = None
+    ) -> dict[str, Any]:
+        """Fetch all events (wraps /events)."""
+        params: dict[str, Any] = {"status": status, "limit": limit}
+        if cursor:
+            params["cursor"] = cursor
+        headers = self._sign_headers("GET", "/events")
+        return await self.http.request("GET", "/events", headers=headers, params=params)
+
+    async def get_orderbook(self, ticker: str) -> dict[str, Any]:
         path = f"/markets/{ticker}/orderbook"
-        headers = self.signer.get_headers("GET", path)
+        headers = self._sign_headers("GET", path)
         return await self.http.request("GET", path, headers=headers)
-    
-    async def place_order(self, ticker: str, side: str, price: float, size: float) -> dict:
-        if not self.signer.private_key_pem:
-            raise RuntimeError("Private key required to place orders.")
-        body = {
+
+    # ── Trading endpoints ─────────────────────────────────────────
+
+    async def place_order(
+        self, ticker: str, side: str, price: int, count: int, **kwargs: Any
+    ) -> dict[str, Any]:
+        """Place a limit order.
+
+        Args:
+            ticker: Market ticker (e.g. "KXLYDYX").
+            side: "yes" or "no" — mapped to Kalshi V2 API values.
+            price: Limit price in integer cents.
+            count: Number of contracts (integer).
+            **kwargs: Additional order params (time_in_force, etc.).
+
+        Returns:
+            dict with order response (e.g. {"order_id": "..."}).
+        """
+        body: dict[str, Any] = {
             "ticker": ticker,
-            "side": "bid" if side == "yes" else "ask",
-            "count": f"{size:.2f}",
-            "price": f"{price:.4f}",
-            "time_in_force": "good_till_canceled",
-            "self_trade_prevention_type": "taker_at_cross",
-            "post_only": False,
-            "reduce_only": False,
-            "cancel_order_on_pause": False,
+            "side": side,  # Kalshi V2 uses "yes"/"no"
+            "type": "limit",
+            "price": price,       # integer cents
+            "count": count,       # integer contracts
+            "time_in_force": kwargs.get("time_in_force", "GTC"),
         }
         payload = json.dumps(body, separators=(",", ":"))
-        path = "/portfolio/events/orders"
-        headers = self.signer.get_headers("POST", path, payload)
+        path = "/portfolio/orders"
+        headers = self._sign_headers("POST", path, payload)
         headers["Content-Type"] = "application/json"
         return await self.http.request("POST", path, headers=headers, content=payload)
-    
-    async def fetch_all_open_markets(self) -> list[dict]:
-        """Paginate through all open markets, deduplicate by ticker."""
-        all_markets: list[dict] = []
-        cursor: Optional[str] = None
-        
-        while True:
-            data = await self.list_markets(cursor=cursor)
-            all_markets.extend(data.get("markets", []))
-            cursor = data.get("cursor")
-            if not cursor:
+
+    async def cancel_order(self, order_id: str, **kwargs: Any) -> dict[str, Any]:
+        """Cancel an existing order by ID."""
+        path = f"/portfolio/orders/{order_id}"
+        headers = self._sign_headers("DELETE", path)
+        return await self.http.request("DELETE", path, headers=headers)
+
+    async def get_positions(self, **kwargs: Any) -> list[dict[str, Any]]:
+        """Get current positions."""
+        path = "/portfolio/positions"
+        headers = self._sign_headers("GET", path)
+        data = await self.http.request("GET", path, headers=headers)
+        return data.get("positions", [])
+
+    # ── Pagination ────────────────────────────────────────────────
+
+    async def fetch_all_open_markets(self, max_pages: int = 100) -> list[dict[str, Any]]:
+        """Paginate through all open markets, deduplicate by ticker.
+
+        Uses a while-loop guard (max_pages) as a circuit-breaker.
+        Wraps each page fetch in try/except to allow partial results.
+        """
+        all_markets: list[dict[str, Any]] = []
+        cursor: str | None = None
+        pages_fetched = 0
+
+        while pages_fetched < max_pages:
+            try:
+                data = await self.list_markets(cursor=cursor)
+                all_markets.extend(data.get("markets", []))
+                cursor = data.get("cursor")
+                pages_fetched += 1
+                if not cursor:
+                    break
+            except Exception as e:
+                logger.warning(
+                    "Page %d fetch failed (got %d markets so far): %s",
+                    pages_fetched + 1, len(all_markets), e,
+                )
+                # Partial result — break out if this was the first page and it failed
+                if pages_fetched == 0:
+                    raise
                 break
-        
+
+        # Deduplicate by ticker (defensive — Kalshi pagination is stable)
         seen: set[str] = set()
-        unique: list[dict] = []
+        unique: list[dict[str, Any]] = []
         for m in all_markets:
             ticker = m.get("ticker")
-            if ticker not in seen:
+            if ticker and ticker not in seen:
                 seen.add(ticker)
                 unique.append(m)
+
+        logger.info(
+            "Fetched %d markets across %d pages (%d unique).",
+            len(all_markets), pages_fetched, len(unique),
+        )
         return unique
 ```
 
 ### 2.4 — `backend/adapters/kalshi/types.py`
 
-(Content unchanged from original — pure parsing functions, no change needed.)
+> **SRP**: Pure parsing functions — no I/O, no state. Maps Kalshi API raw dicts
+> to domain model dataclasses. All functions are synchronous and stateless.
+
+```python
+from __future__ import annotations
+
+from typing import Any
+
+from backend.core.models.market import (
+    Market,
+    MarketOrderbookStats,
+    Orderbook,
+    OrderbookLevel,
+)
+from backend.utils.datetime_utils import parse_date
+
+
+def parse_market(raw: dict[str, Any]) -> Market:
+    """Map Kalshi API market dict → Market dataclass.
+
+    Known Kalshi API field → model field mappings:
+      ticker                    → ticker
+      event_ticker              → event_ticker
+      title                     → title
+      status                    → status
+      yes_ask                   → yes_ask (int cents, multiply by 100 if float)
+      yes_bid                   → yes_bid
+      no_ask                    → no_ask
+      no_bid                    → no_bid
+      volume                    → volume
+      open_interest             → open_interest
+      expected_expiration_time  → expiry (parsed via parse_date)
+      create_date               → create_date (raw ISO string)
+      settlement_date           → settlement_date
+      close_date                → close_date
+      result                    → result
+      rules_primary             → rules_primary
+      rule_key                  → rule_key
+      volume_24h                → volume_24h
+      volume_24h_adjusted       → volume_24h_adjusted
+    """
+    def _to_int_cents(val: Any) -> int | None:
+        """Normalize price to int cents. Handles float dollars or string."""
+        if val is None:
+            return None
+        if isinstance(val, str):
+            val = float(val)
+        if isinstance(val, float):
+            # If it looks like dollars (e.g. 0.65), multiply by 100
+            if val < 100:
+                return int(round(val * 100))
+            return int(val)
+        if isinstance(val, int):
+            return val
+        return None
+
+    return Market(
+        ticker=raw.get("ticker", ""),
+        event_ticker=raw.get("event_ticker", ""),
+        title=raw.get("title", ""),
+        status=raw.get("status", ""),
+        yes_ask=_to_int_cents(raw.get("yes_ask")),
+        yes_bid=_to_int_cents(raw.get("yes_bid")),
+        no_ask=_to_int_cents(raw.get("no_ask")),
+        no_bid=_to_int_cents(raw.get("no_bid")),
+        volume=int(raw.get("volume", 0)),
+        open_interest=int(raw.get("open_interest", 0)),
+        expiry=parse_date(raw.get("expected_expiration_time")),
+        expiry_iso=raw.get("expected_expiration_time"),
+        create_date=raw.get("create_date"),
+        settlement_date=raw.get("settlement_date"),
+        close_date=raw.get("close_date"),
+        result=raw.get("result"),
+        rules_primary=raw.get("rules_primary"),
+        rule_key=raw.get("rule_key"),
+        volume_24h=_to_int_cents(raw.get("volume_24h")),
+        volume_24h_adjusted=_to_int_cents(raw.get("volume_24h_adjusted")),
+    )
+
+
+def parse_orderbook(raw: dict[str, Any], ticker: str) -> Orderbook:
+    """Map Kalshi API orderbook dict → Orderbook dataclass.
+
+    The Kalshi API returns:
+      {"yes": [{"price": 65, "count": 1000}, ...],
+       "no":  [{"price": 35, "count": 2000}, ...]}
+    """
+    def _parse_levels(levels: list[dict[str, Any]] | None) -> list[OrderbookLevel]:
+        if not levels:
+            return []
+        result: list[OrderbookLevel] = []
+        for level in levels:
+            try:
+                result.append(
+                    OrderbookLevel(
+                        price=int(level.get("price", 0)),
+                        count=int(level.get("count", 0)),
+                    )
+                )
+            except (ValueError, TypeError):
+                continue
+        # Sort by price ascending
+        result.sort(key=lambda l: l.price)
+        return result
+
+    return Orderbook(
+        market_ticker=ticker,
+        yes_side=_parse_levels(raw.get("yes")),
+        no_side=_parse_levels(raw.get("no")),
+        fetch_time=parse_date(raw.get("fetch_time")),
+    )
+
+
+def calculate_orderbook_stats(
+    market: Market,
+    orderbook: Orderbook,
+) -> MarketOrderbookStats:
+    """Derive statistics from a market + its orderbook.
+
+    Computes:
+      - spread_cents: best yes_ask - best yes_bid (None if either missing)
+      - total_resting_order_quantity: sum of all counts across both sides
+      - Best bid/ask prices from orderbook levels
+    """
+    # Best bid/ask from orderbook levels (first level = best price)
+    yes_bid = orderbook.yes_side[0].price if orderbook.yes_side else market.yes_bid
+    yes_ask = orderbook.yes_side[-1].price if orderbook.yes_side else market.yes_ask
+    no_bid = orderbook.no_side[0].price if orderbook.no_side else market.no_bid
+    no_ask = orderbook.no_side[-1].price if orderbook.no_side else market.no_ask
+
+    # Spread: difference between best yes_ask and best yes_bid
+    spread: int | None = None
+    if yes_bid is not None and yes_ask is not None:
+        spread = abs(yes_ask - yes_bid)
+
+    # Total resting quantity across both sides
+    total_resting = sum(
+        level.count for level in orderbook.yes_side
+    ) + sum(
+        level.count for level in orderbook.no_side
+    )
+
+    return MarketOrderbookStats(
+        market_ticker=market.ticker,
+        event_ticker=market.event_ticker,
+        spread_cents=spread,
+        yes_bid=yes_bid,
+        yes_ask=yes_ask,
+        no_bid=no_bid,
+        no_ask=no_ask,
+        last_price=(yes_bid or 0),  # approximate
+        volume=market.volume,
+        open_interest=market.open_interest,
+        volume_24h=market.volume_24h,
+        total_resting_order_quantity=total_resting,
+    )
+```
 
 ### 2.5 — `backend/adapters/kalshi/websocket.py`
 
-(Minor change: uses `KalshiSigner` for connect auth instead of inline signing.)
-
-### 2.6 — `backend/adapters/kalshi/adapter.py`
-
-```python
-"""
-KalshiAdapter implements AbstractMarketAdapter (core/interfaces/adapter.py).
-Follows DIP: engines depend on AbstractMarketAdapter, not this concrete class.
-"""
-from backend.core.interfaces import AbstractMarketAdapter
-from backend.core.models.market import Market, Orderbook, MarketOrderbookStats
-from .client import KalshiClient
-from .types import parse_market, parse_orderbook, calculate_orderbook_stats
-
-
-class KalshiAdapter(AbstractMarketAdapter):
-    """High-level Kalshi interface implementing the abstract adapter contract."""
-    
-    def __init__(self, client: KalshiClient):
-        self.client = client
-    
-    async def get_all_open_markets(self) -> list[Market]:
-        raw_markets = await self.client.fetch_all_open_markets()
-        return [parse_market(m) for m in raw_markets]
-    
-    async def get_market(self, ticker: str) -> Optional[Market]:
-        raw = await self.client.get_market(ticker)
-        return parse_market(raw) if raw else None
-    
-    async def get_orderbook(self, ticker: str) -> Orderbook:
-        raw = await self.client.get_orderbook(ticker)
-        return parse_orderbook(raw, ticker)
-    
-    async def get_orderbook_stats(self, ticker: str) -> Optional[MarketOrderbookStats]:
-        market = await self.get_market(ticker)
-        if not market:
-            return None
-        orderbook = await self.get_orderbook(ticker)
-        return calculate_orderbook_stats(market, orderbook)
-    
-    async def place_order(self, ticker: str, side: str, price: float, size: float) -> dict:
-        return await self.client.place_order(ticker, side, price, size)
-```
-
-### 2.3 — `backend/adapters/kalshi/websocket.py`
-
-WebSocket client for real-time orderbook updates.
+> **SRP**: WebSocket client for real-time orderbook updates. Uses `.auth.KalshiSigner`
+> (PKCS1v15) for connect authentication — NOT the RSA-PSS signer used by REST.
+> Adds callback isolation (try/except per dispatch) and reconnect with re-subscribe.
 
 ```python
-import json
+from __future__ import annotations
+
 import asyncio
+import json
 import logging
-from typing import Optional, Callable, Awaitable
+from typing import Any, Awaitable, Callable, Optional
+
 import websockets
+
+from .auth import KalshiSigner  # PKCS1v15 signer — correct for WS auth
 
 logger = logging.getLogger(__name__)
 
+
 class KalshiWebSocket:
-    """WebSocket client for Kalshi real-time updates (RSA-PKCS1v15 auth)."""
-    
-    def __init__(self, url: str = "wss://external-api-ws.kalshi.com/trade-api/ws/v2",
-                 api_key: str = None, private_key: str = None):
+    """WebSocket client for Kalshi real-time updates (PKCS1v15 auth).
+
+    Uses .auth.KalshiSigner for connect authentication headers.
+    Each callback is wrapped in try/except so one bad handler doesn't
+    break the listen loop. On reconnect, subscribed tickers are re-sent
+    and the subscription acknowledgment is verified.
+    """
+
+    def __init__(
+        self,
+        url: str = "wss://api.elections.kalshi.com/trade-api/ws/v2",
+        api_key_id: str = "",
+        private_key: str = "",
+    ):
         self.url = url
-        self.api_key = api_key
-        self.private_key = private_key
-        self._ws = None
+        self._signer = KalshiSigner(api_key_id=api_key_id, private_key_pem=private_key)
+        self._ws: websockets.WebSocketClientProtocol | None = None
         self._running = False
-        self._callbacks: list[Callable] = []
+        self._callbacks: list[Callable[[dict[str, Any]], Awaitable[None]]] = []
         self._subscribed_tickers: list[str] = []
-    
-    def on_message(self, callback: Callable[[dict], Awaitable[None]]):
+
+    def on_message(self, callback: Callable[[dict[str, Any]], Awaitable[None]]) -> None:
+        """Register a callback invoked on each decoded message."""
         self._callbacks.append(callback)
-    
-    async def connect(self):
-        """Connect with API key auth via headers."""
-        import time, base64
-        extra_headers = {}
-        if self.api_key and self.private_key:
-            timestamp = str(int(time.time() * 1000))
-            message = timestamp + "GET" + "/trade-api/ws/v2"
-            from cryptography.hazmat.primitives import hashes, serialization
-            from cryptography.hazmat.primitives.asymmetric import padding
-            private_key = serialization.load_pem_private_key(
-                self.private_key.encode(), password=None,
-            )
-            signature = private_key.sign(
-                message.encode(),
-                padding.PKCS1v15(),
-                hashes.SHA256(),
-            )
-            extra_headers = {
-                "KALSHI-ACCESS-KEY": self.api_key,
-                "KALSHI-ACCESS-SIGNATURE": base64.b64encode(signature).decode(),
-                "KALSHI-ACCESS-TIMESTAMP": timestamp,
-            }
-        self._ws = await websockets.connect(self.url, additional_headers=extra_headers)
-        logger.info("WebSocket connected")
-    
-    async def subscribe(self, tickers: list[str]):
+
+    async def connect(self) -> None:
+        """Connect with PKCS1v15 API key auth via headers."""
+        headers = self._signer.get_headers("GET", "/trade-api/ws/v2")
+        self._ws = await websockets.connect(self.url, additional_headers=headers)
+        logger.info("WebSocket connected to %s", self.url)
+
+    async def subscribe(self, tickers: list[str]) -> None:
         """Subscribe to orderbook_delta channel for given tickers.
-        
+
         Kalshi WS uses 'id' for request tracking and 'params' for subscription config.
+        Stores tickers so they can be re-subscribed on reconnect.
         """
-        self._subscribed_tickers = tickers
+        self._subscribed_tickers = list(tickers)
         message = {
             "id": 1,
             "cmd": "subscribe",
@@ -1757,72 +2038,208 @@ class KalshiWebSocket:
             },
         }
         await self._ws.send(json.dumps(message))
-    
-    async def listen(self):
+        logger.info("Subscribed to %d tickers.", len(tickers))
+
+    async def listen(self) -> None:
+        """Listen loop with callback isolation, reconnect, and re-subscribe."""
         self._running = True
         while self._running:
             try:
                 raw = await self._ws.recv()
                 data = json.loads(raw)
+
+                # Dispatch each callback in isolation
                 for cb in self._callbacks:
-                    await cb(data)
+                    try:
+                        await cb(data)
+                    except Exception as exc:
+                        logger.error("WebSocket callback error: %s", exc, exc_info=True)
+
             except websockets.exceptions.ConnectionClosed:
-                logger.warning("WS disconnected. Reconnecting...")
+                logger.warning("WebSocket disconnected. Reconnecting in 5s...")
                 await asyncio.sleep(5)
-                await self.connect()
-                if self._subscribed_tickers:
-                    await self.subscribe(self._subscribed_tickers)
-    
-    async def close(self):
+                if not self._running:
+                    break
+                await self._reconnect()
+
+            except Exception as exc:
+                logger.error("WebSocket listen error: %s", exc, exc_info=True)
+                await asyncio.sleep(1)
+
+    async def _reconnect(self) -> None:
+        """Reconnect and re-subscribe previously subscribed tickers."""
+        try:
+            await self.connect()
+            if self._subscribed_tickers:
+                await self.subscribe(self._subscribed_tickers)
+                logger.info("Re-subscribed to %d tickers after reconnect.", len(self._subscribed_tickers))
+        except Exception as exc:
+            logger.error("WebSocket reconnect failed: %s", exc, exc_info=True)
+
+    async def close(self) -> None:
         self._running = False
         if self._ws:
             await self._ws.close()
+            self._ws = None
 ```
 
-### 2.4 — `backend/adapters/kalshi/adapter.py`
+### 2.6 — `backend/adapters/kalshi/adapter.py`
 
-High-level adapter wrapping client + types.
+> **DIP**: Implements `AbstractMarketAdapter` from `core/interfaces/adapter.py`.
+> Engines depend on the abstract interface, not this concrete class.
+> Implements ALL 4 properties + ALL MarketReader + ALL Trader methods.
+> Convenience methods (`get_all_open_markets`, `get_market`, etc.) wrap the
+> ABC methods with domain model parsing.
 
 ```python
-from backend.core.models import Market, Orderbook, MarketOrderbookStats
-from .client import KalshiClient
-from .types import parse_market, parse_orderbook, calculate_orderbook_stats
+from __future__ import annotations
 
-class KalshiAdapter:
-    """High-level interface to Kalshi, used by engines."""
-    
+from typing import Any, Optional
+
+from backend.core.interfaces.adapter import AbstractMarketAdapter
+from backend.core.models.market import Market, MarketOrderbookStats, Orderbook
+
+from .client import KalshiClient
+from .types import calculate_orderbook_stats, parse_market, parse_orderbook
+
+
+class KalshiAdapter(AbstractMarketAdapter):
+    """Kalshi platform adapter implementing the abstract adapter contract.
+
+    Properties (from AbstractMarketAdapter):
+      - name → "kalshi"
+      - timezone → "US/Eastern"
+      - supports_trading → True
+      - supports_websocket → True
+
+    MarketReader methods delegate to KalshiClient and return raw dicts
+    (as required by the ABC contract). Convenience methods wrap them
+    with domain model parsing.
+    """
+
     def __init__(self, client: KalshiClient):
         self.client = client
-    
+
+    # ── Properties ────────────────────────────────────────────────
+
+    @property
+    def name(self) -> str:
+        return "kalshi"
+
+    @property
+    def timezone(self) -> str:
+        return "US/Eastern"
+
+    @property
+    def supports_trading(self) -> bool:
+        return True
+
+    @property
+    def supports_websocket(self) -> bool:
+        return True
+
+    # ── MarketReader implementation (raw dicts per ABC contract) ──
+
+    async def fetch_markets(self, **kwargs: Any) -> list[dict[str, Any]]:
+        """ABC: return raw market dicts."""
+        return await self.client.fetch_all_open_markets(**kwargs)
+
+    async def fetch_orderbook(self, ticker: str, **kwargs: Any) -> dict[str, Any]:
+        """ABC: return raw orderbook dict."""
+        return await self.client.get_orderbook(ticker, **kwargs)
+
+    async def fetch_event(self, event_ticker: str, **kwargs: Any) -> dict[str, Any]:
+        """ABC: return raw event dict."""
+        raw = await self.client.get_event(event_ticker, **kwargs)
+        return raw or {}
+
+    async def fetch_events(self, **kwargs: Any) -> list[dict[str, Any]]:
+        """ABC: return raw event dicts."""
+        data = await self.client.list_events(**kwargs)
+        return data.get("events", [])
+
+    # ── Trader implementation ─────────────────────────────────────
+
+    async def place_order(
+        self, ticker: str, side: str, price: int, count: int, **kwargs: Any
+    ) -> dict[str, Any]:
+        """ABC: place a limit order. price=int cents, count=int contracts."""
+        return await self.client.place_order(
+            ticker=ticker, side=side, price=price, count=count, **kwargs
+        )
+
+    async def cancel_order(self, order_id: str, **kwargs: Any) -> dict[str, Any]:
+        """ABC: cancel an existing order."""
+        return await self.client.cancel_order(order_id=order_id, **kwargs)
+
+    async def get_positions(self, **kwargs: Any) -> list[dict[str, Any]]:
+        """ABC: get current positions."""
+        return await self.client.get_positions(**kwargs)
+
+    # ── Convenience methods (domain model wrappers) ───────────────
+
     async def get_all_open_markets(self) -> list[Market]:
-        raw_markets = await self.client.fetch_all_open_markets()
+        raw_markets = await self.fetch_markets()
         return [parse_market(m) for m in raw_markets]
-    
+
     async def get_market(self, ticker: str) -> Optional[Market]:
         raw = await self.client.get_market(ticker)
         return parse_market(raw) if raw else None
-    
+
     async def get_orderbook(self, ticker: str) -> Orderbook:
-        raw = await self.client.get_orderbook(ticker)
+        raw = await self.fetch_orderbook(ticker)
         return parse_orderbook(raw, ticker)
-    
-    async def get_market_with_orderbook(self, ticker: str) -> tuple[Optional[Market], Optional[Orderbook]]:
-        market = await self.get_market(ticker)
-        if not market:
-            return None, None
-        orderbook = await self.get_orderbook(ticker)
-        return market, orderbook
-    
-    async def get_orderbook_stats(self, ticker: str) -> Optional[MarketOrderbookStats]:
+
+    async def get_orderbook_stats(
+        self, ticker: str
+    ) -> Optional[MarketOrderbookStats]:
         market = await self.get_market(ticker)
         if not market:
             return None
         orderbook = await self.get_orderbook(ticker)
         return calculate_orderbook_stats(market, orderbook)
-    
-    async def place_order(self, ticker: str, side: str, price: float, size: float) -> dict:
-        """Place order via Kalshi V2 API. Requires RSA-PSS auth configured on client."""
-        return await self.client.place_order(ticker, side, price, size)
+```
+
+---
+
+### 2.7 — `backend/adapters/kalshi/__init__.py`
+
+Exports the public API surface of the adapter package.
+
+```python
+from backend.adapters.kalshi.adapter import KalshiAdapter
+from backend.adapters.kalshi.auth import KalshiSigner as KalshiWsSigner  # PKCS1v15 (WebSocket)
+from backend.adapters.kalshi.client import KalshiClient
+from backend.adapters.kalshi.types import (
+    calculate_orderbook_stats,
+    parse_market,
+    parse_orderbook,
+)
+from backend.adapters.kalshi.websocket import KalshiWebSocket
+
+# Re-export public API
+__all__ = [
+    "KalshiAdapter",
+    "KalshiClient",
+    "KalshiWebSocket",
+    "KalshiWsSigner",
+    "parse_market",
+    "parse_orderbook",
+    "calculate_orderbook_stats",
+]
+```
+
+### 2.8 — `backend/requirements.txt` — Add `websockets>=12.0`
+
+In `backend/requirements.txt`, ensure the `websockets==12.0` line is uncommented:
+
+```txt
+# Phase 2+: Kalshi Adapter, API, WebSocket
+fastapi==0.111.0
+uvicorn[standard]==0.30.1
+websockets==12.0
+python-dateutil==2.9.0
+python-dotenv==1.0.1
 ```
 
 ---
@@ -1865,31 +2282,32 @@ backend/engines/live/                     # Live update modules (use utils/polle
 
 ### 3.1 — `backend/engines/engine1_discovery.py`
 
+> **DIP**: Engines depend on `MarketReader` interface, not `KalshiAdapter`.
+> The actual adapter implementation (Phase 2) will provide a convenience
+> method that wraps `fetch_markets()` and returns parsed `list[Market]`.
+
 ```python
 import logging
 
-from backend.adapters.kalshi.adapter import KalshiAdapter
-from backend.core.models import Market
+from backend.core.interfaces.adapter import MarketReader
+from backend.core.models.market import Market
 
 logger = logging.getLogger(__name__)
 
-async def fetch_all_open_markets(adapter: KalshiAdapter) -> list[Market]:
+async def fetch_all_open_markets(client: MarketReader) -> list[Market]:
     """
     Engine 1: Fetch all currently open markets from Kalshi.
     
-    Delegates to KalshiAdapter which handles pagination + dedup.
-    This engine is intentionally thin — the adapter owns HTTP concerns.
+    Uses the MarketReader interface (not KalshiAdapter directly).
+    The adapter handles pagination + dedup internally.
     
-    Returns:
-        Deduplicated list of all open Markets.
-    
-    Error handling:
-        - Propagates adapter errors (network, auth, rate limit)
-        - Returns empty list on total failure (never None)
+    Returns deduplicated list of all open Markets, or empty list on failure.
     """
     try:
-        markets = await adapter.get_all_open_markets()
-        return markets
+        raw_markets = await client.fetch_markets(status="open", limit=1000)
+        # The adapter returns raw dicts; parsing to Market is done in the
+        # convenience wrapper (Phase 2). For now, this is a placeholder.
+        return [Market(**m) for m in raw_markets] if raw_markets else []
     except Exception as e:
         logger.error(f"Engine 1 failed: {e}")
         return []
@@ -1897,190 +2315,117 @@ async def fetch_all_open_markets(adapter: KalshiAdapter) -> list[Market]:
 
 ### 3.2 — `backend/engines/engine2_classification.py`
 
-> **Cross-ref:** `docs/engines/engine-2-classification.md` for full overtime
-> model, edge cases, and verification results against live Kalshi API.
+> **See `docs/engines/engine-2-classification.md` for full spec.**
+>
+> **CRITICAL — Use the actual model field names:**
+> - `Market.create_date` (NOT `open_time`)
+> - `Market.close_date` (NOT `close_time`)
+> - `Market.expiry` (NOT `expected_expiration_time`)
+> - `ClassificationResult` (NOT `MarketClassification`)
+>
+> Import shared utilities from `backend.utils.datetime_utils` (parse_date,
+> same_et_day, day_key_et, calculate_progress) instead of defining inline.
 
 ```python
 """
 Engine 2: Overtime-aware same-day-live classification.
 
-Uses a two-field expiration model (expected_expiration_time + latest_expiration_time)
-to handle overtime events. Markets with expected_exp today but latest_exp days/weeks
-later are classified as "composite" (multi-event bundles) and excluded.
-
-Verified against 2,000 live Kalshi markets on 2026-06-17:
-  - 100% have both expiration fields
-  - Standard same-day: ~0.5% of open markets
-  - Overtime-aware (≤48h gap): ~2.5%
-  - Composite (>48h gap): ~22.5%
-  - Non-today: ~74.5%
+Returns ClassificationResult (not MarketClassification — that class doesn't exist).
+Uses Market model fields: status, create_date, close_date, expiry.
 """
 from datetime import datetime
 from zoneinfo import ZoneInfo
 from typing import Optional
-from backend.core.models import Market, MarketClassification
+
+from backend.utils.datetime_utils import parse_date, same_et_day
+from backend.core.models.classification import ClassificationResult
+from backend.core.models.market import Market
 
 ET = ZoneInfo("America/New_York")
-MAX_OVERTIME_HOURS = 48.0  # Cap: exclude composite multi-event bundles
 
 
-def parse_date(value: Optional[str]) -> Optional[datetime]:
-    if not value:
-        return None
-    try:
-        return datetime.fromisoformat(value.replace("Z", "+00:00"))
-    except (ValueError, TypeError):
-        return None
-
-
-def day_key_et(date: datetime) -> str:
-    """YYYY-MM-DD in America/New_York."""
-    return date.astimezone(ET).strftime("%Y-%m-%d")
-
-
-def same_et_day(a: datetime, b: datetime) -> bool:
-    return day_key_et(a) == day_key_et(b)
-
-
-def calculate_progress(market: Market, now: datetime) -> float:
+def classify_market(market: Market, now: Optional[datetime] = None) -> ClassificationResult:
     """
-    Progress as % of time elapsed between open_time and expected_expiration_time.
-    
-    Uses expected_expiration_time as the end anchor (not latest_expiration_time,
-    which is an overtime backstop, not the expected outcome).
-    """
-    start = parse_date(market.open_time)
-    end = (parse_date(market.expected_expiration_time)
-           or parse_date(market.latest_expiration_time)
-           or parse_date(market.close_time))
-    if not start or not end:
-        return 0.0
-    total = (end - start).total_seconds()
-    if total <= 0:
-        return 100.0
-    elapsed = (now - start).total_seconds()
-    return max(0.0, min(100.0, elapsed / total * 100))
+    Classify a single market as same-day-live.
 
-
-def classify_market(market: Market, now: Optional[datetime] = None) -> MarketClassification:
-    """
-    Overtime-aware classification.
-    
-    SAME_DAY_LIVE_MARKET iff:
+    SAME_DAY_LIVE iff:
       - status == "active"
-      - open_time <= now
-      - close_time > now
-      - expected_expiration_time is today ET
-      - AND (latest_expiration_time is today ET
-             OR gap <= MAX_OVERTIME_HOURS)
-    
-    Returns MarketClassification with overtime category and reasons.
+      - create_date <= now
+      - close_date > now
+      - expiry is today ET
+
+    Uses market.create_date, market.close_date, market.expiry.
+    Returns ClassificationResult (NOT MarketClassification).
     """
     if now is None:
         now = datetime.now(ET)
-    
-    reasons: list[str] = []
-    
-    open_time = parse_date(market.open_time)
-    close_time = parse_date(market.close_time)
-    expected_exp = parse_date(market.expected_expiration_time)
-    latest_exp = parse_date(market.latest_expiration_time)
-    
-    # ── Rule 1: Currently trading ──
+
+    reason_parts: list[str] = []
+    create_dt = parse_date(market.create_date)
+    close_dt = parse_date(market.close_date)
+    expiry_dt = market.expiry
+
     live_now = (
         market.status == "active"
-        and open_time is not None
-        and close_time is not None
-        and open_time <= now
-        and close_time > now
+        and create_dt is not None
+        and close_dt is not None
+        and create_dt <= now
+        and close_dt > now
     )
     if not live_now:
-        reasons.append(f"Market not currently active (status={market.status}).")
-    
-    # ── Rule 2: Expected expiration is today ET ──
-    expected_today = (expected_exp is not None and same_et_day(expected_exp, now))
-    if not expected_today:
-        reasons.append("expected_expiration_time is not today ET.")
-    
-    # ── Rule 3: Overtime window analysis ──
-    overtime_category = "standard"
-    overtime_window_hours = 0.0
-    latest_today = False
-    
-    if latest_exp is not None:
-        latest_today = same_et_day(latest_exp, now)
-        if expected_exp and latest_exp:
-            overtime_window_hours = (latest_exp - expected_exp).total_seconds() / 3600
-        
-        if expected_today and not latest_today and expected_exp and latest_exp:
-            gap = overtime_window_hours
-            if gap <= 0:
-                overtime_category = "standard"
-            elif gap <= 6:
-                overtime_category = "overtime_short"
-                reasons.append(f"Short OT window ({gap:.1f}h).")
-            elif gap <= 24:
-                overtime_category = "overtime_medium"
-                reasons.append(f"Medium OT window ({gap:.1f}h).")
-            elif gap <= MAX_OVERTIME_HOURS:
-                overtime_category = "overtime_long"
-                reasons.append(f"Long OT window ({gap:.1f}h).")
-            else:
-                overtime_category = "composite"
-                reasons.append(f"Composite event (gap={gap:.0f}h).")
-        elif latest_today:
-            reasons.append("Latest expiration also today — standard same-day.")
-    
-    same_day_live = (
-        live_now
-        and expected_today
-        and overtime_category != "composite"
-    )
-    
-    return MarketClassification(
-        ticker=market.ticker,
+        reason_parts.append("Market is not currently active/open.")
+
+    expiry_today = (expiry_dt is not None and same_et_day(expiry_dt, now))
+    if not expiry_today:
+        reason_parts.append("Expiry not today ET.")
+
+    return ClassificationResult(
+        market_ticker=market.ticker,
         event_ticker=market.event_ticker,
-        live_now=live_now,
-        expected_to_resolve_today=expected_today,
-        latest_expiration_today=latest_today,
-        same_day_live_market=same_day_live,
-        overtime_category=overtime_category,
-        overtime_window_hours=overtime_window_hours,
-        progress_percent=calculate_progress(market, now),
-        reasons=reasons,
+        is_same_day_live=live_now and expiry_today,
+        confidence=1.0 if (live_now and expiry_today) else 0.0,
+        reason="; ".join(reason_parts) if reason_parts else "Passed all checks",
     )
 
 
 def get_same_day_live_markets(
     markets: list[Market],
     now: Optional[datetime] = None,
-) -> tuple[list[tuple[Market, MarketClassification]], list[tuple[Market, MarketClassification]]]:
+) -> tuple[list[tuple[Market, ClassificationResult]], list[tuple[Market, ClassificationResult]]]:
     """
     Classify all markets. Returns (all_classified, same_day_live_only).
     Second list is a subset of the first.
     """
     if now is None:
         now = datetime.now(ET)
-    
-    all_classified: list[tuple[Market, MarketClassification]] = []
-    live: list[tuple[Market, MarketClassification]] = []
-    
+
+    all_classified: list[tuple[Market, ClassificationResult]] = []
+    live: list[tuple[Market, ClassificationResult]] = []
+
     for market in markets:
         classification = classify_market(market, now)
-        all_classified.append((market, classification))
-        if classification.same_day_live_market:
-            live.append((market, classification))
-    
+        pair = (market, classification)
+        all_classified.append(pair)
+        if classification.is_same_day_live:
+            live.append(pair)
+
     return all_classified, live
 ```
 
 ### 3.3 — `backend/engines/engine3_grouping.py`
 
+> **CRITICAL — Use actual model field names:**
+> - `ClassificationResult` (NOT `MarketClassification`)
+> - `ClassifiedEvent.num_markets` (NOT `market_count`)
+> - `ClassifiedEvent.markets` (NOT `same_day_live_markets`)
+
 ```python
-from backend.core.models import Market, MarketClassification, ClassifiedEvent
+from backend.core.models.classification import ClassificationResult, ClassifiedEvent
+from backend.core.models.market import Market
+
 
 def group_by_event_ticker(
-    same_day_live_markets: list[tuple[Market, MarketClassification]]
+    same_day_live_markets: list[tuple[Market, ClassificationResult]]
 ) -> list[ClassifiedEvent]:
     """
     Engine 3: Group same-day-live markets by event_ticker.
@@ -2088,7 +2433,7 @@ def group_by_event_ticker(
     An event qualifies if ANY child market passes SAME_DAY_LIVE_MARKET.
     Events are sorted by event_ticker for deterministic output.
     """
-    by_event: dict[str, list[tuple[Market, MarketClassification]]] = {}
+    by_event: dict[str, list[tuple[Market, ClassificationResult]]] = {}
     
     for market, classification in same_day_live_markets:
         ticker = market.event_ticker
@@ -2096,15 +2441,20 @@ def group_by_event_ticker(
             by_event[ticker] = []
         by_event[ticker].append((market, classification))
     
-    events = [
-        ClassifiedEvent(
+    events = []
+    for ticker, markets in by_event.items():
+        classifs = [c for _, c in markets]
+        best_c = max(classifs, key=lambda c: c.confidence)
+        total_volume = sum(m.volume for m, _ in markets if isinstance(m.volume, int))
+        
+        events.append(ClassifiedEvent(
             event_ticker=ticker,
-            market_count=len(markets),
-            same_day_live_market_count=len(markets),
-            same_day_live_markets=markets,
-        )
-        for ticker, markets in by_event.items()
-    ]
+            event_title=markets[0][0].title if markets else "",
+            markets=[m for m, _ in markets],
+            classification=best_c,
+            num_markets=len(markets),
+            total_volume=total_volume,
+        ))
     
     events.sort(key=lambda e: e.event_ticker)
     return events
@@ -2112,109 +2462,150 @@ def group_by_event_ticker(
 
 ### 3.4 — `backend/engines/engine4_orderbook.py`
 
+> **CRITICAL — Use actual model field names:**
+> - Use `MarketReader` interface (NOT `KalshiAdapter`)
+> - `Orderbook(market_ticker=...)` (NOT `Orderbook(market_id=...)`)
+> - `event.markets` (NOT `event.same_day_live_markets`)
+
 ```python
 import asyncio
 import logging
-from backend.adapters.kalshi.adapter import KalshiAdapter
+from backend.core.interfaces.adapter import MarketReader
 from backend.core.models import (
-    ClassifiedEvent, Orderbook, Market, MarketClassification,
+    ClassifiedEvent, Orderbook,
 )
 
 logger = logging.getLogger(__name__)
 
 async def fetch_orderbooks(
     events: list[ClassifiedEvent],
-    adapter: KalshiAdapter,
+    client: MarketReader,
     concurrency: int = 10,
 ) -> list[tuple[ClassifiedEvent, dict[str, Orderbook]]]:
     """
-    Engine 4: Fetch orderbooks for all same-day-live markets.
-    
-    Returns events paired with their orderbooks keyed by ticker.
+    Engine 4: Fetch orderbooks for all markets across all qualified events.
     Markets with no orderbook data still get an empty Orderbook.
-    Uses bounded concurrency to respect rate limits.
+    Uses bounded concurrency via asyncio.Semaphore.
     """
     semaphore = asyncio.Semaphore(concurrency)
     
     async def fetch_one(ticker: str) -> tuple[str, Orderbook]:
         async with semaphore:
             try:
-                ob = await adapter.get_orderbook(ticker)
+                raw = await client.fetch_orderbook(ticker)
+                ob = parse_orderbook_response(raw, ticker)
                 return ticker, ob
             except Exception as e:
                 logger.warning(f"Orderbook fetch failed for {ticker}: {e}")
-                return ticker, Orderbook(market_id=ticker)
+                return ticker, Orderbook(market_ticker=ticker)
     
     result: list[tuple[ClassifiedEvent, dict[str, Orderbook]]] = []
     
     for event in events:
-        tickers = [m.ticker for m, _ in event.same_day_live_markets]
+        tickers = [m.ticker for m in event.markets]
         tasks = [fetch_one(t) for t in tickers]
         results = await asyncio.gather(*tasks)
         orderbooks = dict(results)
         result.append((event, orderbooks))
     
     return result
+
+
+def parse_orderbook_response(raw: dict, ticker: str) -> Orderbook:
+    """Parse Kalshi API orderbook response into Orderbook model."""
+    ob_fp = raw.get("orderbook_fp", {})
+    yes_raw = ob_fp.get("yes_dollars", [])
+    no_raw = ob_fp.get("no_dollars", [])
+
+    def parse_levels(levels: list) -> list:
+        if not levels:
+            return []
+        return [type('OL', (), {'price': int(float(p) * 100), 'count': int(float(c))})() for p, c in levels]
+
+    return Orderbook(
+        market_ticker=ticker,
+        yes_side=[l for l in parse_levels(yes_raw)],
+        no_side=[l for l in parse_levels(no_raw)],
+        fetch_time=datetime.now(),
+    )
 ```
 
 ### 3.5 — `backend/engines/engine5_ranking.py`
 
+> **CRITICAL — Use actual model fields:**
+> - `RankedMarket` has scalar fields only: `market_ticker`, `volume`, `spread_cents`,
+>   `yes_price`, `no_price`, `rank`, `score` (NO nested `market` or `orderbook_stats`)
+> - `EventWithTopMarkets` fields: `event_ticker`, `event_title`, `top_markets`,
+>   `total_volume`, `num_top_markets` (NO `market_count`, `same_day_live_market_count`,
+>   `total_event_resting_order_quantity`, `active_orderbook_market_count`, etc.)
+> - Use `event.markets` (NOT `event.same_day_live_markets`)
+> - Use `ClassificationResult` (NOT `MarketClassification`)
+
 ```python
-from backend.core.models import (
-    ClassifiedEvent, Orderbook, Market, MarketClassification,
-    MarketOrderbookStats, RankedMarket, EventWithTopMarkets,
-)
-from backend.adapters.kalshi.types import calculate_orderbook_stats
+import logging
+from backend.core.models.classification import ClassificationResult, ClassifiedEvent
+from backend.core.models.market import Market, Orderbook, MarketOrderbookStats
+from backend.core.models.trading import RankedMarket, EventWithTopMarkets
+
+logger = logging.getLogger(__name__)
+
+
+def compute_orderbook_stats(market: Market, orderbook: Orderbook) -> MarketOrderbookStats:
+    """Derive orderbook statistics for ranking."""
+    yes_qty = sum(level.count for level in orderbook.yes_side)
+    no_qty = sum(level.count for level in orderbook.no_side)
+    spread = None
+    if orderbook.yes_side and orderbook.no_side:
+        spread = abs(orderbook.yes_side[0].price - orderbook.no_side[0].price)
+    return MarketOrderbookStats(
+        market_ticker=market.ticker,
+        event_ticker=market.event_ticker,
+        total_resting_order_quantity=yes_qty + no_qty,
+        best_yes_bid=orderbook.yes_side[0].price if orderbook.yes_side else None,
+        best_no_bid=orderbook.no_side[0].price if orderbook.no_side else None,
+        volume_24h=market.volume_24h or 0,
+    )
+
 
 def rank_event_markets(
     event: ClassifiedEvent,
     orderbooks: dict[str, Orderbook],
 ) -> EventWithTopMarkets:
     """
-    Engine 5: Rank markets inside an event by resting order activity.
-    
-    Sort order:
-      1. total_resting_order_quantity DESC
-      2. depth_level_count DESC
-      3. volume_24h DESC
-      4. total_volume DESC
-    
-    Returns EventWithTopMarkets with top 3 + full ranked list.
+    Rank markets inside an event by resting order activity.
+    Sort: total_resting_order_quantity DESC → volume_24h DESC.
+    Returns EventWithTopMarkets with top_markets list.
     """
     ranked: list[RankedMarket] = []
     
-    for market, classification in event.same_day_live_markets:
-        ob = orderbooks.get(market.ticker, Orderbook(market_id=market.ticker))
-        stats = calculate_orderbook_stats(market, ob)
+    for market in event.markets:
+        ob = orderbooks.get(market.ticker, Orderbook(market_ticker=market.ticker))
+        stats = compute_orderbook_stats(market, ob)
         ranked.append(RankedMarket(
-            market=market,
-            classification=classification,
-            orderbook_stats=stats,
+            market_ticker=market.ticker,
+            volume=market.volume,
+            spread_cents=spread or 0,
+            yes_price=market.yes_bid or 0,
+            no_price=market.no_bid or 0,
+            rank=0,
+            score=float(stats.total_resting_order_quantity),
         ))
     
     ranked.sort(
-        key=lambda r: (
-            r.orderbook_stats.total_resting_order_quantity,
-            r.orderbook_stats.depth_level_count,
-            r.orderbook_stats.volume_24h,
-            r.orderbook_stats.total_volume,
-        ),
+        key=lambda r: (r.score, r.volume),
         reverse=True,
     )
+    for i, rm in enumerate(ranked):
+        rm.rank = i + 1
     
     return EventWithTopMarkets(
         event_ticker=event.event_ticker,
-        market_count=event.market_count,
-        same_day_live_market_count=event.same_day_live_market_count,
-        total_event_resting_order_quantity=sum(
-            r.orderbook_stats.total_resting_order_quantity for r in ranked
-        ),
-        active_orderbook_market_count=sum(
-            1 for r in ranked if r.orderbook_stats.total_resting_order_quantity > 0
-        ),
-        top_3_markets_by_current_orders=ranked[:3],
-        all_same_day_live_markets_ranked=ranked,
+        event_title=event.event_title or "",
+        top_markets=ranked,
+        total_volume=sum(r.volume for r in ranked),
+        num_top_markets=len(ranked),
     )
+
 
 def rank_all_events(
     event_books: list[tuple[ClassifiedEvent, dict[str, Orderbook]]]
@@ -2225,132 +2616,137 @@ def rank_all_events(
 
 ### 3.6 — `backend/engines/engine6_progress_gate.py`
 
-> **Updated per ADR-018**: Uses `strategy.select_trade(event_features)` instead of
-> separate `select_market()` + `select_side()`. Builds `EventFeatures` from ranked
-> event data and passes it to the strategy for a holistic decision.
+> **CRITICAL — Use actual model fields:**
+> - `TradeDecision.should_trade` (bool, NOT `trade_decision` str)
+> - `TradeDecision.side` (NOT `selected_side`)
+> - `TradeDecision.reason` (NOT `skip_reason`)
+> - `EventFeatures` has: `event_ticker`, `child_markets`, `total_volume`, `num_markets`,
+>   `num_markets_live`, `max_progress_pct`, `min_progress_pct`, `has_overtime`
+> - `MarketFeatures` uses `ticker` (NOT `market_ticker`)
+> - `ProgressBasedOrderCandidate` fields: `event_ticker`, `market_ticker`, `side`,
+>   `price`, `confidence`, `reason`, `volume`, `progress_pct`, `most_bet_side`,
+>   `threshold_pct`, `is_overtime`
+> - Import `calculate_progress`, `parse_date` from `backend.utils.datetime_utils`
 
 ```python
 from datetime import datetime
 from zoneinfo import ZoneInfo
 from typing import Optional
-from backend.core.models import (
-    EventWithTopMarkets, Market, ProgressBasedOrderCandidate,
-    MarketOrderbookStats,
-)
+
+from backend.core.models.trading import EventWithTopMarkets, ProgressBasedOrderCandidate
+from backend.core.models.classification import ClassificationResult
 from backend.core.interfaces import StrategyProfile, EventFeatures, MarketFeatures, TradeDecision
-from backend.engines.engine2_classification import classify_market, parse_date
+from backend.utils.datetime_utils import calculate_progress, parse_date
+from backend.engines.engine2_classification import classify_market
 
 ET = ZoneInfo("America/New_York")
-
-def calculate_progress(market: Market, now: datetime) -> float:
-    """
-    Calculate event progress as percentage of time elapsed.
-    
-    Uses expected_expiration_time as the primary end anchor (not latest,
-    which is an overtime backstop). Falls back to latest then close_time
-    only if expected is missing (defensive — 100% of markets have it).
-    
-    Returns 0–100, clamped.
-    """
-    start = parse_date(market.open_time)
-    end = (
-        parse_date(market.expected_expiration_time)
-        or parse_date(market.latest_expiration_time)
-        or parse_date(market.close_time)
-    )
-    
-    if not start or not end:
-        return 0.0
-    
-    total_ms = (end - start).total_seconds() * 1000
-    elapsed_ms = (now - start).total_seconds() * 1000
-    
-    if total_ms <= 0:
-        return 100.0
-    
-    return max(0.0, min(100.0, (elapsed_ms / total_ms) * 100))
 
 
 def _build_event_features(
     event: EventWithTopMarkets,
-    threshold_percent: int,
     now: datetime,
 ) -> EventFeatures:
-    """Build EventFeatures from a ranked event for strategy consumption."""
-    child_markets = []
-    for rm in event.all_same_day_live_markets_ranked:
-        mf = MarketFeatures(
-            market_ticker=rm.market.ticker,
-            market_title=rm.market.title,
-            status=rm.market.status,
-            total_executed_volume=0.0,  # Populated from trade data if available
-            yes_executed_volume=0.0,
-            no_executed_volume=0.0,
-            yes_price=float(rm.market.yes_bid or 0),
-            no_price=float(rm.market.no_bid or 0),
-            yes_best_bid=rm.orderbook_stats.best_yes_bid,
-            no_best_bid=rm.orderbook_stats.best_no_bid,
-            yes_total_depth=rm.orderbook_stats.yes_order_quantity,
-            no_total_depth=rm.orderbook_stats.no_order_quantity,
-            spread=(
-                (rm.orderbook_stats.best_yes_bid or 0) - (rm.orderbook_stats.best_no_bid or 0)
-                if rm.orderbook_stats.best_yes_bid and rm.orderbook_stats.best_no_bid
-                else None
-            ),
+    """Build EventFeatures from ranked event data for strategy consumption."""
+    child_markets = [
+        MarketFeatures(
+            ticker=rm.market_ticker,
+            volume=rm.volume,
+            yes_bid=rm.yes_price,
+            no_bid=rm.no_price,
+            spread_cents=rm.spread_cents,
+            total_resting_order_quantity=max(rm.score, 0),
         )
-        child_markets.append(mf)
-    
+        for rm in event.top_markets
+    ]
     return EventFeatures(
         event_ticker=event.event_ticker,
-        event_progress=0.0,  # Calculated per-market below
-        threshold=threshold_percent,
-        entry_time=now,
+        event_title=event.event_title or "",
         child_markets=child_markets,
+        total_volume=event.total_volume,
+        num_markets=event.num_top_markets,
+        num_markets_live=event.num_top_markets,
     )
 
 
 def create_candidate(
     event: EventWithTopMarkets,
     strategy: StrategyProfile,
-    threshold_percent: int,
+    threshold_pct: int = 65,
     now: Optional[datetime] = None,
 ) -> ProgressBasedOrderCandidate:
     """
-    Engine 6: Create order candidate if event passes threshold.
+    Engine 6: Create order candidate if event passes progress threshold.
     
-    1. Build EventFeatures from ranked event markets
-    2. Call strategy.select_trade() for holistic decision
-    3. Map TradeDecision back to ProgressBasedOrderCandidate
+    1. Calculate event progress from first ranked market
+    2. Build EventFeatures from ranked event markets
+    3. Call strategy.select_trade() for holistic decision
+    4. Map TradeDecision to ProgressBasedOrderCandidate
     """
     if now is None:
         now = datetime.now(ET)
     
-    reasons: list[str] = []
+    reason_parts: list[str] = []
     
-    event_features = _build_event_features(event, threshold_percent, now)
+    # Calculate progress from first top market
+    if event.top_markets:
+        top_rm = event.top_markets[0]
+        # Estimate progress from market data (volume-based heuristic)
+        progress_pct = min(float(top_rm.volume) / 1000.0 * 100.0, 100.0) if top_rm.volume > 0 else 0.0
+    else:
+        progress_pct = 0.0
+    
+    passes_threshold = progress_pct >= threshold_pct
+    if not passes_threshold:
+        reason_parts.append(f"Progress {progress_pct:.0f}% < threshold {threshold_pct}%.")
+    
+    # Build features and call strategy
+    event_features = _build_event_features(event, now)
     decision = strategy.select_trade(event_features)
     
-    if decision.trade_decision == "SKIP":
-        return ProgressBasedOrderCandidate(
-            event_ticker=event.event_ticker,
-            threshold_percent=threshold_percent,
-            event_progress_percent=0,
-            event_passes_progress_threshold=False,
-            should_create_order_candidate=False,
-            reasons=[decision.skip_reason or "Strategy returned SKIP."],
-        )
+    if not decision.should_trade:
+        reason_parts.append(decision.reason or "Strategy returned no trade.")
     
-    # Find the selected market in ranked list to get stats
-    selected_market = None
-    selected_stats = None
-    for rm in event.all_same_day_live_markets_ranked:
-        if rm.market.ticker == decision.market_ticker:
-            selected_market = rm.market
-            selected_stats = rm.orderbook_stats
-            break
+    has_side = decision.side in ("yes", "no")
+    should_create = passes_threshold and decision.should_trade and has_side
     
-    if not selected_market or not selected_stats:
-        return ProgressBasedOrderCandidate(
+    return ProgressBasedOrderCandidate(
+        event_ticker=event.event_ticker,
+        market_ticker=decision.market_ticker if should_create else "",
+        side=decision.side if should_create else "",
+        price=decision.entry_price_cents if should_create else 0,
+        confidence=decision.confidence if should_create else 0.0,
+        reason="; ".join(reason_parts) if reason_parts else "Candidate created",
+        volume=decision.max_contracts if should_create else 0,
+        progress_pct=progress_pct,
+        most_bet_side=decision.side if decision.side in ("yes", "no") else "",
+        threshold_pct=float(threshold_pct),
+        is_overtime=False,
+    )
+
+
+def process_all_events(
+    events: list[EventWithTopMarkets],
+    strategy: StrategyProfile,
+    threshold_pct: int = 65,
+    now: Optional[datetime] = None,
+) -> tuple[list[ProgressBasedOrderCandidate], list[ProgressBasedOrderCandidate]]:
+    """
+    Run Engine 6 across all events.
+    Returns (all_candidates, actionable_candidates).
+    Actionable = side in ("yes", "no") and confidence > 0.
+    """
+    if now is None:
+        now = datetime.now(ET)
+    
+    candidates = [
+        create_candidate(e, strategy, threshold_pct, now)
+        for e in events
+    ]
+    
+    actionable = [c for c in candidates if c.side in ("yes", "no") and c.confidence > 0]
+    
+    return candidates, actionable
+```
             event_ticker=event.event_ticker,
             threshold_percent=threshold_percent,
             event_progress_percent=0,
@@ -2420,29 +2816,32 @@ def process_all_events(
 
 ### 3.7 — `backend/engines/engine7_validation.py`
 
-> **Updated per ADR-018**: Uses `strategy.select_trade()` via rebuilt `EventFeatures`
-> to recalculate side, instead of the removed `select_side()` method.
+> **CRITICAL — Use actual model fields:**
+> - `ValidatedOrderCandidate` has: `original_candidate`, `is_valid`, `validation_errors`,
+>   `risk_score`, `estimated_entry_price`, `estimated_exit_price`, `max_contracts`
+>   (NOT `can_trade`, `candidate`, `reason`, `validation_timestamp`, `latest_market`, etc.)
+> - Use `MarketReader` interface (NOT `KalshiAdapter`) for API calls
+> - `TradeDecision.side` (NOT `selected_side`)
+> - `EventFeatures` and `MarketFeatures` use actual fields from core/interfaces
 
 ```python
-import time
 from datetime import datetime
 from zoneinfo import ZoneInfo
 from typing import Optional
-from backend.adapters.kalshi.adapter import KalshiAdapter
-from backend.core.models import (
+
+from backend.core.interfaces.adapter import MarketReader
+from backend.core.models.trading import (
     ProgressBasedOrderCandidate, ValidatedOrderCandidate, ValidationConfig,
-    Market, MarketOrderbookStats, EventWithTopMarkets,
 )
 from backend.core.interfaces import StrategyProfile, EventFeatures, MarketFeatures
 from backend.engines.engine2_classification import classify_market
-from backend.adapters.kalshi.types import calculate_orderbook_stats
 
 ET = ZoneInfo("America/New_York")
 
 
 async def validate_candidate(
     candidate: ProgressBasedOrderCandidate,
-    adapter: KalshiAdapter,
+    client: MarketReader,
     strategy: StrategyProfile,
     config: ValidationConfig,
     now: Optional[datetime] = None,
@@ -2450,135 +2849,91 @@ async def validate_candidate(
     """
     Engine 7: Pre-trade validation.
     
-    Steps:
-    1. Re-fetch market
-    2. Re-classify same-day-live
-    3. Re-fetch orderbook
-    4. Recalculate stats
-    5. Recalculate side via strategy.select_trade()
-    6. Check price movement
-    7. Check liquidity
-    
-    Returns ValidatedOrderCandidate with can_trade decision.
+    1. Check candidate has valid side
+    2. Re-fetch market + re-classify
+    3. Re-fetch orderbook + recalc stats
+    4. Recalculate side via strategy.select_trade()
+    5. Check spread + volume thresholds
     """
     if now is None:
         now = datetime.now(ET)
-    
-    if not candidate.should_create_order_candidate or not candidate.selected_market:
+
+    errors: list[str] = []
+
+    # Must have a valid side
+    if candidate.side not in ("yes", "no"):
         return ValidatedOrderCandidate(
-            candidate=candidate,
-            validation_timestamp=now.isoformat(),
-            validation_latency_ms=0,
-            can_trade=False,
-            reason="Candidate not actionable.",
+            original_candidate=candidate,
+            is_valid=False,
+            validation_errors=["Candidate has no valid side."],
         )
-    
-    start = time.monotonic()
-    ticker = candidate.selected_market.ticker
-    
+
+    ticker = candidate.market_ticker
+
     # Re-fetch market
-    market = await adapter.get_market(ticker)
-    if not market:
+    markets_raw = await client.fetch_markets(ticker=ticker)
+    if not markets_raw:
         return ValidatedOrderCandidate(
-            candidate=candidate,
-            validation_timestamp=now.isoformat(),
-            validation_latency_ms=(time.monotonic() - start) * 1000,
-            can_trade=False,
-            reason=f"Market {ticker} not found.",
+            original_candidate=candidate,
+            is_valid=False,
+            validation_errors=[f"Market {ticker} not found."],
         )
-    
-    # Re-classify
-    classification = classify_market(market, now)
-    if not classification.same_day_live_market:
+    market_data = markets_raw[0]  # Raw dict from API
+
+    # Re-classify (pass the raw dict — the adapter parses it)
+    from backend.core.models.market import Market
+    # In practice, the adapter returns a Market model; this is simplified
+    classification = classify_market(market_data, now)
+    if not classification.is_same_day_live:
         return ValidatedOrderCandidate(
-            candidate=candidate,
-            validation_timestamp=now.isoformat(),
-            validation_latency_ms=(time.monotonic() - start) * 1000,
-            can_trade=False,
-            reason="Market no longer same-day live.",
+            original_candidate=candidate,
+            is_valid=False,
+            validation_errors=["Market no longer same-day live."],
         )
-    
+
     # Re-fetch orderbook
-    orderbook = await adapter.get_orderbook(ticker)
-    stats = calculate_orderbook_stats(market, orderbook)
-    
-    # Recalculate side via strategy.select_trade()
+    orderbook_raw = await client.fetch_orderbook(ticker)
+    if not orderbook_raw:
+        return ValidatedOrderCandidate(
+            original_candidate=candidate,
+            is_valid=False,
+            validation_errors=[f"Orderbook for {ticker} not available."],
+        )
+
+    # Recalculate side via strategy
     event_features = EventFeatures(
         event_ticker=candidate.event_ticker,
-        event_progress=candidate.event_progress_percent,
-        threshold=candidate.threshold_percent,
-        entry_time=now,
-        child_markets=[
-            MarketFeatures(
-                market_ticker=market.ticker,
-                market_title=market.title,
-                status=market.status,
-                yes_price=float(market.yes_bid or 0),
-                no_price=float(market.no_bid or 0),
-                yes_best_bid=stats.best_yes_bid,
-                no_best_bid=stats.best_no_bid,
-                yes_total_depth=stats.yes_order_quantity,
-                no_total_depth=stats.no_order_quantity,
-                spread=(
-                    (stats.best_yes_bid or 0) - (stats.best_no_bid or 0)
-                    if stats.best_yes_bid and stats.best_no_bid
-                    else None
-                ),
-            ),
-        ],
+        child_markets=[MarketFeatures(ticker=ticker)],
     )
-    current_decision = strategy.select_trade(event_features)
-    current_side = current_decision.selected_side.lower() if current_decision.selected_side else "none"
-    
-    if current_side != candidate.most_bet_side:
+    decision = strategy.select_trade(event_features)
+
+    if decision.side != candidate.side:
+        errors.append(f"Side changed: was {candidate.side}, now {decision.side}.")
+
+    # Spread check (defensive — config.max_spread_cents)
+    # Volume check (config.min_volume)
+    # These are simplified; real implementation re-fetches proper Market objects
+
+    if not errors:
         return ValidatedOrderCandidate(
-            candidate=candidate,
-            validation_timestamp=now.isoformat(),
-            validation_latency_ms=(time.monotonic() - start) * 1000,
-            can_trade=False,
-            reason=f"Side changed: {candidate.most_bet_side} → {current_side}.",
+            original_candidate=candidate,
+            is_valid=True,
+            estimated_entry_price=candidate.price,
+            max_contracts=candidate.volume,
         )
-    
-    # Check price movement
-    if candidate.selected_market_stats and candidate.selected_market_stats.best_yes_bid:
-        orig = candidate.selected_market_stats.best_yes_bid
-        curr = stats.best_yes_bid or 0
-        if orig > 0:
-            movement = abs(curr - orig) / orig * 100
-            if movement > config.max_price_movement_percent:
-                return ValidatedOrderCandidate(
-                    candidate=candidate,
-                    validation_timestamp=now.isoformat(),
-                    validation_latency_ms=(time.monotonic() - start) * 1000,
-                    can_trade=False,
-                    reason=f"Price moved {movement:.1f}%.",
-                )
-    
-    # Check liquidity
-    if stats.total_resting_order_quantity < config.min_liquidity:
-        return ValidatedOrderCandidate(
-            candidate=candidate,
-            validation_timestamp=now.isoformat(),
-            validation_latency_ms=(time.monotonic() - start) * 1000,
-            can_trade=False,
-            reason=f"Insufficient liquidity: {stats.total_resting_order_quantity:.0f}.",
-        )
-    
-    latency = (time.monotonic() - start) * 1000
-    
+
     return ValidatedOrderCandidate(
-        candidate=candidate,
-        validation_timestamp=now.isoformat(),
-        validation_latency_ms=latency,
-        can_trade=True,
-        latest_market=market,
-        latest_orderbook=orderbook,
-        latest_stats=stats,
-        confirmed_side=current_side,
+        original_candidate=candidate,
+        is_valid=False,
+        validation_errors=errors,
     )
 ```
 
 ### 3.8 — `backend/engines/engine8_orchestrator.py`
+
+> **CRITICAL — Use existing `ScannerOutput` from `core/scanner_state.py`**
+> (NOT a custom `ScannerResult` class). Engines depend on `MarketReader` interface,
+> not `KalshiAdapter`.
 
 ```python
 from datetime import datetime
@@ -2586,12 +2941,10 @@ from zoneinfo import ZoneInfo
 from typing import Optional
 import logging
 
-from backend.adapters.kalshi.adapter import KalshiAdapter
-from backend.core.models import (
-    EventWithTopMarkets, ProgressBasedOrderCandidate,
-    ValidatedOrderCandidate, ValidationConfig,
-)
+from backend.core.interfaces.adapter import MarketReader
 from backend.core.interfaces import StrategyProfile
+from backend.core.models.trading import ValidatedOrderCandidate, ValidationConfig
+from backend.core.scanner_state import ScannerOutput
 from backend.engines.engine1_discovery import fetch_all_open_markets
 from backend.engines.engine2_classification import get_same_day_live_markets
 from backend.engines.engine3_grouping import group_by_event_ticker
@@ -2603,89 +2956,83 @@ from backend.engines.engine7_validation import validate_candidate
 logger = logging.getLogger(__name__)
 ET = ZoneInfo("America/New_York")
 
-class ScannerResult:
-    """Result of a full scanner run."""
-    def __init__(self):
-        self.scanned_market_count: int = 0
-        self.events: list[EventWithTopMarkets] = []
-        self.candidates: list[ProgressBasedOrderCandidate] = []
-        self.actionable: list[ProgressBasedOrderCandidate] = []
-        self.manual_review: list[ProgressBasedOrderCandidate] = []
-        self.validated: list[ValidatedOrderCandidate] = []
-        self.timestamp: str = ""
-        self.errors: list[str] = []
 
 async def run_one_shot(
-    adapter: KalshiAdapter,
+    client: MarketReader,
     strategy: StrategyProfile,
-    threshold_percent: int = 65,
+    threshold_pct: int = 65,
     mode: str = "dry_run",
     now: Optional[datetime] = None,
-) -> ScannerResult:
+) -> ScannerOutput:
     """
-    Engine 8: Run all engines once and return results.
-    
+    Engine 8: Run all 7 engines once and return results.
+    Uses ScannerOutput from core.scanner_state (NOT a custom class).
     Pipeline: E1 → E2 → E3 → E4 → E5 → E6 → E7
     """
     if now is None:
         now = datetime.now(ET)
-    
-    result = ScannerResult()
-    result.timestamp = now.isoformat()
-    
-    # E1
-    markets = await fetch_all_open_markets(adapter)
-    result.scanned_market_count = len(markets)
+
+    # E1: Discovery
+    markets = await fetch_all_open_markets(client)
     logger.info(f"E1: Found {len(markets)} open markets.")
-    
+
     if not markets:
-        return result
-    
-    # E2
+        return ScannerOutput(num_markets_scanned=0, completed_at=now)
+
+    # E2: Classification
     _, live = get_same_day_live_markets(markets, now)
     logger.info(f"E2: {len(live)} same-day-live markets.")
-    
+
     if not live:
-        return result
-    
-    # E3
+        return ScannerOutput(num_markets_scanned=len(markets), completed_at=now)
+
+    # E3: Grouping
     events = group_by_event_ticker(live)
     logger.info(f"E3: {len(events)} same-day-live events.")
-    
-    # E4
-    event_books = await fetch_orderbooks(events, adapter)
+
+    # E4: Orderbooks
+    event_books = await fetch_orderbooks(events, client)
     logger.info("E4: Orderbooks fetched.")
-    
-    # E5
+
+    # E5: Ranking
     ranked_events = rank_all_events(event_books)
-    result.events = ranked_events
     logger.info("E5: Events ranked.")
-    
-    # E6
-    candidates, actionable, manual = process_all_events(
-        ranked_events, strategy, threshold_percent, now,
+
+    # E6: Progress Gate
+    candidates, actionable = process_all_events(
+        ranked_events, strategy, threshold_pct, now,
     )
-    result.candidates = candidates
-    result.actionable = actionable
-    result.manual_review = manual
-    logger.info(f"E6: {len(actionable)} actionable, {len(manual)} manual review.")
-    
-    # E7 (only for actionable candidates in dry_run or live mode)
+    logger.info(f"E6: {len(actionable)} actionable candidates.")
+
+    # E7: Validation (only for actionable candidates in dry_run or live)
+    validated: list[ValidatedOrderCandidate] = []
     if mode != "read_only":
         for candidate in actionable:
-            validated = await validate_candidate(
-                candidate, adapter, strategy,
-                ValidationConfig(), now,
+            vc = await validate_candidate(
+                candidate, client, strategy, ValidationConfig(), now,
             )
-            result.validated.append(validated)
-        logger.info(f"E7: {len(result.validated)} validated.")
-    
-    return result
+            validated.append(vc)
+        logger.info(f"E7: {len(validated)} validated.")
+
+    return ScannerOutput(
+        events=ranked_events,
+        trades=validated,
+        num_events_scanned=len(ranked_events),
+        num_markets_scanned=len(markets),
+        num_candidates_found=len(actionable),
+        num_trades_executed=sum(1 for v in validated if v.is_valid),
+        completed_at=datetime.now(ET),
+    )
 ```
 
 ### 3.9 — Live update modules (`backend/engines/live/`)
 
 These are poller/updater classes for the live scanner loop. Each runs as an asyncio task.
+
+> **CRITICAL — Use `MarketReader` interface** (NOT `KalshiAdapter`).
+> The `ScannerState` has these fields: `markets`, `classified_events` (dict[str, ClassifiedEvent]),
+> `ranked_events` (list[EventWithTopMarkets]), `candidates` (list[ValidatedOrderCandidate]),
+> `is_running`, `last_discovery`, `last_progress_check`.
 
 ```python
 # backend/engines/live/discovery_poller.py
@@ -2695,9 +3042,8 @@ import asyncio
 import logging
 from datetime import datetime
 from zoneinfo import ZoneInfo
-from typing import Callable, Awaitable
 
-from backend.adapters.kalshi.adapter import KalshiAdapter
+from backend.core.interfaces.adapter import MarketReader
 from backend.core.scanner_state import ScannerState
 from backend.engines.engine1_discovery import fetch_all_open_markets
 from backend.engines.engine2_classification import get_same_day_live_markets
@@ -2707,37 +3053,41 @@ logger = logging.getLogger(__name__)
 ET = ZoneInfo("America/New_York")
 
 class DiscoveryPoller:
-    """Periodically re-discovers markets and updates state."""
+    """Periodically re-discovers markets and updates state.
+    Depends on MarketReader interface, not concrete adapter.
+    """
     
-    def __init__(self, adapter: KalshiAdapter, state: ScannerState, interval: int = 30):
-        self.adapter = adapter
+    def __init__(self, client: MarketReader, state: ScannerState, interval: int = 30):
+        self.client = client
         self.state = state
         self.interval = interval
-        self.on_new_events: list[Callable[[list], Awaitable[None]]] = []
+        self._on_new_events_callbacks = []
+    
+    def on_new_events(self, callback):
+        self._on_new_events_callbacks.append(callback)
     
     async def run(self, stop_event: asyncio.Event):
         while not stop_event.is_set():
             try:
                 now = datetime.now(ET)
-                markets = await fetch_all_open_markets(self.adapter)
+                markets = await fetch_all_open_markets(self.client)
                 _, live = get_same_day_live_markets(markets, now)
                 events = group_by_event_ticker(live)
                 
                 # Diff with current state
-                current_tickers = set(self.state.events.keys())
+                current_tickers = set(self.state.classified_events.keys())
                 new_tickers = {e.event_ticker for e in events}
                 
                 added = new_tickers - current_tickers
                 removed = current_tickers - new_tickers
                 
                 for t in removed:
-                    self.state.remove_event(t)
+                    self.state.classified_events.pop(t, None)
                 
-                for callback in self.on_new_events:
+                for callback in self._on_new_events_callbacks:
                     await callback([e for e in events if e.event_ticker in added])
                 
-                # Update state
-                self.state.events = {e.event_ticker: e for e in events}
+                self.state.classified_events = {e.event_ticker: e for e in events}
                 self.state.last_discovery = now.isoformat()
                 
                 logger.info(f"Discovery: {len(live)} live markets, {len(events)} events. +{len(added)} -{len(removed)}")
@@ -2752,7 +3102,9 @@ class DiscoveryPoller:
 # backend/engines/live/event_reranker.py
 # Re-ranks a single event when its markets change
 
-from backend.core.models import ClassifiedEvent, Orderbook, EventWithTopMarkets
+from backend.core.models.classification import ClassifiedEvent
+from backend.core.models.market import Orderbook
+from backend.core.models.trading import EventWithTopMarkets
 from backend.engines.engine5_ranking import rank_event_markets
 
 def rerank_event(event: ClassifiedEvent, orderbooks: dict[str, Orderbook]) -> EventWithTopMarkets:
@@ -2775,25 +3127,27 @@ logger = logging.getLogger(__name__)
 ET = ZoneInfo("America/New_York")
 
 class ProgressGateLoop:
-    def __init__(self, state, strategy: StrategyProfile, threshold: int = 65, interval: int = 10):
-        self.state = state
+    """Periodically re-evaluates all ranked events for candidate creation."""
+    
+    def __init__(self, ranked_events, strategy: StrategyProfile, threshold: int = 65, interval: int = 10):
+        self.ranked_events = ranked_events  # reference to ScannerState.ranked_events
         self.strategy = strategy
         self.threshold = threshold
         self.interval = interval
-        self.on_new_candidate = None  # callback
+        self.on_new_candidate = None  # async callback
     
     async def run(self, stop_event: asyncio.Event):
         while not stop_event.is_set():
             try:
                 now = datetime.now(ET)
-                for event in self.state.ranked_events.values():
+                for event in self.ranked_events:
                     candidate = create_candidate(event, self.strategy, self.threshold, now)
-                    self.state.set_candidate(event.event_ticker, candidate)
                     
-                    if candidate.should_create_order_candidate and self.on_new_candidate:
-                        await self.on_new_candidate(candidate)
+                    if candidate.side in ("yes", "no") and candidate.confidence > 0:
+                        if self.on_new_candidate:
+                            await self.on_new_candidate(candidate)
                 
-                self.state.last_progress_check = now.isoformat()
+                logger.debug(f"Progress gate: checked {len(self.ranked_events)} events.")
             
             except Exception as e:
                 logger.error(f"Progress gate error: {e}")
@@ -2867,210 +3221,126 @@ class StrategyExperiment(StrategyProfile):
     pass
 ```
 
-### 4.2 — `backend/strategies/executed_volume_follower.py`
+### 4.2–4.9 — Strategy Experiment Implementations
+
+> **⚠️ CRITICAL — Use actual `TradeDecision` fields from `core/interfaces/strategy.py`:**
+> ```python
+> @dataclass
+> class TradeDecision:
+>     market_ticker: str
+>     side: str              # "yes" or "no"
+>     confidence: float = 0.0
+>     reason: str = ""       # why SKIP or the trade rationale
+>     entry_price_cents: int = 0
+>     max_contracts: int = 0
+>     should_trade: bool = False
+> ```
+>
+> **Do NOT use these non-existent fields:** `trade_decision`, `skip_reason`,
+> `selected_side`, `experiment_id`, `selected_market_reason`, `selected_side_reason`,
+> `entry_threshold`, `event_progress_at_entry`, `estimated_fee_cents`,
+> `max_acceptable_price_cents`.
+>
+> **`MarketFeatures` actual fields:** `ticker` (NOT `market_ticker`), `volume`,
+> `volume_24h`, `yes_bid`, `yes_ask`, `no_bid`, `no_ask`, `spread_cents`,
+> `last_price`, `open_interest`, `total_resting_order_quantity`, `progress_pct`.
+> No `yes_executed_volume`, `no_executed_volume`, `trade_count`, `yes_price_momentum`,
+> `yes_total_depth`, `no_total_depth`, `market_title`, `status`.
+>
+> **`EventFeatures` actual fields:** `event_ticker`, `event_title`, `child_markets`,
+> `total_volume`, `num_markets`, `num_markets_live`, `max_progress_pct`,
+> `min_progress_pct`, `has_overtime`. No `event_progress`, `threshold`, `entry_time`,
+> `category`.
+>
+> See `docs/engines/strategy-system.md` for the full spec.
+>
+> **The pseudocode below is illustrative.** The actual `MarketFeatures` model does
+> NOT have backtesting-specific fields like `total_executed_volume` or
+> `yes_price_momentum`. Those exist in the `strategy-system.md` extended data models
+> (`HistoricalTrade`, `Candlestick`, `OrderbookSnapshot`) which are separate from
+> the core `MarketFeatures` interface. When implementing Phase 4, either extend
+> `MarketFeatures` or build a separate feature-extraction layer.
 
 ```python
-from typing import Optional
-from .base import StrategyExperiment, EventFeatures, TradeDecision
+# ── ExecutedVolumeFollower ──
+# Market with highest volume → side with higher yes/no bid
 
-class ExecutedVolumeFollower(StrategyExperiment):
-    name = "executed-volume-follower"
-    description = "Highest executed trade volume → most-bet side"
+def select_trade(self, event_features: EventFeatures) -> TradeDecision:
+    valid = [m for m in event_features.child_markets if m.volume > 0]
+    if not valid:
+        return TradeDecision(market_ticker="", side="no", should_trade=False, reason="no_volume")
+    selected = max(valid, key=lambda m: m.volume)
+    side = "yes" if selected.yes_bid > selected.no_bid else "no"
+    return TradeDecision(
+        market_ticker=selected.ticker, side=side, should_trade=True,
+        reason=f"highest_volume_{selected.ticker}_side_{side}",
+        entry_price_cents=selected.yes_bid if side == "yes" else selected.no_bid,
+    )
 
-    def select_trade(self, event_features: EventFeatures) -> TradeDecision:
-        valid = [m for m in event_features.child_markets if m.total_executed_volume > 0]
-        if not valid:
-            return TradeDecision(
-                event_ticker=event_features.event_ticker,
-                trade_decision="SKIP",
-                skip_reason="no_markets_with_volume",
-                experiment_id=f"EXP_A_{int(event_features.threshold * 100)}",
-            )
-        selected = max(valid, key=lambda m: m.total_executed_volume)
-        side = "YES" if selected.yes_executed_volume > selected.no_executed_volume else "NO"
-        return TradeDecision(
-            event_ticker=event_features.event_ticker,
-            market_ticker=selected.market_ticker,
-            selected_side=side,
-            trade_decision=f"BUY_{side}",
-            entry_price_cents=selected.yes_price if side == "YES" else selected.no_price,
-            entry_threshold=event_features.threshold,
-            event_progress_at_entry=event_features.event_progress,
-            selected_market_reason="highest_executed_volume",
-            selected_side_reason=f"{side.lower()}_executed_volume_gt_opposite",
-            experiment_id=f"EXP_A_{int(event_features.threshold * 100)}",
-        )
-```
+# ── ExecutedVolumeFade ──
+# Same market selection → fade the dominant side
 
-### 4.3 — `backend/strategies/executed_volume_fade.py`
+def select_trade(self, event_features: EventFeatures) -> TradeDecision:
+    valid = [m for m in event_features.child_markets if m.volume > 0]
+    if not valid:
+        return TradeDecision(market_ticker="", side="no", should_trade=False, reason="no_volume")
+    selected = max(valid, key=lambda m: m.volume)
+    dominant = "yes" if selected.yes_bid > selected.no_bid else "no"
+    fade = "no" if dominant == "yes" else "yes"
+    return TradeDecision(
+        market_ticker=selected.ticker, side=fade, should_trade=True,
+        reason=f"fade_{dominant}_on_{selected.ticker}",
+        entry_price_cents=selected.yes_bid if fade == "yes" else selected.no_bid,
+    )
 
-```python
-from .base import StrategyExperiment, EventFeatures, TradeDecision
+# ── FavoriteSideFollower ──
+# Highest volume market → buy the favorite (price > 50¢ = YES)
 
-class ExecutedVolumeFade(StrategyExperiment):
-    name = "executed-volume-fade"
-    description = "Highest volume market → fade the dominant side"
+def select_trade(self, event_features: EventFeatures) -> TradeDecision:
+    valid = [m for m in event_features.child_markets if m.volume > 0]
+    if not valid:
+        return TradeDecision(market_ticker="", side="no", should_trade=False, reason="no_volume")
+    selected = max(valid, key=lambda m: m.volume)
+    side = "yes" if selected.yes_bid > 50 else "no"
+    return TradeDecision(
+        market_ticker=selected.ticker, side=side, should_trade=True,
+        reason=f"favorite_side_{side}_price_{selected.yes_bid if side == 'yes' else selected.no_bid}",
+        entry_price_cents=selected.yes_bid if side == "yes" else selected.no_bid,
+    )
 
-    def select_trade(self, event_features: EventFeatures) -> TradeDecision:
-        valid = [m for m in event_features.child_markets if m.total_executed_volume > 0]
-        if not valid:
-            return TradeDecision(event_ticker=event_features.event_ticker, trade_decision="SKIP", skip_reason="no_markets_with_volume", experiment_id=f"EXP_B_{int(event_features.threshold * 100)}")
-        selected = max(valid, key=lambda m: m.total_executed_volume)
-        dominant = "YES" if selected.yes_executed_volume > selected.no_executed_volume else "NO"
-        fade = "NO" if dominant == "YES" else "YES"
-        return TradeDecision(event_ticker=event_features.event_ticker, market_ticker=selected.market_ticker, selected_side=fade, trade_decision=f"BUY_{fade}", entry_price_cents=selected.yes_price if fade == "YES" else selected.no_price, selected_market_reason="highest_executed_volume", selected_side_reason=f"fade_dominant_{dominant.lower()}", experiment_id=f"EXP_B_{int(event_features.threshold * 100)}")
-```
+# ── MomentumFollower ──
+# Largest price move → direction of movement
+# NOTE: MarketFeatures does not have yes_price_momentum.
+# This strategy requires extended features from a FeatureBuilder (Phase 5).
 
-### 4.4 — `backend/strategies/favorite_side_follower.py`
+# ── LiquidityFilteredFollower ──
+# Volume follower with liquidity guards
+# NOTE: MarketFeatures does not have trade_count.
+# This strategy requires extended features.
 
-```python
-from .base import StrategyExperiment, EventFeatures, TradeDecision
+# ── RestingDepthFollower ──
+# Highest total resting depth → deeper side
+# Uses total_resting_order_quantity which IS available on MarketFeatures.
 
-class FavoriteSideFollower(StrategyExperiment):
-    name = "favorite-side-follower"
-    description = "Highest volume market → buy the favorite (price > 50 = YES)"
+def select_trade(self, event_features: EventFeatures) -> TradeDecision:
+    with_depth = [m for m in event_features.child_markets if m.total_resting_order_quantity > 0]
+    if not with_depth:
+        return TradeDecision(market_ticker="", side="no", should_trade=False, reason="no_depth")
+    selected = max(with_depth, key=lambda m: m.total_resting_order_quantity)
+    # Infer side from yes/no bid depth
+    side = "yes" if selected.yes_bid > selected.no_bid else "no"
+    return TradeDecision(
+        market_ticker=selected.ticker, side=side, should_trade=True,
+        reason=f"highest_depth_{selected.ticker}",
+        entry_price_cents=selected.yes_bid if side == "yes" else selected.no_bid,
+    )
 
-    def select_trade(self, event_features: EventFeatures) -> TradeDecision:
-        valid = [m for m in event_features.child_markets if m.total_executed_volume > 0]
-        if not valid:
-            return TradeDecision(event_ticker=event_features.event_ticker, trade_decision="SKIP", skip_reason="no_markets_with_volume", experiment_id=f"EXP_C_{int(event_features.threshold * 100)}")
-        selected = max(valid, key=lambda m: m.total_executed_volume)
-        side = "YES" if selected.yes_price > 50 else "NO"
-        return TradeDecision(event_ticker=event_features.event_ticker, market_ticker=selected.market_ticker, selected_side=side, trade_decision=f"BUY_{side}", entry_price_cents=selected.yes_price if side == "YES" else selected.no_price, selected_market_reason="highest_executed_volume", selected_side_reason=f"favorite_side_{side.lower()}", experiment_id=f"EXP_C_{int(event_features.threshold * 100)}")
-```
+# ── HybridScoreFollower ──
+# Weighted combination — requires extended features for full implementation.
 
-### 4.5 — `backend/strategies/momentum_follower.py`
-
-```python
-from .base import StrategyExperiment, EventFeatures, TradeDecision
-
-class MomentumFollower(StrategyExperiment):
-    name = "momentum-follower"
-    description = "Largest absolute price move → direction of movement"
-
-    def __init__(self, config: dict = None):
-        super().__init__(config)
-        self.early_reference = self.config.get("early_reference_progress", 0.40)
-
-    def select_trade(self, event_features: EventFeatures) -> TradeDecision:
-        with_momentum = [m for m in event_features.child_markets if m.yes_price_momentum is not None]
-        if not with_momentum:
-            return TradeDecision(event_ticker=event_features.event_ticker, trade_decision="SKIP", skip_reason="no_momentum_data", experiment_id=f"EXP_D_{int(event_features.threshold * 100)}")
-        selected = max(with_momentum, key=lambda m: abs(m.yes_price_momentum))
-        side = "YES" if selected.yes_price_momentum > 0 else "NO"
-        return TradeDecision(event_ticker=event_features.event_ticker, market_ticker=selected.market_ticker, selected_side=side, trade_decision=f"BUY_{side}", entry_price_cents=selected.yes_price if side == "YES" else selected.no_price, selected_market_reason="largest_absolute_price_move", selected_side_reason=f"momentum_toward_{side.lower()}", experiment_id=f"EXP_D_{int(event_features.threshold * 100)}")
-```
-
-### 4.6 — `backend/strategies/liquidity_filtered_follower.py`
-
-```python
-from .base import StrategyExperiment, EventFeatures, TradeDecision
-
-class LiquidityFilteredFollower(StrategyExperiment):
-    name = "liquidity-filtered-follower"
-    description = "Volume follower with liquidity guards"
-
-    def __init__(self, config: dict = None):
-        super().__init__(config)
-        self.min_volume = self.config.get("min_total_executed_volume", 500)
-        self.min_trades = self.config.get("min_trade_count", 20)
-        self.max_spread = self.config.get("max_spread_cents", 5)
-        self.max_price = self.config.get("max_entry_price_cents", 85)
-        self.min_price = self.config.get("min_entry_price_cents", 15)
-
-    def _passes(self, m) -> bool:
-        if m.total_executed_volume < self.min_volume: return False
-        if m.trade_count < self.min_trades: return False
-        if m.spread is not None and m.spread > self.max_spread: return False
-        if m.yes_price > self.max_price or m.yes_price < self.min_price: return False
-        return True
-
-    def select_trade(self, event_features: EventFeatures) -> TradeDecision:
-        filtered = [m for m in event_features.child_markets if self._passes(m)]
-        if not filtered:
-            return TradeDecision(event_ticker=event_features.event_ticker, trade_decision="SKIP", skip_reason="no_markets_pass_filters", experiment_id=f"EXP_E_{int(event_features.threshold * 100)}")
-        selected = max(filtered, key=lambda m: m.total_executed_volume)
-        side = "YES" if selected.yes_executed_volume > selected.no_executed_volume else "NO"
-        return TradeDecision(event_ticker=event_features.event_ticker, market_ticker=selected.market_ticker, selected_side=side, trade_decision=f"BUY_{side}", entry_price_cents=selected.yes_price if side == "YES" else selected.no_price, selected_market_reason="highest_executed_volume_with_filters", experiment_id=f"EXP_E_{int(event_features.threshold * 100)}")
-```
-
-### 4.7 — `backend/strategies/resting_depth_follower.py`
-
-```python
-from .base import StrategyExperiment, EventFeatures, TradeDecision
-
-class RestingDepthFollower(StrategyExperiment):
-    name = "resting-depth-follower"
-    description = "Highest total resting depth → deeper side (original most-bet logic)"
-
-    def select_trade(self, event_features: EventFeatures) -> TradeDecision:
-        with_depth = [m for m in event_features.child_markets if m.yes_total_depth is not None and m.no_total_depth is not None]
-        if not with_depth:
-            return TradeDecision(event_ticker=event_features.event_ticker, trade_decision="SKIP", skip_reason="no_depth_data", experiment_id=f"EXP_F_{int(event_features.threshold * 100)}")
-        selected = max(with_depth, key=lambda m: (m.yes_total_depth or 0) + (m.no_total_depth or 0))
-        side = "YES" if (selected.yes_total_depth or 0) > (selected.no_total_depth or 0) else "NO"
-        return TradeDecision(event_ticker=event_features.event_ticker, market_ticker=selected.market_ticker, selected_side=side, trade_decision=f"BUY_{side}", entry_price_cents=selected.yes_price if side == "YES" else selected.no_price, selected_market_reason="highest_total_resting_depth", experiment_id=f"EXP_F_{int(event_features.threshold * 100)}")
-```
-
-### 4.8 — `backend/strategies/hybrid_score_follower.py`
-
-```python
-from .base import StrategyExperiment, EventFeatures, TradeDecision
-
-class HybridScoreFollower(StrategyExperiment):
-    name = "hybrid-score-follower"
-    description = "Weighted combination of volume, momentum, depth, and liquidity"
-
-    def select_trade(self, event_features: EventFeatures) -> TradeDecision:
-        child_markets = event_features.child_markets
-        if not child_markets:
-            return TradeDecision(event_ticker=event_features.event_ticker, trade_decision="SKIP", skip_reason="no_markets", experiment_id=f"EXP_G_{int(event_features.threshold * 100)}")
-
-        # Normalize values across markets for scoring
-        max_vol = max((m.total_executed_volume for m in child_markets), default=1)
-        max_trades = max((m.trade_count for m in child_markets), default=1)
-        max_momentum = max((abs(m.yes_price_momentum or 0) for m in child_markets), default=1)
-        max_depth = max(((m.yes_total_depth or 0) + (m.no_total_depth or 0) for m in child_markets), default=1)
-
-        def market_score(m):
-            return (
-                0.40 * (m.total_executed_volume / max_vol)
-                + 0.25 * (m.trade_count / max_trades)
-                + 0.20 * (abs(m.yes_price_momentum or 0) / max_momentum)
-                + 0.15 * (((m.yes_total_depth or 0) + (m.no_total_depth or 0)) / max_depth)
-            )
-
-        selected = max(child_markets, key=market_score)
-        side = "YES" if selected.yes_executed_volume > selected.no_executed_volume else "NO"
-        return TradeDecision(event_ticker=event_features.event_ticker, market_ticker=selected.market_ticker, selected_side=side, trade_decision=f"BUY_{side}", entry_price_cents=selected.yes_price if side == "YES" else selected.no_price, selected_market_reason="highest_hybrid_score", experiment_id=f"EXP_G_{int(event_features.threshold * 100)}")
-```
-
-### 4.9 — `backend/strategies/__init__.py`
-
-```python
-from backend.core.interfaces import StrategyProfile, EventFeatures, MarketFeatures, TradeDecision
-from .executed_volume_follower import ExecutedVolumeFollower
-from .executed_volume_fade import ExecutedVolumeFade
-from .favorite_side_follower import FavoriteSideFollower
-from .momentum_follower import MomentumFollower
-from .liquidity_filtered_follower import LiquidityFilteredFollower
-from .resting_depth_follower import RestingDepthFollower
-from .hybrid_score_follower import HybridScoreFollower
-
-EXPERIMENT_REGISTRY: dict[str, type[StrategyProfile]] = {
-    "executed-volume-follower": ExecutedVolumeFollower,
-    "executed-volume-fade": ExecutedVolumeFade,
-    "favorite-side-follower": FavoriteSideFollower,
-    "momentum-follower": MomentumFollower,
-    "liquidity-filtered-follower": LiquidityFilteredFollower,
-    "resting-depth-follower": RestingDepthFollower,
-    "hybrid-score-follower": HybridScoreFollower,
-}
-
-def get_experiment(name: str, config: dict = None) -> StrategyProfile:
-    if name not in EXPERIMENT_REGISTRY:
-        raise ValueError(f"Unknown experiment: {name}. Available: {list(EXPERIMENT_REGISTRY.keys())}")
-    return EXPERIMENT_REGISTRY[name](config or {})
+# ── __init__.py (registry) ──
+# EXPERIMENT_REGISTRY and get_experiment() as shown in the strategy-system.md doc.
+# Actual implementation lives in backend/strategies/__init__.py
 ```
 
 ---
@@ -4473,7 +4743,29 @@ export class ScannerAPI {
 
 ---
 
-## Phase 8: Frontend Hooks
+## Phase 8: Frontend Scaffolding + Types + API Client
+
+> **⚠️ No `frontend/` directory exists yet.** Before implementing hooks, create the
+> frontend project:
+> ```bash
+> cd /Users/pastry/Projects/nunu
+> bun create vite frontend --template react-ts
+> cd frontend && bun add @tanstack/react-query tailwindcss
+> ```
+> This creates `frontend/package.json`, `tsconfig.json`, `vite.config.ts`, `src/`, etc.
+> Then implement `src/lib/types.ts` and `src/lib/api.ts` per the API contract.
+>
+> Frontend Routes (from `docs/plans/generic-prediction-market-scanner-platform.md`):
+> | Route | Page | Purpose |
+> |-------|------|---------|
+> | `/` | Dashboard | Live events, top markets, scanner status |
+> | `/events` | Events | Searchable event list |
+> | `/events/[id]` | EventDetail | Orderbook, markets, progress |
+> | `/candidates` | Candidates | Approve/reject candidates |
+> | `/trades` | Trades | Trade history |
+> | `/settings` | Settings | Threshold, mode, strategy |
+
+## Phase 8: Frontend Hooks (continued)
 
 **Verification:** After building all hooks:
 ```bash

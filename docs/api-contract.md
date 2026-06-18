@@ -827,73 +827,56 @@ Broadcasts trade execution events.
 ### Shared Types
 
 ```python
-# backend/core/models.py (Python)
+# backend/core/models/market.py (Python — actual model)
 
 @dataclass
 class OrderbookLevel:
-    price: float
-    size: float
+    price: int       # cents
+    count: int       # contracts at this level
 
 @dataclass
 class MarketOrderbookStats:
-    market_id: str
-    event_id: str
-    total_resting_order_quantity: float
-    yes_order_quantity: float
-    no_order_quantity: float
-    depth_level_count: int
-    best_yes_bid: float | None
-    best_no_bid: float | None
-    volume_24h: float
-    total_volume: float
-
-@dataclass
-class OrderCandidate:
-    event_id: str
-    market_id: str
-    side: str
-    estimated_price: float
-    estimated_size: float
-    progress_percent: float
-    threshold_percent: float
-    confidence: str
-    requires_manual_review: bool
-    reasons: list[str]
+    market_ticker: str           # NOT market_id
+    event_ticker: str            # NOT event_id
+    total_resting_order_quantity: int = 0
+    yes_order_quantity: float = 0
+    no_order_quantity: float = 0
+    depth_level_count: int = 0
+    best_yes_bid: int | None = None
+    best_no_bid: int | None = None
+    volume_24h: int | None = None
+    volume: int = 0
+    open_interest: int = 0
 ```
 
 ```typescript
-// frontend/src/lib/types.ts (TypeScript)
+// frontend/src/lib/types.ts (TypeScript — must match backend)
 
 interface OrderbookLevel {
-  price: number;
-  size: number;
+  price: number;    // cents
+  count: number;    // contracts
 }
 
 interface MarketOrderbookStats {
-  market_id: string;
-  event_id: string;
+  market_ticker: string;
+  event_ticker: string;
   total_resting_order_quantity: number;
   yes_order_quantity: number;
   no_order_quantity: number;
   depth_level_count: number;
   best_yes_bid: number | null;
   best_no_bid: number | null;
-  volume_24h: number;
-  total_volume: number;
+  volume_24h: number | null;
+  volume: number;
+  open_interest: number;
 }
+```
 
-interface OrderCandidate {
-  event_id: string;
-  market_id: string;
-  side: "yes" | "no" | "tie" | "none";
-  estimated_price: number;
-  estimated_size: number;
-  progress_percent: number;
-  threshold_percent: number;
-  confidence: "high" | "medium" | "low";
-  requires_manual_review: boolean;
-  reasons: string[];
-}
+> **IMPORTANT**: The backend uses `_ticker` suffix (event_ticker, market_ticker),
+> NOT `_id` suffix. The frontend types must match. The `OrderCandidate` model
+> from `backend/core/models/trading.py` uses: `event_ticker`, `market_ticker`,
+> `side` ("yes"/"no"), `price` (int cents), `volume` (int contracts),
+> `confidence` (float 0-1), `reason` (str), `progress_pct` (float 0-100).
 ```
 
 ### Field Mapping Rules

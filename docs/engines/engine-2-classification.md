@@ -60,8 +60,8 @@ classified as "composite" (multi-event bundles) and excluded from same-day-live.
 | Status check | `status` | `status` | string |
 | Open / create time | `open_time` | `create_date` | ISO 8601 str |
 | Close time | `close_time` | `close_date` | ISO 8601 str |
-| Expected expiration | `expected_expiration_time` | `expiry` | datetime |
-| Latest expiration | `latest_expiration_time` | *(not modeled — forward-looking)* | ISO 8601 |
+| Expected expiration | `expected_expiration_time` | `expiry` (datetime), `expiry_iso` (raw) | datetime / str |
+| Latest expiration | `latest_expiration_time` | *(not on Market model — adapter raw dict)* | ISO 8601 |
 
 ### Timezone Handling
 
@@ -76,9 +76,16 @@ from backend.utils.datetime_utils import day_key_et, same_et_day, parse_date
 ### Expiration Field Note
 
 The Kalshi API provides both `expected_expiration_time` and `latest_expiration_time`.
-Our Phase 1 `Market` model coalesces these into `expiry` (datetime). For the
-forward-looking overtime logic, the raw Kalshi API fields can be accessed via
-the adapter's raw response. The engine uses `market.expiry` for the "today" check.
+Our Phase 1 `Market` model maps `expected_expiration_time` to `expiry` (datetime) and
+stores the raw ISO string in `expiry_iso`. `latest_expiration_time` is NOT currently
+modeled on the Market dataclass — the forward-looking overtime logic would access it
+from the adapter's raw API response dict. The engine uses `market.expiry` for the
+"today" check.
+
+**Migration from `open_time` / `close_time`:** Earlier spec versions referenced
+`market.open_time` and `market.close_time`. The actual Market model uses
+`market.create_date` (ISO string for when trading opened) and `market.close_date`
+(ISO string for when trading closes). All engine code must use these field names.
 
 ---
 
@@ -251,23 +258,22 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 from typing import Optional
 
-from backend.utils.datetime_utils import day_key_et, same_et_day, parse_date, calculate_progress
+from backend.utils.datetime_utils import day_key_et, same_et_day, parse_date
 from backend.core.models.classification import ClassificationResult
 
 ET = ZoneInfo("America/New_York")
 MAX_OVERTIME_HOURS = 48.0
 
 
-# Note: parse_date, day_key_et, same_et_day, and calculate_progress
-# live in backend.utils.datetime_utils. The signatures are:
-#   parse_date(date_str: str | None) -> datetime | None
-#   day_key_et(dt: datetime | None = None) -> str
-#   same_et_day(dt1: datetime, dt2: datetime) -> bool
-#   calculate_progress(expires_at, now=None, start_at=None) -> float
-
-
 def classify_market(market, now: Optional[datetime] = None) -> ClassificationResult:
-    """Overtime-aware classification. Returns a ClassificationResult dataclass."""
+    """Overtime-aware classification. Returns a ClassificationResult dataclass.
+    
+    Uses Market model fields:
+      - market.status (str)
+      - market.create_date (ISO str — open_time from API)
+      - market.close_date (ISO str — close_time from API)
+      - market.expiry (datetime — expected_expiration_time from API)
+    """
     if now is None:
         now = datetime.now(ET)
 
@@ -295,13 +301,10 @@ def classify_market(market, now: Optional[datetime] = None) -> ClassificationRes
         reason_parts.append("Market past expiry (overdue).")
 
     # Rule 3: Check overtime window
-    # Note: latest_expiration_time is available from the Kalshi API but not
-    # yet modeled on the Market dataclass. This forward-looking logic would
-    # use the raw API field when available.
+    # latest_expiration_time is NOT on the Market model. This forward-looking
+    # logic would access the raw API field from the adapter's response dict.
+    # Until then, overtime check is disabled and composite detection is skipped.
     is_composite = False
-
-    # (Forward-looking: when latest_expiration_time is available, compute
-    #  overtime gap and set is_composite if gap > MAX_OVERTIME_HOURS.)
 
     # Final decision
     is_same_day_live = live_now and expiry_today and not is_composite
@@ -321,8 +324,13 @@ def classify_market(market, now: Optional[datetime] = None) -> ClassificationRes
 def get_same_day_live_markets(
     markets: list,
     now: Optional[datetime] = None,
-) -> tuple:
-    """Classify all markets. Returns (all_classified, same_day_live_only)."""
+) -> tuple[list[tuple], list[tuple]]:
+    """
+    Classify all markets.
+    
+    Returns (all_classified, same_day_live_only) where each is a list of
+    (Market, ClassificationResult) tuples. The second list is a subset of the first.
+    """
     if now is None:
         now = datetime.now(ET)
 

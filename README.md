@@ -54,4 +54,21 @@ Engine 8:  Orchestration        → Run pipeline, manage state
 
 ## Status
 
-**Phase 1 (Backend Core + Utils) implemented.** Core domain models, interfaces, configuration, and utility modules are complete. Engines (Phase 3), adapters (Phase 2), and frontend (Phase 8+) are in development. See the [build plan](docs/build-plan.md) for details and next steps.
+**✅ Phase 1 (Backend Core + Utils) — Complete.** Core domain models, interfaces, configuration, and utility modules are implemented and importable.
+
+**✅ Phase 2 (Kalshi Adapter) — Complete.** HTTP client, WebSocket client, types, and adapter facade implementing `AbstractMarketAdapter`.
+
+**⬜ Phases 3–13 — Not yet started.**
+- Phase 3: 8-engine pipeline (discovery → classification → grouping → orderbook → ranking → progress gate → validation → orchestration)
+- Phase 4: 7 strategy experiments + registry
+- Phase 5: Backtesting infrastructure
+- Phase 6: Trading executor + logging + portfolio
+- Phase 7: FastAPI REST + WebSocket layer
+- Phase 8: Frontend scaffolding (Vite + React + TypeScript)
+- Phase 9: Frontend hooks (WebSocket, scanner state)
+- Phase 10: Frontend pages (6 routes)
+- Phase 11: Frontend components (15+)
+- Phase 12: Test infrastructure
+- Phase 13: Docker + integration
+
+**No `frontend/` directory exists yet.** See the [build plan](docs/build-plan.md) and [API contract](docs/api-contract.md) for the target architecture.

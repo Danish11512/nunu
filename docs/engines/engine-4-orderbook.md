@@ -15,6 +15,10 @@ class Engine4Input:
 ## Output
 
 ```python
+from backend.core.models.market import Market, Orderbook, OrderbookLevel
+# Engine 4 uses Market and Orderbook directly from the domain models
+# The adapter's types.parse_orderbook handles API format conversion
+
 @dataclass
 class MarketWithOrderbook:
     market: Market
@@ -24,7 +28,7 @@ class MarketWithOrderbook:
 class EventWithOrderbooks:
     event_ticker: str
     event_title: str
-    markets: list[MarketWithOrderbook]   # One per child market
+    markets: list[MarketWithOrderbook]
     total_volume: int = 0
 
 @dataclass
@@ -40,26 +44,22 @@ GET https://api.elections.kalshi.com/trade-api/v2/markets/{ticker}/orderbook
 
 ### Response Format
 
-Kalshi orderbooks return **bids only** for each outcome token:
+The Kalshi orderbook API returns **bids only** for each outcome token:
 
 ```json
 {
-  "orderbook_fp": {
-    "yes_dollars": [["0.65", "1000"], ["0.64", "500"], ...],
-    "no_dollars":  [["0.35", "800"], ["0.34", "300"], ...]
-  }
+  "yes": [{"price": 65, "count": 1000}, {"price": 64, "count": 500}],
+  "no":  [{"price": 35, "count": 800}, {"price": 34, "count": 300}]
 }
 ```
 
-Each level is `[price_dollars, count_fp]` — a string tuple.
-
 ### Orderbook Semantics (Kalshi)
 
-- `yes_dollars` = bids for the YES outcome (people offering to buy YES) — parsed into `yes_side` list
-- `no_dollars` = bids for the NO outcome (people offering to buy NO) — parsed into `no_side` list
-- Kalshi does **not** directly expose asks in the orderbook endpoint
-- For ranking purposes, we use resting bid quantities directly
-- The parsed `Orderbook` model uses `yes_side`/`no_side` (list of `OrderbookLevel` with int cents)
+- `yes` = levels for the YES outcome — each level has `price` (int cents) and `count` (int contracts)
+- `no` = levels for the NO outcome
+- The orderbook endpoint returns **bids only** — there are no direct asks
+- `parse_orderbook()` in `types.py` handles the conversion to `Orderbook` domain objects
+- `calculate_orderbook_stats()` derives best bid from the lowest price level in each side
 
 ## Implementation
 
@@ -102,17 +102,21 @@ async def fetch_orderbooks(events: list[ClassifiedEvent], client: MarketReader) 
 
 
 def parse_orderbook_response(raw: dict[str, Any], ticker: str) -> Orderbook:
-    """Convert raw Kalshi API orderbook response to Orderbook model."""
-    ob_fp = raw.get("orderbook_fp", {})
-    yes_raw = ob_fp.get("yes_dollars", [])
-    no_raw = ob_fp.get("no_dollars", [])
+    """Convert raw Kalshi API orderbook response to Orderbook model.
+
+    The API returns ``{"yes": [{"price": 65, "count": 1000}, ...],
+    "no": [{"price": 35, "count": 800}, ...]}`` where each level
+    has ``price`` in int cents and ``count`` in int contracts.
+    """
+    yes_raw = raw.get("yes", [])
+    no_raw = raw.get("no", [])
 
     def parse_levels(levels: list) -> list[OrderbookLevel]:
         if not levels:
             return []
         return [
-            OrderbookLevel(price=int(float(price) * 100), count=int(float(count)))
-            for price, count in levels
+            OrderbookLevel(price=level["price"], count=level["count"])
+            for level in levels
         ]
 
     return Orderbook(
@@ -127,22 +131,25 @@ def parse_orderbook_response(raw: dict[str, Any], ticker: str) -> Orderbook:
 
 ```python
 def parse_orderbook_levels(
-    yes_dollars: list[tuple[str, str]] | None,
-    no_dollars: list[tuple[str, str]] | None,
+    yes: list[dict[str, int | float]] | None,
+    no: list[dict[str, int | float]] | None,
 ) -> tuple[list[OrderbookLevel], list[OrderbookLevel]]:
-    """Parse Kalshi FP string tuples into OrderbookLevel objects (int cents)."""
+    """Parse Kalshi orderbook level dicts into OrderbookLevel objects (int cents).
 
-    def parse_levels(levels: list[tuple[str, str]] | None) -> list[OrderbookLevel]:
+    Each level has ``price`` (int cents) and ``count`` (int contracts).
+    """
+
+    def parse_levels(levels: list[dict[str, int | float]] | None) -> list[OrderbookLevel]:
         if not levels:
             return []
         return [
-            OrderbookLevel(price=int(float(price) * 100), count=int(float(count)))
-            for price, count in levels
+            OrderbookLevel(price=int(level["price"]), count=int(level["count"]))
+            for level in levels
         ]
 
     return (
-        parse_levels(yes_dollars),
-        parse_levels(no_dollars),
+        parse_levels(yes),
+        parse_levels(no),
     )
 ```
 

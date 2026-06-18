@@ -39,7 +39,7 @@ class KalshiConfig(BaseSettings):
         description="Kalshi API base URL",
     )
     ws_base_url: str = Field(
-        default="wss://api.elections.kalshi.com/trade-api/v2",
+        default="wss://api.elections.kalshi.com/trade-api/ws/v2",
         alias="KALSHI_WS_BASE_URL",
         description="Kalshi WebSocket base URL",
     )

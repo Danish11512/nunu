@@ -11,10 +11,8 @@ None (or config containing base URL and pagination settings).
 ## Output
 
 ```python
-@dataclass
-class Engine1Output:
-    scanned_market_count: int
-    markets: list[Market]
+# Returns: list[Market] (not an Engine1Output wrapper — the pipeline
+# uses simple types. The scanned count is tracked by the caller.)
 ```
 
 ## Kalshi Endpoint
@@ -23,52 +21,20 @@ class Engine1Output:
 GET https://api.elections.kalshi.com/trade-api/v2/markets
 ```
 
-### Request Parameters
-
-| Param | Value | Reason |
-|-------|-------|--------|
-| `status` | `open` | Only currently open markets |
-| `limit` | `1000` | Maximum page size |
-| `mve_filter` | `exclude` | Exclude multivariate events |
-| `cursor` | *(from previous response)* | Pagination cursor |
+Pagination is handled internally by the adapter layer (see `KalshiClient.fetch_all_open_markets()`). The engine calls `adapter.get_all_open_markets()` which returns fully parsed `Market` domain objects.
 
 ## Implementation
 
 ```python
-async def fetch_all_open_markets(client: MarketReader) -> Engine1Output:
+async def fetch_all_open_markets(adapter: KalshiAdapter) -> list[Market]:
     """
-    Fetch all open markets with cursor-based pagination.
-    Deduplicates by ticker (in case of cursor overlap).
-
-    Uses MarketReader.fetch_markets(**kwargs) -> list[dict[str, Any]]
-    (the actual Kalshi adapter returns raw API dicts; parsing to Market
-    dataclasses happens inside the adapter layer).
+    Fetch all open markets using the adapter's internal pagination.
+    The adapter handles cursor-based pagination internally.
+    Returns parsed Market domain objects.
     """
-    all_markets: list[Market] = []
-    cursor: str | None = None
-
-    while True:
-        params = {"status": "open", "limit": 1000, "mve_filter": "exclude"}
-        if cursor:
-            params["cursor"] = cursor
-
-        markets_data = await client.fetch_markets(**params)
-
-        all_markets.extend(markets_data)
-
-        # Cursor-based pagination: fetch_markets returns raw API dicts
-        # which include a "cursor" key when more pages exist.
-        # The adapter handles cursor extraction internally.
-        if not markets_data:
-            break
-
-    # Deduplicate by ticker (safety net for pagination edge cases)
-    unique = {m.ticker: m for m in all_markets}
-
-    return Engine1Output(
-        scanned_market_count=len(unique),
-        markets=list(unique.values()),
-    )
+    markets = await adapter.get_all_open_markets()
+    logger.info("Fetched %d open markets.", len(markets))
+    return markets
 ```
 
 ## Error Handling
@@ -77,8 +43,8 @@ async def fetch_all_open_markets(client: MarketReader) -> Engine1Output:
 |----------|----------|
 | HTTP 429 (rate limit) | Exponential backoff, retry up to 3 times |
 | HTTP 5xx | Retry once, then fail (the adapter should define its own error hierarchy; Phase 1 uses httpx status checks) |
-| Network timeout | Retry once, then fail (forward-looking — Phase 1 adapter raises on httpx timeout) |
-| Empty response | Return `Engine1Output(scanned_market_count=0, markets=[])` |
+| Network timeout | Retry once, then fail (adapter raises on httpx timeout) |
+| Empty response | Return `[]` |
 | Partial data (some markets malformed) | Log warning, skip malformed entries, continue |
 
 ## Non-Negotiable Rules
