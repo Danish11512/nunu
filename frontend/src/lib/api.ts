@@ -12,7 +12,7 @@ import type {
   ApproveCandidateRequest,
   ApproveCandidateResult,
   RejectCandidateRequest,
-  TradeRecord,
+  TradesResponse,
   UpdateConfigRequest,
   ScannerConfigResponse,
   SwitchModeRequest,
@@ -146,8 +146,8 @@ class ScannerAPI {
     mode?: string,
     limit?: number,
     offset?: number,
-  ): Promise<APIResponse<TradeRecord[]>> {
-    return this.request<TradeRecord[]>(
+  ): Promise<APIResponse<TradesResponse>> {
+    return this.request<TradesResponse>(
       "GET",
       "/trades",
       undefined,

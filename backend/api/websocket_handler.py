@@ -52,9 +52,9 @@ class ConnectionManager:
 manager = ConnectionManager()
 
 
-@router.websocket("/ws/scanner")
-async def ws_scanner(ws: WebSocket):
-    await manager.connect("scanner", ws)
+async def _ping_loop(channel: str, ws: WebSocket) -> None:
+    """Listen for pings and reply with pongs."""
+    await manager.connect(channel, ws)
     try:
         while True:
             data = await ws.receive_text()
@@ -62,46 +62,27 @@ async def ws_scanner(ws: WebSocket):
             if msg.get("type") == "ping":
                 await ws.send_text(json.dumps({"type": "pong"}))
     except WebSocketDisconnect:
-        manager.disconnect("scanner", ws)
+        manager.disconnect(channel, ws)
     except Exception as e:
-        logger.error(f"WS scanner error: {e}")
-        manager.disconnect("scanner", ws)
+        logger.error(f"WS {channel} error: {e}")
+        manager.disconnect(channel, ws)
+
+
+@router.websocket("/ws/scanner")
+async def ws_scanner(ws: WebSocket):
+    await _ping_loop("scanner", ws)
 
 
 @router.websocket("/ws/events")
 async def ws_events(ws: WebSocket):
-    await manager.connect("events", ws)
-    try:
-        while True:
-            await ws.receive_text()
-    except WebSocketDisconnect:
-        manager.disconnect("events", ws)
-    except Exception as e:
-        logger.error(f"WS events error: {e}")
-        manager.disconnect("events", ws)
+    await _ping_loop("events", ws)
 
 
 @router.websocket("/ws/candidates")
 async def ws_candidates(ws: WebSocket):
-    await manager.connect("candidates", ws)
-    try:
-        while True:
-            await ws.receive_text()
-    except WebSocketDisconnect:
-        manager.disconnect("candidates", ws)
-    except Exception as e:
-        logger.error(f"WS candidates error: {e}")
-        manager.disconnect("candidates", ws)
+    await _ping_loop("candidates", ws)
 
 
 @router.websocket("/ws/trades")
 async def ws_trades(ws: WebSocket):
-    await manager.connect("trades", ws)
-    try:
-        while True:
-            await ws.receive_text()
-    except WebSocketDisconnect:
-        manager.disconnect("trades", ws)
-    except Exception as e:
-        logger.error(f"WS trades error: {e}")
-        manager.disconnect("trades", ws)
+    await _ping_loop("trades", ws)

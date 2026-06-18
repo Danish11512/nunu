@@ -10,7 +10,7 @@ export default function Settings() {
   const [selectedStrategy, setSelectedStrategy] = useState<string | null>(null);
 
   const resolvedThreshold = threshold ?? config.data?.threshold_percent ?? 65;
-  const resolvedStrategy = selectedStrategy ?? config.data?.strategy.active_profile ?? '';
+  const resolvedStrategy = selectedStrategy ?? config.data?.strategy.name ?? '';
 
   const handleSave = () => {
     updateConfig.mutate({
@@ -20,6 +20,7 @@ export default function Settings() {
   };
 
   const currentMode = config.data?.mode ?? ScannerMode.DRY_RUN;
+  const kalshiConnected = config.data?.kalshi.connected ?? false;
 
   return (
     <div className="min-h-screen bg-gray-900 text-gray-100">
@@ -51,8 +52,8 @@ export default function Settings() {
               <h2 className="text-lg font-semibold mb-3">Mode</h2>
               <ModeSelector
                 currentMode={currentMode}
-                onSwitch={(mode) => switchMode.mutate({ mode })}
-                hasCredentials={config.data.has_credentials}
+                onSwitch={(mode) => switchMode.mutate({ mode, confirm: true })}
+                hasCredentials={kalshiConnected}
                 switching={switchMode.isPending}
               />
             </section>
@@ -66,8 +67,8 @@ export default function Settings() {
                 className="w-full bg-gray-700 border border-gray-600 rounded px-3 py-2 text-gray-100"
               >
                 {config.data.available_strategies.map((s) => (
-                  <option key={s.name} value={s.name}>
-                    {s.name} - {s.description}
+                  <option key={s} value={s}>
+                    {s}
                   </option>
                 ))}
               </select>

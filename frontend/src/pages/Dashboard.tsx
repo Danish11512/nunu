@@ -1,6 +1,8 @@
 import { useState, useCallback } from 'react';
 import { useEvents } from '../hooks/useEvents';
 import { useWebSocket } from '../hooks/useWebSocket';
+import { useWSStore } from '../stores/wsStore';
+import { useScannerConfig } from '../hooks/useScannerConfig';
 import ProgressBar from '../components/ProgressBar';
 import Badge from '../components/Badge';
 import type { EventSummary } from '../lib/types';
@@ -43,9 +45,11 @@ function EventCard({ event }: { event: EventSummary }) {
 
 export default function Dashboard() {
   const [events, setEvents] = useState<EventSummary[]>([]);
-  const [wsConnected, setWsConnected] = useState(false);
+  const wsConnected = useWSStore((s) => s.connectedChannels.events ?? false);
 
   const { data, isLoading, isError, error, refetch } = useEvents();
+  const { config } = useScannerConfig();
+  const currentMode = config.data?.mode ?? 'unknown';
 
   useWebSocket<EventSummary>('events', useCallback((msg) => {
     if (msg.type === 'event:updated' || msg.type === 'event:discovered') {
@@ -63,7 +67,7 @@ export default function Dashboard() {
       const removed = msg.data as { event_ticker: string };
       setEvents((prev) => prev.filter((e) => e.event_ticker !== removed.event_ticker));
     }
-  }, []), setWsConnected);
+  }, []));
 
   const displayEvents = events.length > 0 ? events : (data ?? []);
 
@@ -76,7 +80,7 @@ export default function Dashboard() {
             <span className={`w-2 h-2 rounded-full ${wsConnected ? 'bg-green-400' : 'bg-red-400'}`} />
             {wsConnected ? 'Connected' : 'Disconnected'}
           </span>
-          <span className="text-gray-400">Mode: <span className="text-blue-300">unknown</span></span>
+          <span className="text-gray-400">Mode: <span className="text-blue-300">{currentMode}</span></span>
           <a href="/settings" className="text-blue-400 hover:text-blue-300 underline">Settings</a>
         </div>
       </header>
