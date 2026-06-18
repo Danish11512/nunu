@@ -18,6 +18,17 @@ class MarketFeatures:
     total_resting_order_quantity: int = 0
     progress_pct: float = 0.0
 
+    # ── Extended fields for backtesting / strategy-system.md alignment ──
+    # These default to 0/None. At runtime (Engine 6) they get defaults;
+    # Phase 5 FeatureBuilder enriches them from historical trade data.
+    total_executed_volume: int = 0
+    yes_executed_volume: int = 0
+    no_executed_volume: int = 0
+    trade_count: int = 0
+    yes_price_momentum: float = 0.0
+    yes_total_depth: int = 0
+    no_total_depth: int = 0
+
 
 @dataclass
 class EventFeatures:
