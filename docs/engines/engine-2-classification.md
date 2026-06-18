@@ -22,17 +22,12 @@ class Engine2Input:
 
 ```python
 @dataclass
-class MarketClassification:
-    ticker: str
+class ClassificationResult:
+    market_ticker: str
     event_ticker: str
-    live_now: bool              # Status == "active" AND within trading window
-    expected_to_resolve_today: bool  # expected_expiration_time is today ET
-    latest_expiration_today: bool    # latest_expiration_time is today ET
-    same_day_live_market: bool       # Final decision (see rule below)
-    overtime_category: str           # "standard" | "overtime_short" | "overtime_medium" | "composite"
-    overtime_window_hours: float     # Hours between expected and latest expiration
-    progress_percent: float          # % of time elapsed between open and expected_exp
-    reasons: list[str]
+    is_same_day_live: bool = False
+    confidence: float = 0.0       # 0.0 to 1.0
+    reason: str = ""              # Single reason string, not list
 ```
 
 ## Classification Rule (Overtime-Aware)
@@ -40,47 +35,50 @@ class MarketClassification:
 ```
 SAME_DAY_LIVE_MARKET =
     market.status == "active"                              # Kalshi "active" = open for trading
-    AND market.open_time <= now                            # Trading has started
-    AND market.close_time > now                            # Trading hasn't ended
-    AND expected_expiration_time is today in ET            # Scheduled to resolve today
+    AND create_date (parsed) <= now                        # Trading has started
+    AND close_date (parsed) > now                          # Trading hasn't ended
+    AND market.expiry is today in ET                       # Scheduled to resolve today
     AND (
         latest_expiration_time is today in ET              # Standard: no overtime gap
-        OR (latest_expiration_time - expected_expiration_time)
+        OR (latest_expiration_time - market.expiry)
            <= MAX_OVERTIME_WINDOW_HOURS                    # Overtime-capable with backstop
     )
 ```
 
+> **Note:** `latest_expiration_time` is available from the Kalshi API but is not
+> yet modeled in the Phase 1 `Market` dataclass (which maps it to `expiry`).
+> The overtime logic above is forward-looking — Phase 1 simplifies to:
+> `is_same_day_live = (status == "active" and expiry is today ET)`.
+
 **MAX_OVERTIME_WINDOW_HOURS defaults to 48.** Markets with gaps beyond 48h are
 classified as "composite" (multi-event bundles) and excluded from same-day-live.
 
-### Field Mappings (Kalshi)
+### Field Mappings (Kalshi API → Market Model)
 
-| Rule | Kalshi Field | Type | Verification |
-|------|-------------|------|-------------|
-| Status check | `status` | string | ✅ All 2000 open markets return `"active"` |
-| Open time | `open_time` | ISO 8601 | ✅ Always present on active markets |
-| Close time | `close_time` | ISO 8601 | ✅ Always present |
-| Expected expiration | `expected_expiration_time` | ISO 8601 | ✅ Present on 100% of markets |
-| Latest expiration | `latest_expiration_time` | ISO 8601 | ✅ Present on 100% of markets |
+| Rule | Kalshi API Field | Model Field | Type |
+|------|-----------------|-------------|------|
+| Status check | `status` | `status` | string |
+| Open / create time | `open_time` | `create_date` | ISO 8601 str |
+| Close time | `close_time` | `close_date` | ISO 8601 str |
+| Expected expiration | `expected_expiration_time` | `expiry` | datetime |
+| Latest expiration | `latest_expiration_time` | *(not modeled — forward-looking)* | ISO 8601 |
 
 ### Timezone Handling
 
-All "today" comparisons use **America/New_York** (ET):
+All "today" comparisons use **America/New_York** (ET). The helpers
+`day_key_et()`, `same_et_day()`, and `parse_date()` live in
+`backend.utils.datetime_utils`:
 
 ```python
-def day_key_et(date: datetime) -> str:
-    return date.astimezone(ZoneInfo("America/New_York")).strftime("%Y-%m-%d")
-
-def same_et_day(a: datetime, b: datetime) -> bool:
-    return day_key_et(a) == day_key_et(b)
+from backend.utils.datetime_utils import day_key_et, same_et_day, parse_date
 ```
 
-### Expiration Field Deprecation
+### Expiration Field Note
 
-`expiration_time` (singular, no prefix) is **deprecated**. Always use
-`expected_expiration_time` and `latest_expiration_time`. If a market only has
-`expiration_time`, it does **not** pass classification. ✅ Verified: 100% of
-active markets have both new-style fields.
+The Kalshi API provides both `expected_expiration_time` and `latest_expiration_time`.
+Our Phase 1 `Market` model coalesces these into `expiry` (datetime). For the
+forward-looking overtime logic, the raw Kalshi API fields can be accessed via
+the adapter's raw response. The engine uses `market.expiry` for the "today" check.
 
 ---
 
@@ -144,27 +142,35 @@ Progress measures how much of the event's lifecycle has elapsed. This is used
 by Engine 6 (Progress Gate) to determine if an event is "far enough along" to
 start generating candidates.
 
+The actual implementation lives in `backend.utils.datetime_utils`:
+
+```python
+from backend.utils.datetime_utils import calculate_progress
+
+# Signature:
+# calculate_progress(expires_at: datetime, now: datetime | None = None, start_at: datetime | None = None) -> float
+```
+
 ### Formula
 
 ```
-progress_percent = clamp(
-    (now - open_time) / (expected_expiration_time - open_time) * 100,
+progress_pct = clamp(
+    (1 - (expires_at - now) / (expires_at - start_at)) * 100,
     0, 100
 )
 ```
 
-- **Start anchor**: `open_time` (when the market opened for trading)
-- **End anchor**: `expected_expiration_time` (scheduled resolution)
-- The `latest_expiration_time` is NOT used for progress — it's a backstop, not the expected outcome.
+- **End anchor**: `expires_at` — `market.expiry` (scheduled resolution datetime)
+- **Start anchor**: `start_at` — parsed `market.create_date` (when the market opened for trading)
 - Values clamp to [0, 100]. If the denominator is ≤ 0, returns 100.
 
 ### Example (verified against Kalshi API)
 
 ```
 Event: KXMVESPORTSMULTIGAMEEXTENDED-S202690A7F347182
-Open:          06/17 02:00 EDT
-Expected exp:  06/17 23:05 EDT
-Window:        21.1 hours
+Create date:    06/17 02:00 EDT
+Expiry:         06/17 23:05 EDT
+Window:         21.1 hours
 
 Progress at milestones:
   At opening (02:00):      0.0%
@@ -172,7 +178,7 @@ Progress at milestones:
   At 50% (12:32):         50.0%
   At 65% (15:42):         65.0%  ← Default threshold
   At 90% (20:58):         90.0%
-  At expected (23:05):   100.0%
+  At expiry (23:05):     100.0%
   Now (02:00):             0.0%  ← Just opened (example time)
 ```
 
@@ -181,8 +187,8 @@ point, the scanner would begin generating order candidates for this event.
 
 ### Important: Progress ≠ Event Outcome
 
-Progress is purely temporal — it measures clock elapsed between open and
-expected expiration. It does **not** measure:
+Progress is purely temporal — it measures clock elapsed between creation and
+expected expiry. It does **not** measure:
 - How much volume has traded
 - How close the market is to resolution
 - Whether the outcome is decided
@@ -194,27 +200,27 @@ Those come from Engine 5 (Ranking) and Engine 6 (Progress Gate).
 ## Edge Cases (verified 2026-06-17)
 
 ### 1. Negative Gap (latest < expected)
-**38 markets** out of 2000 have `latest_expiration_time` before
+**38 markets** out of 2000 have `latest_expiration_time` (raw API field) before
 `expected_expiration_time`. This appears to be a data artifact (likely the
 expected time got pushed back after latest was set). Our classification handles
-this fine because we only check `expected_expiration_time` for the "today"
-decision.
+this fine because we only check `expiry` (mapped from `expected_expiration_time`)
+for the "today" decision.
 
 ### 2. Zero-Volume Same-Day-Live Markets
 **49 markets** classified as same-day-live have zero trading volume. These are
 valid — they may get volume later. Our non-filtering rule at this stage is
 correct.
 
-### 3. Past Expected Expiration
+### 3. Past Expiry
 **0 markets** are past their expected expiration but still trading. Kalshi
 closes markets at expected expiration time and proceeds to settlement. This
-confirms `expected_expiration` is a hard deadline.
+confirms `expected_expiration_time` is a hard deadline.
 
 ### 4. Midnight ET Boundary
-**119 markets** have `expected_expiration_time` at exactly 00:00 ET. The
-`same_et_day()` check handles this correctly — midnight is the boundary of
-"today." A market expiring at 00:00 ET on June 18 is classified as June 18,
-not June 17.
+**119 markets** have `expiry` (mapped from `expected_expiration_time`) at exactly
+00:00 ET. The `same_et_day()` check handles this correctly — midnight is the
+boundary of "today." A market expiring at 00:00 ET on June 18 is classified as
+June 18, not June 17.
 
 ### 5. Market with `status != "active"`
 All 2000 open markets returned `status: "active"`. We still check for it as
@@ -233,7 +239,7 @@ scanning if ANY of its child markets passes classification (handled by Engine 3)
 2. **Do NOT filter by category or keyword** — no allowlists, no topic filters.
 3. **Do NOT classify event status directly** — always classify markets first, then group by event_ticker (Engine 3).
 4. **All "today" comparisons use America/New_York** — ET is the market's home timezone.
-5. **Do NOT use deprecated `expiration_time`** — require the two newer fields.
+5. **Use `market.expiry` for the "today" decision** — the Market model coalesces the Kalshi API's `expected_expiration_time` and `latest_expiration_time` into `expiry`. The forward-looking overtime logic can access raw API fields through the adapter.
 6. **Cap overtime window at 48 hours** — composite multi-event bundles with gaps of 300+ hours are not same-day-live events.
 
 ---
@@ -245,119 +251,71 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 from typing import Optional
 
+from backend.utils.datetime_utils import day_key_et, same_et_day, parse_date, calculate_progress
+from backend.core.models.classification import ClassificationResult
+
 ET = ZoneInfo("America/New_York")
 MAX_OVERTIME_HOURS = 48.0
 
 
-def parse_date(value: Optional[str]) -> Optional[datetime]:
-    if not value:
-        return None
-    try:
-        return datetime.fromisoformat(value.replace("Z", "+00:00"))
-    except (ValueError, TypeError):
-        return None
+# Note: parse_date, day_key_et, same_et_day, and calculate_progress
+# live in backend.utils.datetime_utils. The signatures are:
+#   parse_date(date_str: str | None) -> datetime | None
+#   day_key_et(dt: datetime | None = None) -> str
+#   same_et_day(dt1: datetime, dt2: datetime) -> bool
+#   calculate_progress(expires_at, now=None, start_at=None) -> float
 
 
-def day_key_et(date: datetime) -> str:
-    return date.astimezone(ET).strftime("%Y-%m-%d")
-
-
-def same_et_day(a: datetime, b: datetime) -> bool:
-    return day_key_et(a) == day_key_et(b)
-
-
-def calculate_progress(market, now: datetime) -> float:
-    """Return 0–100 based on time elapsed between open and expected_exp."""
-    start = parse_date(market.open_time)
-    end = (parse_date(market.expected_expiration_time)
-           or parse_date(market.latest_expiration_time)
-           or parse_date(market.close_time))
-    if not start or not end:
-        return 0.0
-    total = (end - start).total_seconds()
-    if total <= 0:
-        return 100.0
-    elapsed = (now - start).total_seconds()
-    return max(0.0, min(100.0, elapsed / total * 100))
-
-
-def classify_market(market, now: Optional[datetime] = None) -> dict:
-    """Overtime-aware classification. Returns dict with all fields."""
+def classify_market(market, now: Optional[datetime] = None) -> ClassificationResult:
+    """Overtime-aware classification. Returns a ClassificationResult dataclass."""
     if now is None:
         now = datetime.now(ET)
 
-    reasons = []
-    open_time = parse_date(market.open_time)
-    close_time = parse_date(market.close_time)
-    expected_exp = parse_date(market.expected_expiration_time)
-    latest_exp = parse_date(market.latest_expiration_time)
+    reason_parts: list[str] = []
+    create_dt = parse_date(market.create_date)
+    close_dt = parse_date(market.close_date)
+    expiry_dt = market.expiry  # Already a datetime from the adapter
 
     # Rule 1: Currently trading
     live_now = (
         market.status == "active"
-        and open_time is not None
-        and close_time is not None
-        and open_time <= now
-        and close_time > now
+        and create_dt is not None
+        and close_dt is not None
+        and create_dt <= now
+        and close_dt > now
     )
     if not live_now:
-        reasons.append("Market is not currently active/open.")
+        reason_parts.append("Market is not currently active/open.")
 
-    # Rule 2: Expected expiration is today ET
-    expected_today = (expected_exp is not None and same_et_day(expected_exp, now))
-    if not expected_today:
-        reasons.append(f"Expected expiration not today ET.")
-    elif expected_exp and now > expected_exp:
-        reasons.append("Market past expected expiration (overdue).")
+    # Rule 2: Expiry is today ET
+    expiry_today = (expiry_dt is not None and same_et_day(expiry_dt, now))
+    if not expiry_today:
+        reason_parts.append("Expiry not today ET.")
+    elif expiry_dt and now > expiry_dt:
+        reason_parts.append("Market past expiry (overdue).")
 
     # Rule 3: Check overtime window
-    overtime_category = "standard"
-    overtime_window_hours = 0.0
-    latest_today = False
+    # Note: latest_expiration_time is available from the Kalshi API but not
+    # yet modeled on the Market dataclass. This forward-looking logic would
+    # use the raw API field when available.
+    is_composite = False
 
-    if latest_exp is not None:
-        latest_today = same_et_day(latest_exp, now)
-        if expected_exp and latest_exp:
-            overtime_window_hours = (latest_exp - expected_exp).total_seconds() / 3600
-
-        if expected_today and not latest_today and expected_exp and latest_exp:
-            gap = overtime_window_hours
-            if gap <= 0:
-                overtime_category = "standard"
-            elif gap <= 6:
-                overtime_category = "overtime_short"
-                reasons.append(f"Short OT window ({gap:.1f}h).")
-            elif gap <= 24:
-                overtime_category = "overtime_medium"
-                reasons.append(f"Medium OT window ({gap:.1f}h).")
-            elif gap <= MAX_OVERTIME_HOURS:
-                overtime_category = "overtime_long"
-                reasons.append(f"Long OT window ({gap:.1f}h).")
-            else:
-                overtime_category = "composite"
-                reasons.append(f"Composite event (gap={gap:.0f}h).")
-        elif latest_today:
-            reasons.append("Latest expiration also today — standard same-day.")
+    # (Forward-looking: when latest_expiration_time is available, compute
+    #  overtime gap and set is_composite if gap > MAX_OVERTIME_HOURS.)
 
     # Final decision
-    same_day_live = (
-        live_now
-        and expected_today
-        and overtime_category != "composite"
-    )
+    is_same_day_live = live_now and expiry_today and not is_composite
 
-    return {
-        "ticker": market.ticker,
-        "event_ticker": market.event_ticker,
-        "live_now": live_now,
-        "expected_to_resolve_today": expected_today,
-        "latest_expiration_today": latest_today,
-        "same_day_live_market": same_day_live,
-        "overtime_category": overtime_category,
-        "overtime_window_hours": overtime_window_hours,
-        "progress_percent": calculate_progress(market, now),
-        "reasons": reasons,
-    }
+    # Build single reason string
+    reason = "; ".join(reason_parts) if reason_parts else "Passed all checks"
+
+    return ClassificationResult(
+        market_ticker=market.ticker,
+        event_ticker=market.event_ticker,
+        is_same_day_live=is_same_day_live,
+        confidence=1.0 if is_same_day_live else 0.0,
+        reason=reason,
+    )
 
 
 def get_same_day_live_markets(
@@ -375,7 +333,7 @@ def get_same_day_live_markets(
         classification = classify_market(market, now)
         pair = (market, classification)
         all_classified.append(pair)
-        if classification["same_day_live_market"]:
+        if classification.is_same_day_live:
             live.append(pair)
 
     return all_classified, live
@@ -385,7 +343,9 @@ def get_same_day_live_markets(
 
 ## Dependencies
 
-- `backend/core/models.py` — `Market`, `MarketClassification`
+- `backend.core.models.market` — `Market`
+- `backend.core.models.classification` — `ClassificationResult`
+- `backend.utils.datetime_utils` — `parse_date`, `day_key_et`, `same_et_day`, `calculate_progress`
 - `zoneinfo` (Python 3.9+) — `ZoneInfo("America/New_York")`
 - No external API calls — pure data transformation
 
@@ -396,8 +356,7 @@ def get_same_day_live_markets(
 The analysis at `scripts/run_classification_analysis.py` provides a
 verifiable, live-audited baseline. Run it against the real Kalshi API to:
 
-1. Confirm every market has both `expected_expiration_time` and
-   `latest_expiration_time` ✅ (100% in 2026-06-17 test)
+1. Confirm every market has `expiry` set (mapped from `expected_expiration_time`) ✅ (100% in 2026-06-17 test)
 2. Classify all open markets into SDL / overtime / composite buckets
 3. Display real examples of each category
 4. Measure overtime window distribution

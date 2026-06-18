@@ -183,16 +183,17 @@ python-dotenv==1.0.1
 
 ```
 # Kalshi API
-KALSHI_API_BASE_URL=https://external-api.kalshi.com/trade-api/v2
+KALSHI_API_BASE_URL=https://api.elections.kalshi.com/trade-api/v2
+KALSHI_WS_BASE_URL=wss://api.elections.kalshi.com/trade-api/v2
 KALSHI_API_KEY_ID=             # API key ID from Kalshi dashboard
 KALSHI_PRIVATE_KEY=            # RSA private key in PEM format (for signing)
-KALSHI_MEMBER_ID=              # Kalshi member ID (from account settings)
-KALSHI_FUNDER_ADDRESS=
+KALSHI_MEMBER_ID=              # Kalshi member ID (optional, Phase 6+)
+KALSHI_FUNDER_ADDRESS=         # Optional, Phase 6+
 
 # Scanner
-SCANNER_DEFAULT_MODE=dry_run
+SCANNER_DEFAULT_MODE=oneshot
 SCANNER_DEFAULT_THRESHOLD=65
-SCANNER_DEFAULT_STRATEGY=executed-volume-follower
+SCANNER_DEFAULT_STRATEGY=favorite-side-follower
 
 # Logging
 LOG_LEVEL=INFO
@@ -207,13 +208,13 @@ TRADE_HISTORY_PATH=logs/trades.json
 
 ```yaml
 kalshi:
-  base_url: "https://external-api.kalshi.com/trade-api/v2"
+  base_url: "https://api.elections.kalshi.com/trade-api/v2"
   rate_limit: 10              # requests per second
 
 scanner:
-  default_mode: dry_run        # dry_run | read_only | live
+  default_mode: oneshot        # oneshot | live
   default_threshold: 65        # matches settings.py default
-  default_strategy: executed-volume-follower
+  default_strategy: favorite-side-follower
   discovery_poll_interval: 30  # seconds
   progress_gate_interval: 10   # seconds
   max_candidate_age: 30        # seconds
@@ -243,7 +244,7 @@ backend/core/
   models/
     __init__.py               # Re-exports all models
     market.py                 # Market, Orderbook, OrderbookLevel, MarketOrderbookStats
-    classification.py         # MarketClassification, ClassifiedEvent
+    classification.py         # ClassificationResult, ClassifiedEvent
     trading.py                # OrderCandidate, TradeRecord, ValidationConfig, RiskConfig
   interfaces/
     __init__.py               # Re-exports all interfaces
@@ -270,7 +271,7 @@ backend/utils/
 **Verification:**
 ```bash
 cd backend && python -c "
-from backend.core.models import Market, OrderCandidate, MarketClassification
+from backend.core.models import Market, OrderCandidate, ClassificationResult
 from backend.core.interfaces import AbstractMarketAdapter, StrategyProfile, AbstractEngine
 from backend.utils.datetime_utils import parse_date, calculate_progress
 from backend.utils.http_utils import RateLimiter
@@ -283,211 +284,228 @@ print('Phase 1: Core + Utils import OK')
 
 ```python
 from dataclasses import dataclass, field
-from typing import Optional
+from datetime import datetime
+
 
 @dataclass
 class Market:
-    """A single Kalshi market (tradable binary outcome)."""
-    ticker: str                    # Primary ID, e.g. "EVTA-M1"
-    event_ticker: str              # Parent event ID, e.g. "EVTA"
-    status: str                    # "active" | "closed" | "settled"
-    title: str                     # Human-readable question
-    open_time: str                 # ISO 8601
-    close_time: str                # ISO 8601
-    expected_expiration_time: Optional[str] = None
-    latest_expiration_time: Optional[str] = None
-    yes_bid: Optional[str] = None
-    yes_ask: Optional[str] = None
-    no_bid: Optional[str] = None
-    no_ask: Optional[str] = None
-    volume_24h: Optional[str] = None
-    total_volume: Optional[str] = None
-    category: Optional[str] = None
-    series_ticker: Optional[str] = None
+    """A single Kalshi prediction market contract."""
+
+    ticker: str                    # e.g. "KXLYDYX"
+    event_ticker: str              # e.g. "PRESIDENTS-DAY-24H"
+    title: str
+    status: str                    # "open" | "active" | "closed" | "settled"
+    yes_ask: int | None            # Price in cents
+    yes_bid: int | None
+    no_ask: int | None
+    no_bid: int | None
+    volume: int                    # Total contracts traded
+    open_interest: int
+    expiry: datetime | None        # expected_expiration_time from API
+    expiry_iso: str | None         # Raw ISO string for serialization
+    create_date: str | None        # ISO date
+    settlement_date: str | None
+    close_date: str | None
+    result: str | None             # "yes" | "no" | None (before settlement)
+    rules_primary: str | None      # The main "Yes/No" rule
+    rule_key: str | None
+    volume_24h: int | None = None
+    volume_24h_adjusted: int | None = None
 
 
 @dataclass
 class OrderbookLevel:
-    """Single price level in an orderbook."""
-    price: float     # In dollars
-    size: float      # Quantity at this level
+    """A single price level in the orderbook."""
+
+    price: int          # In cents
+    count: int          # Number of contracts at this level
 
 
 @dataclass
 class Orderbook:
-    """Resting bids for YES and NO outcomes."""
-    market_id: str
-    yes_bids: list[OrderbookLevel] = field(default_factory=list)
-    no_bids: list[OrderbookLevel] = field(default_factory=list)
+    """Orderbook snapshot for a single market."""
+
+    market_ticker: str
+    yes_side: list[OrderbookLevel] = field(default_factory=list)
+    no_side: list[OrderbookLevel] = field(default_factory=list)
+    fetch_time: datetime | None = None
 
 
 @dataclass
 class MarketOrderbookStats:
-    """Derived statistics from an orderbook."""
-    market_id: str
-    event_ticker: str              # event_id, stored as event_ticker for consistency
-    total_resting_order_quantity: float
-    yes_order_quantity: float
-    no_order_quantity: float
-    depth_level_count: int
-    best_yes_bid: Optional[float] = None
-    best_no_bid: Optional[float] = None
-    volume_24h: float = 0.0
-    total_volume: float = 0.0
-    series_ticker: Optional[str] = None
+    """Derived orderbook statistics for a market."""
+
+    market_ticker: str               # NOT market_id — consistent with Market.ticker
+    event_ticker: str
+    spread_cents: int | None = None
+    yes_bid: int | None = None
+    yes_ask: int | None = None
+    no_bid: int | None = None
+    no_ask: int | None = None
+    last_price: int | None = None
+    volume: int = 0
+    open_interest: int = 0
+    volume_24h: int | None = None
+    total_resting_order_quantity: int = 0
 ```
 
 ### 1.2 — `backend/core/models/classification.py`
 
 ```python
 from dataclasses import dataclass, field
-from typing import Optional
+
+from backend.core.models.market import Market
+
 
 @dataclass
-class MarketClassification:
-    """Result of same-day-live classification for one market."""
-    ticker: str
+class ClassificationResult:
+    """Result of running a classifier on a market."""
+
+    market_ticker: str
     event_ticker: str
-    live_now: bool
-    expected_to_resolve_today: bool
-    latest_expiration_today: bool
-    same_day_live_market: bool
-    overtime_category: str = "standard"
-    overtime_window_hours: float = 0.0
-    progress_percent: float = 0.0
-    reasons: list[str] = field(default_factory=list)
+    is_same_day_live: bool = False
+    confidence: float = 0.0        # 0.0 to 1.0
+    reason: str = ""
 
 
 @dataclass
 class ClassifiedEvent:
-    """Event with its same-day-live child markets."""
+    """A grouped event with classified markets."""
+
     event_ticker: str
-    market_count: int
-    same_day_live_market_count: int
-    same_day_live_markets: list[tuple['Market', 'MarketClassification']] = field(default_factory=list)
+    event_title: str
+    event_start_date: str | None = None
+    event_end_date: str | None = None
+    event_description: str | None = None
+    markets: list[Market] = field(default_factory=list)
+    classification: ClassificationResult | None = None
+    num_markets: int = 0
+    total_volume: int = 0
 ```
 
 ### 1.3 — `backend/core/models/trading.py`
 
 ```python
 from dataclasses import dataclass, field
-from typing import Optional
-from .market import Market, MarketOrderbookStats, Orderbook
-from .classification import MarketClassification
+from datetime import datetime
+
 
 @dataclass
 class RankedMarket:
-    """Market with classification and orderbook stats, ready for ranking."""
-    market: Market
-    classification: MarketClassification
-    orderbook_stats: MarketOrderbookStats
+    """A market with its ranking score and price data."""
+
+    market_ticker: str
+    volume: int
+    spread_cents: int
+    yes_price: int               # Current yes bid or valuation
+    no_price: int                # Current no bid or valuation
+    rank: int
+    score: float                 # Composite ranking score
 
 
 @dataclass
 class EventWithTopMarkets:
-    """Ranked event with top 3 markets + full ranked list."""
+    """An event with its top ranked markets."""
+
     event_ticker: str
-    market_count: int
-    same_day_live_market_count: int
-    total_event_resting_order_quantity: float
-    active_orderbook_market_count: int
-    top_3_markets_by_current_orders: list[RankedMarket] = field(default_factory=list)
-    all_same_day_live_markets_ranked: list[RankedMarket] = field(default_factory=list)
+    event_title: str
+    top_markets: list[RankedMarket] = field(default_factory=list)
+    total_volume: int = 0
+    num_top_markets: int = 0
 
 
 @dataclass
 class OrderCandidate:
-    """A potential trade, produced by Engine 6."""
-    event_id: str
-    market_id: str
-    side: str                      # "yes" | "no" | "tie" | "none"
-    estimated_price: float
-    estimated_size: float
-    progress_percent: float
-    threshold_percent: float
-    confidence: str                # "high" | "medium" | "low"
-    requires_manual_review: bool = False
-    reasons: list[str] = field(default_factory=list)
+    """A potential trade order before validation."""
 
-    @property
-    def is_actionable(self) -> bool:
-        return self.side in ("yes", "no") and not self.requires_manual_review
+    event_ticker: str              # NOT event_id — consistent with Market.event_ticker
+    market_ticker: str             # NOT market_id — consistent with Market.ticker
+    side: str                      # "yes" or "no"
+    price: int                     # Limit price in cents
+    confidence: float = 0.0
+    reason: str = ""
+    volume: int = 0
+    progress_pct: float = 0.0     # 0–100 scale
+    created_at: datetime | None = None
 
 
 @dataclass
-class ProgressBasedOrderCandidate:
-    """Full candidate from Engine 6 with all context."""
-    event_ticker: str
-    threshold_percent: int
-    event_progress_percent: float
-    event_passes_progress_threshold: bool
-    selected_market: Optional[Market] = None
-    selected_market_stats: Optional[MarketOrderbookStats] = None
-    most_bet_side: str = "none"
-    yes_order_quantity: float = 0.0
-    no_order_quantity: float = 0.0
-    total_resting_order_quantity: float = 0.0
-    should_create_order_candidate: bool = False
-    requires_manual_review: bool = False
-    reasons: list[str] = field(default_factory=list)
+class ProgressBasedOrderCandidate(OrderCandidate):
+    """Candidate created by Engine 6 (progress gate)."""
+
+    most_bet_side: str = ""        # NOT "selected_side" — see build plan
+    threshold_pct: float = 0.0    # The threshold that was met
+    is_overtime: bool = False
+    # Note: progress_pct inherited from OrderCandidate (default 0.0)
 
 
 @dataclass
 class ValidatedOrderCandidate:
-    """A candidate that passed pre-trade validation."""
-    candidate: ProgressBasedOrderCandidate
-    validation_timestamp: str
-    validation_latency_ms: float
-    can_trade: bool
-    reason: Optional[str] = None
-    latest_market: Optional[Market] = None
-    latest_orderbook: Optional[Orderbook] = None
-    latest_stats: Optional[MarketOrderbookStats] = None
-    confirmed_side: Optional[str] = None
+    """Candidate after Engine 7 validation."""
+
+    original_candidate: OrderCandidate
+    is_valid: bool = False
+    validation_errors: list[str] = field(default_factory=list)
+    risk_score: float = 0.0
+    estimated_entry_price: int = 0
+    estimated_exit_price: int = 0
+    max_contracts: int = 0
 
 
 @dataclass
 class TradeRecord:
-    """A record of an executed trade (real or dry-run)."""
-    trade_id: str
-    event_ticker: str
+    """A completed trade record."""
+
     market_ticker: str
+    event_ticker: str
     side: str
-    price: float
-    size: float
-    mode: str                      # "dry_run" | "live"
-    status: str                    # "filled" | "partial" | "failed"
-    timestamp: str
-    validation_latency_ms: float
-    error: Optional[str] = None
+    entry_price: int
+    exit_price: int | None = None
+    quantity: int = 0
+    entry_time: datetime | None = None
+    exit_time: datetime | None = None
+    pnl: float = 0.0
+    status: str = "open"           # "open" | "closed" | "cancelled"
+    trade_id: str = ""
 
 
 @dataclass
 class ValidationConfig:
-    max_price_movement_percent: float = 10.0
-    max_spread_width: float = 0.05
-    min_liquidity: float = 100.0
-    max_candidate_age_seconds: float = 30.0
-    allow_partial_fill: bool = True
+    """Configuration for trade validation (Engine 7)."""
+
+    max_spread_cents: int = 5
+    min_volume: int = 100
+    max_position_size: int = 1000
+    min_confidence: float = 0.6
+    allow_overtime: bool = False
 
 
 @dataclass
 class RiskConfig:
-    max_exposure_per_market: float = 1000.0
-    max_total_exposure: float = 5000.0
-    max_positions: int = 10
-    daily_loss_limit: float = 500.0
+    """Risk management configuration."""
+
+    max_position_size_per_market: int = 500
+    max_position_size_per_event: int = 1000
+    max_total_positions: int = 20
+    max_daily_trades: int = 50
+    stop_loss_cents: int = 20
+    take_profit_cents: int = 40
 ```
 
 ### 1.4 — `backend/core/models/__init__.py`
 
 ```python
-from .market import Market, Orderbook, OrderbookLevel, MarketOrderbookStats
-from .classification import MarketClassification, ClassifiedEvent
-from .trading import (
-    RankedMarket, EventWithTopMarkets, OrderCandidate,
-    ProgressBasedOrderCandidate, ValidatedOrderCandidate,
-    TradeRecord, ValidationConfig, RiskConfig,
+from backend.core.models.market import Market, OrderbookLevel, Orderbook, MarketOrderbookStats
+from backend.core.models.classification import ClassificationResult, ClassifiedEvent
+from backend.core.models.trading import (
+    RankedMarket,
+    EventWithTopMarkets,
+    OrderCandidate,
+    ProgressBasedOrderCandidate,
+    ValidatedOrderCandidate,
+    TradeRecord,
+    ValidationConfig,
+    RiskConfig,
 )
 ```
 
@@ -501,41 +519,85 @@ from .trading import (
 
 ```python
 from abc import ABC, abstractmethod
-from typing import Optional
-from ..models.market import Market, Orderbook, MarketOrderbookStats
+from typing import Any
 
 
 class MarketReader(ABC):
-    """Read-only market data access (ISP: segregated from trading)."""
-    
+    """Read-only market data access."""
+
     @abstractmethod
-    async def get_all_open_markets(self) -> list[Market]:
+    async def fetch_markets(self, **kwargs: Any) -> list[dict[str, Any]]:
+        """Fetch all available markets."""
         ...
 
     @abstractmethod
-    async def get_market(self, ticker: str) -> Optional[Market]:
+    async def fetch_orderbook(self, ticker: str, **kwargs: Any) -> dict[str, Any]:
+        """Fetch orderbook for a single market by ticker."""
         ...
 
     @abstractmethod
-    async def get_orderbook(self, ticker: str) -> Orderbook:
+    async def fetch_event(self, event_ticker: str, **kwargs: Any) -> dict[str, Any]:
+        """Fetch a single event by ticker."""
         ...
 
     @abstractmethod
-    async def get_orderbook_stats(self, ticker: str) -> Optional[MarketOrderbookStats]:
+    async def fetch_events(self, **kwargs: Any) -> list[dict[str, Any]]:
+        """Fetch all events."""
         ...
 
 
 class Trader(ABC):
-    """Write-side order placement (ISP: only needed for live mode)."""
+    """Write-only trading operations."""
 
     @abstractmethod
-    async def place_order(self, ticker: str, side: str, price: float, size: float) -> dict:
+    async def place_order(self, ticker: str, side: str, price: int, count: int, **kwargs: Any) -> dict[str, Any]:
+        """Place a limit order."""
+        ...
+
+    @abstractmethod
+    async def cancel_order(self, order_id: str, **kwargs: Any) -> dict[str, Any]:
+        """Cancel an existing order."""
+        ...
+
+    @abstractmethod
+    async def get_positions(self, **kwargs: Any) -> list[dict[str, Any]]:
+        """Get current positions."""
         ...
 
 
-class AbstractMarketAdapter(MarketReader, Trader):
-    """Full adapter combining read + write."""
-    pass
+class AbstractMarketAdapter(MarketReader, Trader, ABC):
+    """Combined interface for full market access (read + write).
+
+    Properties that adapters should provide:
+    - name: str — adapter identifier
+    - timezone: str — exchange timezone
+    - supports_trading: bool — whether trading operations are available
+    - supports_websocket: bool — whether websocket streaming is available
+    """
+
+    @property
+    @abstractmethod
+    def name(self) -> str:
+        """Human-readable adapter name."""
+        ...
+
+    @property
+    @abstractmethod
+    def timezone(self) -> str:
+        """Exchange timezone string (e.g. 'US/Eastern')."""
+        ...
+
+    @property
+    @abstractmethod
+    def supports_trading(self) -> bool:
+        """Whether this adapter supports placing orders."""
+        ...
+
+    @property
+    @abstractmethod
+    def supports_websocket(self) -> bool:
+        """Whether this adapter supports websocket streaming."""
+        ...
 ```
 
 #### `backend/core/interfaces/strategy.py` (single `select_trade()` per ADR-018)
@@ -547,118 +609,219 @@ class AbstractMarketAdapter(MarketReader, Trader):
 ```python
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import Optional
-from datetime import datetime
 
 
 @dataclass
 class MarketFeatures:
-    """Pre-computed features for a single child market, passed to strategies."""
-    market_ticker: str
-    market_title: str
-    result: Optional[str] = None
-    status: str = ""
-    total_executed_volume: float = 0.0
-    yes_executed_volume: float = 0.0
-    no_executed_volume: float = 0.0
-    trade_count: int = 0
-    yes_price: float = 0.0
-    no_price: float = 0.0
-    yes_best_bid: Optional[float] = None
-    no_best_bid: Optional[float] = None
-    yes_total_depth: Optional[float] = None
-    no_total_depth: Optional[float] = None
-    spread: Optional[float] = None
-    yes_price_momentum: Optional[float] = None
-    open_interest: Optional[float] = None
+    """Features for a single market within an event."""
+    ticker: str
+    volume: int = 0
+    volume_24h: int = 0
+    yes_bid: int = 0
+    yes_ask: int = 0
+    no_bid: int = 0
+    no_ask: int = 0
+    spread_cents: int = 0
+    last_price: int = 0
+    open_interest: int = 0
+    total_resting_order_quantity: int = 0
+    progress_pct: float = 0.0
 
 
 @dataclass
 class EventFeatures:
-    """All child markets for an event, pre-computed for strategy decision."""
+    """Features computed for an event passed to the strategy."""
     event_ticker: str
     event_title: str = ""
-    category: str = ""
-    event_progress: float = 0.0
-    threshold: float = 0.0
-    entry_time: Optional[datetime] = None
     child_markets: list[MarketFeatures] = field(default_factory=list)
+    total_volume: int = 0
+    num_markets: int = 0
+    num_markets_live: int = 0
+    max_progress_pct: float = 0.0
+    min_progress_pct: float = 0.0
+    has_overtime: bool = False
 
 
 @dataclass
 class TradeDecision:
-    """Result of a strategy's select_trade() call."""
-    event_ticker: str = ""
-    market_ticker: str = ""
-    selected_side: str = ""         # "YES" | "NO"
-    trade_decision: str = "SKIP"    # "BUY_YES" | "BUY_NO" | "SKIP"
-    skip_reason: Optional[str] = None
-    entry_price_cents: Optional[float] = None
-    entry_threshold: Optional[float] = None
-    event_progress_at_entry: Optional[float] = None
-    side_signal_strength: Optional[float] = None
-    market_signal_strength: Optional[float] = None
-    selected_market_reason: Optional[str] = None
-    selected_side_reason: Optional[str] = None
-    experiment_id: Optional[str] = None
-    estimated_fee_cents: float = 1.0
-    max_acceptable_price_cents: float = 85.0
+    """The decision returned by a strategy."""
+    market_ticker: str
+    side: str                              # "yes" or "no"
+    confidence: float = 0.0
+    reason: str = ""
+    entry_price_cents: int = 0
+    max_contracts: int = 0
+    should_trade: bool = False
 
 
 class StrategyProfile(ABC):
-    """Single-method interface for market/side selection strategies.
-    
-    All 7 experiments (Phase 4) implement this interface.
-    Engines E6 and E7 depend on this, not on concrete strategy classes.
-    """
-    name: str = ""
-    description: str = ""
-    config: dict = {}
+    """Base class for all trading strategies.
 
-    def __init__(self, config: dict = None):
-        self.config = config or {}
+    Each strategy receives pre-computed EventFeatures with ALL child markets
+    and returns a TradeDecision for a single market. The strategy gets full
+    context to make the most informed decision.
+    """
+
+    def __init__(self, name: str, description: str = ""):
+        self.name = name
+        self.description = description
 
     @abstractmethod
-    def select_trade(self, event_features: EventFeatures) -> TradeDecision:
-        """
-        Given all pre-computed child market features for an event,
-        return a trade decision (BUY_YES / BUY_NO / SKIP).
+    def select_trade(self, features: EventFeatures) -> TradeDecision:
+        """Analyze event features and return a trade decision.
+
+        The strategy receives ALL child markets in EventFeatures.child_markets
+        and must choose the best one (or none) to trade.
         """
         ...
+
+    def __repr__(self) -> str:
+        return f"StrategyProfile(name={self.name!r})"
 ```
 
 #### `backend/core/interfaces/engine.py` (OCP: new engines via implementation)
 
 ```python
 from abc import ABC, abstractmethod
-from typing import Any
+from dataclasses import dataclass, field
+from typing import Any, Generic, TypeVar
 
 
-class AbstractEngine(ABC):
-    """
-    Every pipeline engine implements this single-method interface.
-    The orchestrator can run any engine without knowing its concrete type.
-    """
-    
+TInput = TypeVar("TInput")
+TOutput = TypeVar("TOutput")
+
+
+@dataclass
+class EngineContext:
+    """Shared context passed through the engine pipeline."""
+    config: dict[str, Any] = field(default_factory=dict)
+    state: dict[str, Any] = field(default_factory=dict)
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+
+class AbstractEngine(ABC, Generic[TInput, TOutput]):
+    """Base class for all processing engines in the pipeline."""
+
+    def __init__(self, name: str, context: EngineContext | None = None):
+        self.name = name
+        self.context = context or EngineContext()
+
     @abstractmethod
-    async def run(self, context: dict) -> dict:
-        """Execute this engine step with the pipeline context.
-        Returns updated context with this engine's results.
+    async def process(self, data: TInput) -> TOutput:
+        """Process input data and return transformed output.
+
+        Args:
+            data: Input data of type TInput
+
+        Returns:
+            Processed output of type TOutput
         """
         ...
+
+    @abstractmethod
+    async def validate(self, data: TInput) -> bool:
+        """Validate whether the input can be processed.
+
+        Args:
+            data: Input data to validate
+
+        Returns:
+            True if input is valid and can be processed
+        """
+        ...
+
+    async def __call__(self, data: TInput) -> TOutput:
+        """Convenience: call the engine directly."""
+        if not await self.validate(data):
+            raise ValueError(f"Engine {self.name}: input validation failed")
+        return await self.process(data)
+
+    def __repr__(self) -> str:
+        return f"AbstractEngine(name={self.name!r})"
 ```
 
 #### `backend/core/interfaces/__init__.py`
 
 ```python
-from .adapter import AbstractMarketAdapter, MarketReader, Trader
-from .strategy import StrategyProfile, EventFeatures, MarketFeatures, TradeDecision
-from .engine import AbstractEngine
+from backend.core.interfaces.adapter import MarketReader, Trader, AbstractMarketAdapter
+from backend.core.interfaces.strategy import StrategyProfile, EventFeatures, MarketFeatures, TradeDecision
+from backend.core.interfaces.engine import AbstractEngine, EngineContext
 ```
 
 ### 1.6 — `backend/core/scanner_state.py`
 
-(Content unchanged from original — central runtime state dataclass.)
+```python
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from datetime import datetime
+from typing import Any
+
+from backend.core.models.classification import ClassifiedEvent
+from backend.core.models.trading import EventWithTopMarkets, ValidatedOrderCandidate
+
+
+@dataclass
+class ScannerState:
+    """Mutable state for the scanner's current cycle."""
+
+    # Pipeline stages
+    is_running: bool = False
+    current_cycle: int = 0
+    started_at: datetime | None = None
+    cycle_started_at: datetime | None = None
+
+    # Data flowing through pipeline
+    markets: list[dict[str, Any]] = field(default_factory=list)
+    classified_events: dict[str, ClassifiedEvent] = field(default_factory=dict)
+    ranked_events: list[EventWithTopMarkets] = field(default_factory=list)
+    candidates: list[ValidatedOrderCandidate] = field(default_factory=list)
+
+    # Error tracking
+    errors: list[str] = field(default_factory=list)
+    warnings: list[str] = field(default_factory=list)
+
+    # Configuration snapshot for this cycle
+    config_snapshot: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class ScannerOutput:
+    """Final output after a complete scanner cycle."""
+
+    cycle: int = 0
+    completed_at: datetime | None = None
+    duration_seconds: float = 0.0
+
+    # Results
+    events: list[EventWithTopMarkets] = field(default_factory=list)
+    trades: list[ValidatedOrderCandidate] = field(default_factory=list)
+
+    # Summary
+    num_events_scanned: int = 0
+    num_markets_scanned: int = 0
+    num_candidates_found: int = 0
+    num_trades_executed: int = 0
+
+    # Error tracking
+    errors: list[str] = field(default_factory=list)
+    warnings: list[str] = field(default_factory=list)
+
+
+@dataclass
+class CycleMetrics:
+    """Metrics collected during a single scanner cycle."""
+
+    cycle: int = 0
+    duration_seconds: float = 0.0
+    markets_fetched: int = 0
+    events_classified: int = 0
+    events_ranked: int = 0
+    candidates_generated: int = 0
+    candidates_validated: int = 0
+    trades_placed: int = 0
+    errors_encountered: int = 0
+```
 
 ### 1.7 — `backend/utils/` (DRY: shared utilities extracted from engines and client)
 
@@ -668,47 +831,67 @@ from .engine import AbstractEngine
 > Engine 6 (calculate_progress). Single source of truth for time handling.
 
 ```python
-from datetime import datetime
+from __future__ import annotations
+
+from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
-from typing import Optional
 
-ET = ZoneInfo("America/New_York")
+# US Eastern timezone
+ET = ZoneInfo("US/Eastern")
+UTC = timezone.utc
 
 
-def parse_date(value: Optional[str]) -> Optional[datetime]:
-    """Parse ISO 8601 string to datetime. Handles 'Z' suffix."""
-    if not value:
+def parse_date(date_str: str | None) -> datetime | None:
+    """Parse ISO 8601 string to datetime. Handles 'Z' suffix and None."""
+    if date_str is None:
         return None
+    if date_str.endswith("Z") or date_str.endswith("z"):
+        date_str = date_str[:-1] + "+00:00"
     try:
-        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+        dt = datetime.fromisoformat(date_str)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=UTC)
+        return dt
     except (ValueError, TypeError):
         return None
 
 
-def day_key_et(date: datetime) -> str:
-    """YYYY-MM-DD in America/New_York."""
-    return date.astimezone(ET).strftime("%Y-%m-%d")
+def day_key_et(dt: datetime | None = None) -> str:
+    """YYYY-MM-DD in America/New_York. Defaults to current ET time."""
+    if dt is None or dt.tzinfo is None:
+        dt = datetime.now(ET)
+    return dt.astimezone(ET).strftime("%Y-%m-%d")
 
 
-def same_et_day(a: datetime, b: datetime) -> bool:
+def same_et_day(dt1: datetime, dt2: datetime) -> bool:
     """True if both datetimes fall on the same calendar day in ET."""
-    return day_key_et(a) == day_key_et(b)
+    return day_key_et(dt1) == day_key_et(dt2)
 
 
-def calculate_progress(start_str: str, end_str: str, now: datetime) -> float:
+def calculate_progress(
+    expires_at: datetime,
+    now: datetime | None = None,
+    start_at: datetime | None = None,
+) -> float:
     """
-    0–100: time elapsed between start and end.
-    Uses expected_expiration_time as the primary end anchor.
+    0–100: time elapsed between start and expiry.
+    
+    If start_at is None, uses the midpoint between now and expires_at
+    as the start (assumes the event started before now).
+    Clamps to [0.0, 100.0].
     """
-    start = parse_date(start_str)
-    end = parse_date(end_str)
-    if not start or not end:
-        return 0.0
-    total = (end - start).total_seconds()
-    if total <= 0:
+    if now is None:
+        now = datetime.now(UTC)
+    if expires_at.tzinfo is None:
+        expires_at = expires_at.replace(tzinfo=UTC)
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=UTC)
+    total_seconds = (expires_at - (start_at or now)).total_seconds()
+    elapsed_seconds = (expires_at - now).total_seconds()
+    if total_seconds <= 0:
         return 100.0
-    elapsed = (now - start).total_seconds()
-    return max(0.0, min(100.0, elapsed / total * 100))
+    progress = (1.0 - (elapsed_seconds / total_seconds)) * 100.0
+    return max(0.0, min(100.0, progress))
 ```
 
 #### `backend/utils/http_utils.py`
@@ -717,64 +900,114 @@ def calculate_progress(start_str: str, end_str: str, now: datetime) -> float:
 > across all HTTP-calling modules.
 
 ```python
+from __future__ import annotations
+
 import asyncio
 import logging
-from typing import Optional
+from collections import deque
+from datetime import datetime, timedelta, timezone
+from typing import Any, Callable
+
+import httpx
 
 logger = logging.getLogger(__name__)
 
 
 class RateLimiter:
-    """Async semaphore-based rate limiter."""
-    
-    def __init__(self, max_concurrent: int = 10):
-        self._semaphore = asyncio.Semaphore(max_concurrent)
+    """Token-bucket rate limiter for API requests.
 
-    async def acquire(self):
-        await self._semaphore.acquire()
+    Limits requests to `max_per_second` calls per second.
+    """
 
-    def release(self):
-        self._semaphore.release()
+    def __init__(self, max_per_second: int = 10):
+        self.max_per_second = max_per_second
+        self._timestamps: deque[datetime] = deque()
+        self._lock = asyncio.Lock()
 
-    async def __aenter__(self):
+    async def acquire(self) -> None:
+        """Block until a request slot is available."""
+        while True:
+            async with self._lock:
+                now = datetime.now(timezone.utc)
+                cutoff = now - timedelta(seconds=1)
+                while self._timestamps and self._timestamps[0] < cutoff:
+                    self._timestamps.popleft()
+                if len(self._timestamps) < self.max_per_second:
+                    self._timestamps.append(now)
+                    return
+            await asyncio.sleep(0.05)
+
+    async def __aenter__(self) -> RateLimiter:
         await self.acquire()
         return self
 
-    async def __aexit__(self, *args):
-        self.release()
+    async def __aexit__(self, *args: Any) -> None:
+        pass
 
 
 async def retry_with_backoff(
-    coro_factory,
+    func: Callable[..., Any],
     max_retries: int = 3,
     base_delay: float = 1.0,
-    retryable_statuses: set[int] = None,
-):
-    """Execute coro_factory() with exponential backoff on retryable errors."""
+    max_delay: float = 30.0,
+    retryable_statuses: set[int] | None = None,
+) -> Any:
+    """Execute an async callable with exponential backoff retry.
+
+    Args:
+        func: Async callable to execute (e.g., lambda: client.get(...))
+        max_retries: Maximum number of retry attempts
+        base_delay: Initial delay in seconds before first retry
+        max_delay: Maximum delay in seconds (caps exponential growth)
+        retryable_statuses: HTTP status codes that trigger retry.
+            Default: {429, 500, 502, 503, 504}
+
+    Returns:
+        The result of the callable
+
+    Raises:
+        httpx.HTTPStatusError: If non-retryable status or max retries exceeded
+        httpx.RequestError: On network errors (retried up to max_retries)
+    """
     if retryable_statuses is None:
         retryable_statuses = {429, 500, 502, 503, 504}
-    
-    import httpx
-    
-    for attempt in range(max_retries):
+
+    last_exception: Exception | None = None
+
+    for attempt in range(max_retries + 1):
         try:
-            return await coro_factory()
+            return await func()
         except httpx.HTTPStatusError as e:
-            if e.response.status_code in retryable_statuses and attempt < max_retries - 1:
-                delay = base_delay * (2 ** attempt)
-                logger.warning(f"Retry {attempt + 1}/{max_retries} after {delay}s (status={e.response.status_code})")
-                await asyncio.sleep(delay)
-                continue
-            raise
-        except (httpx.TimeoutException, httpx.RequestError) as e:
-            if attempt < max_retries - 1:
-                delay = base_delay * (2 ** attempt)
-                logger.warning(f"Retry {attempt + 1}/{max_retries} after {delay}s ({type(e).__name__})")
-                await asyncio.sleep(delay)
-                continue
-            raise
-    
-    raise RuntimeError("Request failed after all retries.")
+            last_exception = e
+            if e.response.status_code not in retryable_statuses:
+                raise
+            if attempt >= max_retries:
+                raise
+            logger.warning(
+                "HTTP %d on attempt %d/%d: %s",
+                e.response.status_code,
+                attempt + 1,
+                max_retries,
+                e.response.url,
+            )
+        except httpx.RequestError as e:
+            last_exception = e
+            if attempt >= max_retries:
+                raise
+            logger.warning(
+                "Request error on attempt %d/%d: %s",
+                attempt + 1,
+                max_retries,
+                e,
+            )
+
+        # Exponential backoff with jitter
+        delay = min(base_delay * (2 ** attempt), max_delay)
+        await asyncio.sleep(delay)
+
+    if last_exception:
+        raise last_exception
+    raise RuntimeError("Unexpected: retry loop ended without result or exception")
 ```
 
 #### `backend/utils/auth_utils.py`
@@ -782,220 +1015,352 @@ async def retry_with_backoff(
 > **SRP**: RSA-PSS signing extracted from KalshiClient. Single responsibility.
 
 ```python
+from __future__ import annotations
+
 import base64
-import time
-from typing import Optional
+import logging
+from datetime import datetime, timezone
+from typing import Any
+
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import padding
+from cryptography.hazmat.primitives.asymmetric.rsa import RSAPrivateKey
+
+logger = logging.getLogger(__name__)
 
 
 class KalshiSigner:
-    """RSA-PSS request signing for Kalshi API authentication."""
+    """RSA-PSS signer for Kalshi API authentication.
 
-    def __init__(self, api_key_id: str, private_key_pem: Optional[str] = None):
-        self.api_key_id = api_key_id
-        self.private_key_pem = private_key_pem
+    Uses SHA-256 hashing with MGF1 padding (PSS) as required by Kalshi's API.
+    """
 
-    def sign(self, method: str, path: str, body: str = "") -> tuple[str, str, str]:
+    def __init__(self, private_key_pem: str | bytes):
+        """Initialize with PEM-encoded RSA private key."""
+        if isinstance(private_key_pem, str):
+            private_key_pem = private_key_pem.encode("utf-8")
+        self._private_key: RSAPrivateKey = serialization.load_pem_private_key(
+            private_key_pem, password=None,
+        )  # type: ignore[assignment]
+
+    @classmethod
+    def from_key_file(cls, key_path: str) -> KalshiSigner:
+        """Load the private key from a PEM file."""
+        with open(key_path, "rb") as f:
+            pem_data = f.read()
+        return cls(pem_data)
+
+    def sign(self, message: str | bytes) -> str:
+        """Sign a message using RSA-PSS and return base64-encoded signature.
+
+        Args:
+            message: The message to sign (string or bytes).
+
+        Returns:
+            Base64-encoded signature string.
         """
-        Generate KALSHI-ACCESS headers.
-        Returns (api_key, signature_b64, timestamp_ms).
-        """
-        timestamp = str(int(time.time() * 1000))
-        message = timestamp + method.upper() + path + body
-
-        if not self.private_key_pem:
-            return self.api_key_id or "", "", timestamp
-
-        from cryptography.hazmat.primitives import hashes
-        from cryptography.hazmat.primitives.asymmetric import padding as asym_padding
-        from cryptography.hazmat.primitives.serialization import load_pem_private_key
-
-        private_key = load_pem_private_key(self.private_key_pem.encode(), password=None)
-        signature = private_key.sign(
-            message.encode(),
-            asym_padding.PKCS1v15(),
+        if isinstance(message, str):
+            message = message.encode("utf-8")
+        signature = self._private_key.sign(
+            message,
+            padding.PSS(
+                mgf=padding.MGF1(hashes.SHA256()),
+                salt_length=padding.PSS.MAX_LENGTH,
+            ),
             hashes.SHA256(),
         )
-        return self.api_key_id, base64.b64encode(signature).decode(), timestamp
+        return base64.b64encode(signature).decode("utf-8")
+
+    @staticmethod
+    def generate_timestamp() -> str:
+        """Generate a Kalshi-compatible ISO timestamp for signing."""
+        now = datetime.now(timezone.utc)
+        return now.strftime("%Y-%m-%dT%H:%M:%S.") + f"{now.microsecond // 1000:03d}Z"
 ```
 
 #### `backend/utils/poller.py` (DRY: generic async poller)
 
 > **DRY**: The live/ modules (discovery_poller, progress_gate_loop) both follow
-> the same poll-sleep pattern. Extracted into a reusable async poller.
+> the same poll-sleep pattern. Extracted into a reusable ABC poller.
 
 ```python
+from __future__ import annotations
+
 import asyncio
 import logging
-from typing import Awaitable, Callable, Optional
+from abc import ABC, abstractmethod
+from datetime import datetime, timezone
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
 
-class AsyncPoller:
-    """
-    Generic async poller that runs a callback on a fixed interval.
-    Used by DiscoveryPoller and ProgressGateLoop (DRY).
+class AsyncPoller(ABC):
+    """Generic async poller — subclass and implement on_poll().
+
+    Usage:
+        class MyPoller(AsyncPoller):
+            async def on_poll(self) -> None:
+                # Do work here
+                pass
+
+        poller = MyPoller(interval_seconds=30)
+        await poller.start()
+        # ... later ...
+        await poller.stop()
     """
 
     def __init__(
         self,
-        callback: Callable[[], Awaitable[None]],
-        interval_seconds: float,
+        interval_seconds: float = 30.0,
         name: str = "poller",
+        jitter_seconds: float = 0.0,
     ):
-        self.callback = callback
-        self.interval = interval_seconds
+        self.interval_seconds = interval_seconds
         self.name = name
-        self._task: Optional[asyncio.Task] = None
+        self.jitter_seconds = jitter_seconds
+        self._task: asyncio.Task[None] | None = None
         self._stop_event = asyncio.Event()
+        self._last_poll_time: datetime | None = None
+        self._poll_count: int = 0
 
-    async def start(self):
+    @abstractmethod
+    async def on_poll(self) -> None:
+        """Called every poll interval. Override to implement work."""
+        ...
+
+    async def on_start(self) -> None:
+        """Hook called when the poller starts. Override for setup."""
+        pass
+
+    async def on_stop(self) -> None:
+        """Hook called when the poller stops. Override for cleanup."""
+        pass
+
+    async def on_error(self, exc: Exception) -> None:
+        """Called when on_poll raises. Override for error handling."""
+        logger.error(
+            "Poller %s: error in cycle %d: %s",
+            self.name, self._poll_count, exc, exc_info=True,
+        )
+
+    async def start(self) -> None:
+        """Start the poller loop (non-blocking)."""
+        if self._task is not None:
+            logger.warning("Poller %s: already running", self.name)
+            return
+        await self.on_start()
         self._stop_event.clear()
-        self._task = asyncio.create_task(self._run(), name=self.name)
-        logger.info(f"Poller '{self.name}' started (interval={self.interval}s)")
+        self._task = asyncio.create_task(self._run())
+        logger.info("Poller %s: started (interval=%ds)", self.name, self.interval_seconds)
 
-    async def stop(self):
+    async def stop(self) -> None:
+        """Signal the poller to stop and wait for it."""
+        if self._task is None:
+            return
         self._stop_event.set()
-        if self._task:
+        try:
+            await asyncio.wait_for(self._task, timeout=self.interval_seconds + 5)
+        except asyncio.TimeoutError:
+            logger.warning("Poller %s: stop timeout — cancelling task", self.name)
             self._task.cancel()
-            try:
-                await self._task
-            except asyncio.CancelledError:
-                pass
-        logger.info(f"Poller '{self.name}' stopped")
+        except asyncio.CancelledError:
+            pass
+        self._task = None
+        await self.on_stop()
+        logger.info("Poller %s: stopped", self.name)
 
-    async def _run(self):
-        while not self._stop_event.is_set():
-            try:
-                await self.callback()
-            except Exception as e:
-                logger.error(f"Poller '{self.name}' error: {e}")
-            await asyncio.sleep(self.interval)
+    @property
+    def is_running(self) -> bool:
+        return self._task is not None and not self._task.done()
+
+    @property
+    def last_poll_time(self) -> datetime | None:
+        return self._last_poll_time
+
+    @property
+    def poll_count(self) -> int:
+        return self._poll_count
+
+    async def poll_once(self) -> None:
+        """Execute a single poll cycle immediately (bypasses interval)."""
+        try:
+            await self.on_poll()
+            self._poll_count += 1
+            self._last_poll_time = datetime.now(timezone.utc)
+        except Exception as e:
+            await self.on_error(e)
+
+    async def _run(self) -> None:
+        try:
+            while not self._stop_event.is_set():
+                await self.poll_once()
+                try:
+                    await asyncio.wait_for(
+                        self._stop_event.wait(), timeout=self.interval_seconds,
+                    )
+                    break
+                except asyncio.TimeoutError:
+                    continue
+        except asyncio.CancelledError:
+            logger.info("Poller %s: cancelled", self.name)
+        except Exception as e:
+            logger.error("Poller %s: fatal error in run loop: %s", self.name, e)
+            raise
 ```
 
 #### `backend/config/settings.py`
 
 (Content unchanged — pydantic-settings loader. See full listing below.)
 
-### 1.3 — `backend/core/scanner_state.py`
-
-Central runtime state for the live scanner.
-
-```python
-from dataclasses import dataclass, field
-from typing import Optional
-from .models import (
-    Market, ClassifiedEvent, EventWithTopMarkets,
-    ProgressBasedOrderCandidate, MarketOrderbookStats,
-)
-
-@dataclass
-class ScannerState:
-    markets_by_ticker: dict[str, Market] = field(default_factory=dict)
-    events: dict[str, ClassifiedEvent] = field(default_factory=dict)
-    orderbook_stats: dict[str, MarketOrderbookStats] = field(default_factory=dict)
-    ranked_events: dict[str, EventWithTopMarkets] = field(default_factory=dict)
-    candidates: dict[str, ProgressBasedOrderCandidate] = field(default_factory=dict)
-    last_discovery: Optional[str] = None
-    last_progress_check: Optional[str] = None
-    is_running: bool = False
-
-    def get_event(self, ticker: str) -> Optional[EventWithTopMarkets]:
-        return self.ranked_events.get(ticker)
-
-    def get_candidate(self, event_ticker: str) -> Optional[ProgressBasedOrderCandidate]:
-        return self.candidates.get(event_ticker)
-
-    def update_event(self, event: EventWithTopMarkets):
-        self.ranked_events[event.event_ticker] = event
-
-    def remove_event(self, event_ticker: str):
-        self.ranked_events.pop(event_ticker, None)
-        self.candidates.pop(event_ticker, None)
-
-    def set_candidate(self, event_ticker: str, candidate: ProgressBasedOrderCandidate):
-        self.candidates[event_ticker] = candidate
-```
-
 ### 1.4 — `backend/config/settings.py`
 
-Pydantic-settings loader.
+Pydantic-settings loader with YAML + env support. Uses a YAML key map for
+translation between snake_case YAML keys and pydantic field names.
 
 ```python
-from pydantic_settings import BaseSettings
-from pydantic import BaseModel
-from typing import Optional
-import yaml
+from __future__ import annotations
+
+import os
 from pathlib import Path
+from typing import Any
 
-class KalshiConfig(BaseModel):
-    base_url: str = "https://external-api.kalshi.com/trade-api/v2"
-    rate_limit: int = 10
+import yaml
+from pydantic import Field
+from pydantic_settings import BaseSettings
 
-class ScannerConfig(BaseModel):
-    default_mode: str = "dry_run"
-    default_threshold: int = 65
-    default_strategy: str = "executed-volume-follower"
-    discovery_poll_interval: int = 30
-    progress_gate_interval: int = 10
-    max_candidate_age: int = 30
 
-class ValidationConfig(BaseModel):
-    max_price_movement_percent: float = 10.0
-    max_spread_width: float = 0.05
-    min_liquidity: float = 100.0
-    allow_partial_fill: bool = True
+class KalshiConfig(BaseSettings):
+    """Kalshi API connection configuration."""
 
-class RiskConfig(BaseModel):
-    max_exposure_per_market: float = 1000.0
-    max_total_exposure: float = 5000.0
-    max_positions: int = 10
-    daily_loss_limit: float = 500.0
+    model_config = {"populate_by_name": True}
 
-class LoggingConfig(BaseModel):
-    level: str = "INFO"
-    csv_path: str = "logs/scanner.csv"
-    trade_history_path: str = "logs/trades.json"
+    api_base_url: str = Field(
+        default="https://api.elections.kalshi.com/trade-api/v2",
+        alias="KALSHI_API_BASE_URL",
+    )
+    ws_base_url: str = Field(
+        default="wss://api.elections.kalshi.com/trade-api/v2",
+        alias="KALSHI_WS_BASE_URL",
+    )
+    key_id: str = Field(default="", alias="KALSHI_API_KEY_ID")
+    private_key_path: str = Field(default="", description="Path to RSA private key PEM file")
+    private_key: str = Field(default="", alias="KALSHI_PRIVATE_KEY")
+    member_id: str = Field(default="", alias="KALSHI_MEMBER_ID")
+    funder_address: str = Field(default="", alias="KALSHI_FUNDER_ADDRESS")
+    rate_limit: int = Field(default=10)
+    max_retries: int = Field(default=3)
+    timeout_seconds: int = Field(default=30)
+    max_connections: int = Field(default=20)
 
-class StrategyConfig(BaseModel):
-    """Strategy experiment config — used by TradingBot in Phase 4+."""
-    active_experiment: str = "executed-volume-follower"
-    experiments: dict = {}
+
+class ScannerConfig(BaseSettings):
+    """Scanner behavior configuration."""
+
+    model_config = {"populate_by_name": True}
+
+    default_mode: str = Field(default="oneshot", alias="SCANNER_DEFAULT_MODE")
+    default_threshold: int = Field(default=65, alias="SCANNER_DEFAULT_THRESHOLD")
+    default_strategy: str = Field(default="favorite-side-follower", alias="SCANNER_DEFAULT_STRATEGY")
+    min_markets_per_event: int = Field(default=3)
+    min_volume_before_entry: int = Field(default=100)
+    min_side_signal_strength: float = Field(default=0.50)
+    max_candidates_per_cycle: int = Field(default=10)
+    poll_interval_seconds: int = Field(default=30)
+    progress_check_interval_seconds: int = Field(default=10)
+    max_event_expiry_hours: int = Field(default=48)
+    exclude_expired: bool = Field(default=True)
+    out_dir: str = Field(default="./kalshi_out")
+
+
+class LoggingConfig(BaseSettings):
+    """Logging configuration."""
+
+    model_config = {"populate_by_name": True}
+
+    level: str = Field(default="INFO", alias="LOG_LEVEL")
+    format: str = Field(default="%(asctime)s | %(levelname)-7s | %(name)s | %(message)s")
+    file: str = Field(default="")
+    csv_path: str = Field(default="", alias="CSV_LOG_PATH")
+    trade_history_path: str = Field(default="", alias="TRADE_HISTORY_PATH")
+
+
+class StrategyConfig(BaseSettings):
+    """Strategy configuration (forward-looking for Phase 4+)."""
+
+    model_config = {"populate_by_name": True}
+
+    name: str = Field(default="")
+    params: dict[str, Any] = Field(default_factory=dict)
+
+
+class ValidationConfigSection(BaseSettings):
+    """Validation rules (forward-looking for Phase 6+)."""
+
+    model_config = {"populate_by_name": True}
+
+    max_spread_cents: int = Field(default=5)
+    min_volume: int = Field(default=100)
+    max_position_size: int = Field(default=1000)
+    min_confidence: float = Field(default=0.6)
+    allow_overtime: bool = Field(default=False)
+
+
+class RiskConfigSection(BaseSettings):
+    """Risk management limits (forward-looking for Phase 6+)."""
+
+    model_config = {"populate_by_name": True}
+
+    max_position_size_per_market: int = Field(default=500)
+    max_position_size_per_event: int = Field(default=1000)
+    max_total_positions: int = Field(default=20)
+    max_daily_trades: int = Field(default=50)
+    stop_loss_cents: int = Field(default=20)
+    take_profit_cents: int = Field(default=40)
+
 
 class Settings(BaseSettings):
-    kalshi: KalshiConfig = KalshiConfig()
-    scanner: ScannerConfig = ScannerConfig()
-    strategy: StrategyConfig = StrategyConfig()
-    validation: ValidationConfig = ValidationConfig()
-    risk: RiskConfig = RiskConfig()
-    logging: LoggingConfig = LoggingConfig()
+    """Root settings aggregating all sub-configs."""
 
-    kalshi_api_key_id: Optional[str] = None
-    kalshi_private_key: Optional[str] = None    # RSA private key PEM
-    kalshi_member_id: Optional[str] = None      # Kalshi member ID
-    kalshi_funder_address: Optional[str] = None
+    kalshi: KalshiConfig = Field(default_factory=KalshiConfig)
+    scanner: ScannerConfig = Field(default_factory=ScannerConfig)
+    logging: LoggingConfig = Field(default_factory=LoggingConfig)
+    strategy: StrategyConfig = Field(default_factory=StrategyConfig)
+    validation: ValidationConfigSection = Field(default_factory=ValidationConfigSection)
+    risk: RiskConfigSection = Field(default_factory=RiskConfigSection)
 
-    model_config = {"env_file": ".env", "env_file_encoding": "utf-8"}
+    model_config = {"env_nested_delimiter": "__", "populate_by_name": True}
 
-def load_settings(config_path: str = "config/settings.yaml") -> Settings:
-    """Load settings from YAML + env overrides."""
+
+def load_settings(config_path: str | None = None) -> Settings:
+    """Load settings from YAML file, overlaying env vars."""
+    if config_path is None:
+        current = Path.cwd()
+        for parent in [current] + list(current.parents):
+            candidate = parent / "config" / "settings.yaml"
+            if candidate.exists():
+                config_path = str(candidate)
+                break
+        if config_path is None:
+            config_path = "config/settings.yaml"
+
     settings = Settings()
-    yaml_path = Path(config_path)
-    if yaml_path.exists():
-        with open(yaml_path) as f:
+    if os.path.exists(config_path):
+        with open(config_path) as f:
             yaml_config = yaml.safe_load(f) or {}
-        if "kalshi" in yaml_config:
-            settings.kalshi = KalshiConfig(**yaml_config["kalshi"])
-        if "scanner" in yaml_config:
-            settings.scanner = ScannerConfig(**yaml_config["scanner"])
-        if "strategy" in yaml_config:
-            settings.strategy = StrategyConfig(**yaml_config["strategy"])
-        if "validation" in yaml_config:
-            settings.validation = ValidationConfig(**yaml_config["validation"])
-        if "risk" in yaml_config:
-            settings.risk = RiskConfig(**yaml_config["risk"])
-        if "logging" in yaml_config:
-            settings.logging = LoggingConfig(**yaml_config["logging"])
+        # Apply YAML sections using field name mapping
+        _YAML_KEY_MAP = {
+            "kalshi": {"base_url": "api_base_url"},
+            "scanner": {
+                "discovery_poll_interval": "poll_interval_seconds",
+                "progress_gate_interval": "progress_check_interval_seconds",
+            },
+        }
+        for section, mapping in _YAML_KEY_MAP.items():
+            if section in yaml_config:
+                raw = yaml_config[section]
+                translated = {mapping.get(k, k): v for k, v in raw.items()}
+                setattr(settings, section, type(getattr(settings, section))(**translated))
     return settings
 ```
 
@@ -1036,16 +1401,20 @@ assert issubclass(KalshiAdapter, AbstractMarketAdapter), 'KalshiAdapter must imp
 
 ### 2.1 — `backend/adapters/kalshi/auth.py`
 
-> **SRP**: Single responsibility — RSA-PSS request signing. Extracted from
+> **SRP**: Single responsibility — RSA-PKCS1v15 request signing. Extracted from
 > the original `client.py._sign_request()`. Now also used by `websocket.py`.
+> Uses PKCS1v15 padding.
 
 ```python
 import base64
 import time
 from typing import Optional
 
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import padding
+
 class KalshiSigner:
-    """RSA-PSS request signing for Kalshi API authentication.
+    """RSA-PKCS1v15 request signing for Kalshi API authentication.
     
     Uses three headers: KALSHI-ACCESS-KEY, KALSHI-ACCESS-SIGNATURE,
     KALSHI-ACCESS-TIMESTAMP.
@@ -1066,14 +1435,12 @@ class KalshiSigner:
         if not self.private_key_pem:
             return self.api_key_id or "", "", timestamp
         
-        from cryptography.hazmat.primitives import hashes
-        from cryptography.hazmat.primitives.asymmetric import padding as asym_padding
-        from cryptography.hazmat.primitives.serialization import load_pem_private_key
-        
-        private_key = load_pem_private_key(self.private_key_pem.encode(), password=None)
+        private_key = serialization.load_pem_private_key(
+            self.private_key_pem.encode(), password=None,
+        )
         signature = private_key.sign(
             message.encode(),
-            asym_padding.PKCS1v15(),
+            padding.PKCS1v15(),
             hashes.SHA256(),
         )
         return self.api_key_id, base64.b64encode(signature).decode(), timestamp
@@ -1081,12 +1448,11 @@ class KalshiSigner:
     def get_headers(self, method: str, path: str, body: str = "") -> dict[str, str]:
         """Convenience: returns dict of KALSHI-ACCESS-* headers."""
         key, sig, ts = self.sign(method, path, body)
-        headers = {
+        return {
             "KALSHI-ACCESS-KEY": key,
             "KALSHI-ACCESS-SIGNATURE": sig,
             "KALSHI-ACCESS-TIMESTAMP": ts,
         }
-        return headers
 ```
 
 ### 2.2 — `backend/adapters/kalshi/http_client.py`
@@ -1336,7 +1702,7 @@ import websockets
 logger = logging.getLogger(__name__)
 
 class KalshiWebSocket:
-    """WebSocket client for Kalshi real-time updates (RSA-PSS auth)."""
+    """WebSocket client for Kalshi real-time updates (RSA-PKCS1v15 auth)."""
     
     def __init__(self, url: str = "wss://external-api-ws.kalshi.com/trade-api/ws/v2",
                  api_key: str = None, private_key: str = None):
@@ -1355,14 +1721,19 @@ class KalshiWebSocket:
         """Connect with API key auth via headers."""
         import time, base64
         extra_headers = {}
-        if hasattr(self, 'api_key') and self.api_key and hasattr(self, 'private_key') and self.private_key:
+        if self.api_key and self.private_key:
             timestamp = str(int(time.time() * 1000))
             message = timestamp + "GET" + "/trade-api/ws/v2"
-            from cryptography.hazmat.primitives import hashes
-            from cryptography.hazmat.primitives.asymmetric import padding as asym_padding
-            from cryptography.hazmat.primitives.serialization import load_pem_private_key
-            private_key = load_pem_private_key(self.private_key.encode(), password=None)
-            signature = private_key.sign(message.encode(), asym_padding.PKCS1v15(), hashes.SHA256())
+            from cryptography.hazmat.primitives import hashes, serialization
+            from cryptography.hazmat.primitives.asymmetric import padding
+            private_key = serialization.load_pem_private_key(
+                self.private_key.encode(), password=None,
+            )
+            signature = private_key.sign(
+                message.encode(),
+                padding.PKCS1v15(),
+                hashes.SHA256(),
+            )
             extra_headers = {
                 "KALSHI-ACCESS-KEY": self.api_key,
                 "KALSHI-ACCESS-SIGNATURE": base64.b64encode(signature).decode(),

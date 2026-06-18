@@ -10,7 +10,7 @@ Create an order candidate only after a user-configurable percentage of the event
 @dataclass
 class Engine6Input:
     events: list[EventWithTopMarkets]    # From Engine 5 (ranked)
-    experiment: StrategyExperiment        # Active experiment (configurable)
+    strategy: StrategyProfile             # Active strategy (configurable)
     threshold_percent: float              # Default: 0.60
     now: datetime                         # Default: system clock
 ```
@@ -19,41 +19,28 @@ class Engine6Input:
 
 ```python
 @dataclass
-class ProgressBasedOrderCandidate:
-    event_ticker: str
-    threshold_percent: float
-    event_progress_percent: float
-    event_passes_progress_threshold: bool
-    selected_market: Market | None
-    selected_market_stats: MarketOrderbookStats | None
-    selected_side: str                    # "YES" | "NO" | "SKIP"
-    yes_order_quantity: float
-    no_order_quantity: float
-    total_executed_volume: float
-    should_create_order_candidate: bool
-    requires_manual_review: bool
-    reasons: list[str]
+class ProgressBasedOrderCandidate(OrderCandidate):
+    """Candidate created by Engine 6 (progress gate)."""
+    most_bet_side: str = ""       # "yes" / "no" — the side with most betting activity
+    threshold_pct: float = 0.0     # The threshold that was met
+    is_overtime: bool = False      # Whether the event is in overtime
+    # Note: progress_pct inherited from OrderCandidate (0-100 scale)
 
 @dataclass
 class Engine6Output:
     threshold_percent: float
     candidates: list[ProgressBasedOrderCandidate]
     actionable_candidates: list[ProgressBasedOrderCandidate]
-    manual_review_candidates: list[ProgressBasedOrderCandidate]
 ```
 
 ## Event Progress Calculation
 
 ### Formula
 
+`calculate_progress` from `backend.utils.datetime_utils` is used:
+
 ```python
-def get_end_time(market: Market) -> datetime | None:
-    """Fallback chain for event end time."""
-    return (
-        parse_date(market.expected_expiration_time)
-        or parse_date(market.latest_expiration_time)
-        or parse_date(market.close_time)
-    )
+from backend.utils.datetime_utils import calculate_progress, parse_date
 
 def calculate_event_progress(market: Market, now: datetime) -> float:
     """
@@ -61,124 +48,110 @@ def calculate_event_progress(market: Market, now: datetime) -> float:
 
     Returns 0–100, clamped.
     """
-    start = parse_date(market.open_time)
-    end = get_end_time(market)
+    expires_at = market.expiry
+    start_at = parse_date(market.create_date)
 
-    if not start or not end:
-        return 0.0
-
-    total_ms = (end - start).total_seconds() * 1000
-    elapsed_ms = (now - start).total_seconds() * 1000
-
-    if total_ms <= 0:
-        return 100.0
-
-    raw = (elapsed_ms / total_ms) * 100
-    return max(0.0, min(100.0, raw))
+    return calculate_progress(expires_at, now, start_at) if expires_at else 0.0
 ```
 
-### End Time Fallback
+### End Time
 
-1. `expected_expiration_time` — primary (most accurate)
-2. `latest_expiration_time` — secondary (latest possible)
-3. `close_time` — last resort (market closing time)
+Uses `market.expiry` (expected_expiration_time from API, parsed to datetime).
 
 ## Side Selection
 
-The active **experiment** handles market and side selection via a single
-`select_trade()` call. The default `ExecutedVolumeFollower` uses
-**executed trade volume** — not resting orderbook quantity:
+The active **strategy** handles market and side selection via a single
+`select_trade()` call. The default `favorite-side-follower` uses
+volume and bid/ask prices to determine which side to favor:
 
 ```python
 def select_trade(self, event_features: EventFeatures) -> TradeDecision:
-    valid = [m for m in event_features.child_markets if m.total_executed_volume > 0]
+    valid = [m for m in event_features.child_markets if m.volume > 0]
     if not valid:
-        return TradeDecision(trade_decision="SKIP", skip_reason="no_markets_with_volume")
+        return TradeDecision(market_ticker="", side=None, should_trade=False, reason="no_markets_with_volume")
 
-    selected = max(valid, key=lambda m: m.total_executed_volume)
-    side = "YES" if selected.yes_executed_volume > selected.no_executed_volume else "NO"
-    return TradeDecision(trade_decision=f"BUY_{side}", selected_side=side, ...)
+    selected = max(valid, key=lambda m: m.volume)
+    side = "yes" if selected.yes_bid > selected.no_bid else "no"
+    return TradeDecision(market_ticker=selected.ticker, side=side, should_trade=True, ...)
 ```
 
-See the [Strategy System](strategy-system.md) doc for all 7 experiments.
+See the [Strategy System](strategy-system.md) doc for all profiles.
 
 ## Order Candidate Creation Rules
 
 Create a candidate **only if ALL** of:
 
 1. Event progress >= user threshold (default 60%)
-2. Experiment returns `trade_decision != "SKIP"`
+2. Strategy returns `should_trade == True`
 3. Selected market still passes `SAME_DAY_LIVE_MARKET` classification
-4. Selected side is `"YES"` or `"NO"`
+4. Selected side is `"yes"` or `"no"`
 
 ## Implementation
 
 ```python
 def create_progress_based_candidate(
     event: EventWithTopMarkets,
-    experiment: StrategyExperiment,
+    strategy: StrategyProfile,
     threshold_percent: float,
     now: datetime,
     child_market_features: list[MarketFeatures],
 ) -> ProgressBasedOrderCandidate:
     reasons: list[str] = []
 
-    # Build EventFeatures for the experiment
+    # Build EventFeatures for the strategy
     event_features = EventFeatures(
         event_ticker=event.event_ticker,
-        event_title=event.event_data.title if event.event_data else "",
-        category=event.event_data.category or "",
-        event_progress=calculate_event_progress(event.all_same_day_live_markets_ranked[0].market, now),
-        threshold=threshold_percent,
-        entry_time=now,
+        event_title=event.event_title,
         child_markets=child_market_features,
     )
 
-    # Step 1: Experiment selects market + side in a single call
-    decision = experiment.select_trade(event_features)
+    # Step 1: Strategy selects market + side in a single call
+    decision = strategy.select_trade(event_features)
 
-    if decision.trade_decision == "SKIP":
-        reasons.append(decision.skip_reason or "Experiment returned SKIP.")
+    if not decision.should_trade:
+        reasons.append(decision.reason or "Strategy returned no trade.")
         return empty_candidate(event.event_ticker, threshold_percent, reasons)
 
     # Step 2: Calculate progress
-    progress = calculate_event_progress(event.all_same_day_live_markets_ranked[0].market, now)
+    top_market = event.top_markets[0] if event.top_markets else None
+    progress = calculate_event_progress(top_market, now) if top_market else 0.0
     passes_threshold = progress >= threshold_percent
     if not passes_threshold:
         reasons.append(f"Progress {progress:.2f}% < threshold {threshold_percent}%.")
 
     # Step 3: Re-check classification
     selected_market_data = next(
-        (rm for rm in event.all_same_day_live_markets_ranked if rm.market.ticker == decision.market_ticker),
+        (rm for rm in event.top_markets if rm.market_ticker == decision.market_ticker),
         None,
     )
-    classification = classify_market(selected_market_data.market, now) if selected_market_data else None
-    if classification and not classification.same_day_live_market:
+    classification = classify_market(selected_market_data, now) if selected_market_data else None
+    if classification and not classification.is_same_day_live:
         reasons.append("Selected market no longer passes same-day live classification.")
 
     should_create = (
         passes_threshold
-        and classification.same_day_live_market
-        and decision.trade_decision in ("BUY_YES", "BUY_NO")
+        and classification is not None and classification.is_same_day_live
+        and decision.should_trade
     )
 
     return ProgressBasedOrderCandidate(
         event_ticker=event.event_ticker,
-        threshold_percent=threshold_percent,
-        event_progress_percent=progress,
-        event_passes_progress_threshold=passes_threshold,
-        selected_market=selected_market_data.market if selected_market_data else None,
-        selected_side=decision.selected_side,
-        total_executed_volume=decision.market_signal_strength or 0,
-        should_create_order_candidate=should_create,
-        requires_manual_review=False,
-        reasons=reasons,
+        market_ticker=decision.market_ticker,
+        side=decision.side,
+        price=decision.entry_price_cents,
+        confidence=decision.confidence,
+        reason="; ".join(reasons),
+        volume=decision.max_contracts,
+        progress_pct=progress,
+        threshold_pct=threshold_percent,
+        most_bet_side=decision.side or "",
+        is_overtime=False,
     )
 
 
 def process_all_events(
     events: list[EventWithTopMarkets],
-    experiment: StrategyExperiment,
+    strategy: StrategyProfile,
     threshold_percent: float = 0.60,
     now: datetime | None = None,
     feature_builder=None,
@@ -190,25 +163,25 @@ def process_all_events(
     for event in events:
         # Build market features for each child market
         child_features = []
-        for rm in event.all_same_day_live_markets_ranked:
+        for rm in event.top_markets:
             mf = feature_builder(rm, now) if feature_builder else MarketFeatures(
-                market_ticker=rm.market.ticker,
-                total_executed_volume=rm.orderbook_stats.volume_24h,
-                yes_price=float(rm.market.yes_ask or 50),
-                no_price=float(rm.market.no_ask or 50),
+                ticker=rm.market_ticker,
+                volume=rm.volume,
+                spread_cents=rm.spread_cents,
+                yes_bid=rm.yes_price,
+                no_bid=rm.no_price,
             )
             child_features.append(mf)
 
         candidate = create_progress_based_candidate(
-            event, experiment, threshold_percent, now, child_features,
+            event, strategy, threshold_percent, now, child_features,
         )
         candidates.append(candidate)
 
     return Engine6Output(
         threshold_percent=threshold_percent,
         candidates=candidates,
-        actionable_candidates=[c for c in candidates if c.should_create_order_candidate],
-        manual_review_candidates=[c for c in candidates if c.requires_manual_review],
+        actionable_candidates=[c for c in candidates if c.side in ("yes", "no") and c.confidence > 0],
     )
 ```
 ```
@@ -248,16 +221,18 @@ When this strategy is active, Engine 6 uses the event-specific threshold instead
 | Scenario | Behavior |
 |----------|----------|
 | Event 25% done, threshold 65% | Candidate not created, reason logged |
-| Market has YES qty 0, NO qty 0 | `side="none"`, candidate not created |
-| YES qty == NO qty (both > 0) | `side="tie"`, requires manual review |
+| Market has no volume | `side=None`, candidate not created |
+| Strategy returns `should_trade=False` | Candidate not created, reason logged |
 | Market expired between ranking and gate | Re-classify fails, candidate not created |
 | Event with 0 markets (shouldn't happen) | Empty candidate with reason |
 
 ## Dependencies
 
 - `backend/strategies/` — Active strategy profile
-- `backend/core/models.py` — `EventWithTopMarkets`, `ProgressBasedOrderCandidate`
-- `backend/engines/engine2_classification.py` — `classify_market()` for re-check
+- `backend.core.models.trading` — `EventWithTopMarkets`, `OrderCandidate`, `ProgressBasedOrderCandidate`
+- `backend.core.models.classification` — `ClassificationResult`
+- `backend.core.interfaces.strategy` — `StrategyProfile`, `EventFeatures`, `MarketFeatures`, `TradeDecision`
+- `backend.utils.datetime_utils` — `calculate_progress`, `parse_date`
 
 ## Testing
 
@@ -270,16 +245,16 @@ async def test_blocks_candidate_below_threshold():
     """Progress < 65% → no candidate, reason logged."""
     ...
 
-async def test_blocks_candidate_when_side_is_tie():
-    """YES == NO qty → manual review, no automatic candidate."""
+async def test_blocks_candidate_when_strategy_returns_no_trade():
+    """Strategy returns should_trade=False → no candidate."""
     ...
 
-async def test_blocks_candidate_when_side_is_none():
-    """Zero order qty → no candidate."""
+async def test_blocks_candidate_when_market_expired():
+    """Market expired between ranking and gate → re-classify fails."""
     ...
 
 async def test_strategy_plugs_in_correctly():
-    """Active strategy's select_market/select_side are called."""
+    """Active strategy's select_trade() is called."""
     ...
 
 async def test_custom_threshold_uses_event_type_threshold():

@@ -20,7 +20,7 @@ class Engine1Output:
 ## Kalshi Endpoint
 
 ```
-GET https://external-api.kalshi.com/trade-api/v2/markets
+GET https://api.elections.kalshi.com/trade-api/v2/markets
 ```
 
 ### Request Parameters
@@ -35,10 +35,14 @@ GET https://external-api.kalshi.com/trade-api/v2/markets
 ## Implementation
 
 ```python
-async def fetch_all_open_markets(client: KalshiClient) -> Engine1Output:
+async def fetch_all_open_markets(client: MarketReader) -> Engine1Output:
     """
     Fetch all open markets with cursor-based pagination.
     Deduplicates by ticker (in case of cursor overlap).
+
+    Uses MarketReader.fetch_markets(**kwargs) -> list[dict[str, Any]]
+    (the actual Kalshi adapter returns raw API dicts; parsing to Market
+    dataclasses happens inside the adapter layer).
     """
     all_markets: list[Market] = []
     cursor: str | None = None
@@ -48,13 +52,14 @@ async def fetch_all_open_markets(client: KalshiClient) -> Engine1Output:
         if cursor:
             params["cursor"] = cursor
 
-        response = await client.get("/markets", params=params)
-        data = response.json()
+        markets_data = await client.fetch_markets(**params)
 
-        all_markets.extend(data.get("markets", []))
+        all_markets.extend(markets_data)
 
-        cursor = data.get("cursor")
-        if not cursor:
+        # Cursor-based pagination: fetch_markets returns raw API dicts
+        # which include a "cursor" key when more pages exist.
+        # The adapter handles cursor extraction internally.
+        if not markets_data:
             break
 
     # Deduplicate by ticker (safety net for pagination edge cases)
@@ -71,8 +76,8 @@ async def fetch_all_open_markets(client: KalshiClient) -> Engine1Output:
 | Scenario | Behavior |
 |----------|----------|
 | HTTP 429 (rate limit) | Exponential backoff, retry up to 3 times |
-| HTTP 5xx | Retry once, then fail with `KalshiServerError` |
-| Network timeout | Retry once, then fail with `KalshiNetworkError` |
+| HTTP 5xx | Retry once, then fail (the adapter should define its own error hierarchy; Phase 1 uses httpx status checks) |
+| Network timeout | Retry once, then fail (forward-looking — Phase 1 adapter raises on httpx timeout) |
 | Empty response | Return `Engine1Output(scanned_market_count=0, markets=[])` |
 | Partial data (some markets malformed) | Log warning, skip malformed entries, continue |
 
@@ -85,13 +90,13 @@ async def fetch_all_open_markets(client: KalshiClient) -> Engine1Output:
 
 ## Dependencies
 
-- `backend/adapters/kalshi/client.py` — `KalshiClient` with rate limiting and error handling
-- `backend/core/models.py` — `Market` dataclass
+- `backend/core/interfaces/adapter.py` — `MarketReader` (the interface this engine depends on)
+- `backend.core.models.market` — `Market` dataclass
 
 ## Testing
 
 ```python
-# Unit tests
+# Unit tests (using a mock MarketReader)
 async def test_deduplicates_by_ticker():
     ...
 

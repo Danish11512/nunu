@@ -9,26 +9,22 @@ Group the same-day live markets (from Engine 2) by `event_ticker`. This converts
 ```python
 @dataclass
 class Engine2Output:
-    same_day_live_markets: list[ClassifiedMarket]
+    same_day_live_markets: list[tuple[Market, ClassificationResult]]
 ```
 
 Where:
 
 ```python
-@dataclass
-class ClassifiedMarket:
-    market: Market
-    classification: MarketClassification
+from backend.core.models.market import Market
+from backend.core.models.classification import ClassificationResult
 
-@dataclass
-class MarketClassification:
-    ticker: str
-    event_ticker: str
-    live_now: bool
-    expected_to_resolve_today: bool
-    latest_expiration_today: bool
-    same_day_live_market: bool
-    reasons: list[str]
+# Engine 2 returns a flat list of (Market, ClassificationResult) pairs.
+# ClassificationResult fields:
+#   market_ticker: str
+#   event_ticker: str
+#   is_same_day_live: bool
+#   confidence: float
+#   reason: str
 ```
 
 ## Output
@@ -37,9 +33,11 @@ class MarketClassification:
 @dataclass
 class ClassifiedEvent:
     event_ticker: str
-    market_count: int                    # Total markets in event
-    same_day_live_market_count: int      # Markets passing same-day-live
-    same_day_live_markets: list[ClassifiedMarket]
+    event_title: str
+    markets: list[Market]                # All child markets (flat)
+    classification: ClassificationResult | None = None
+    num_markets: int = 0                 # Count of child markets
+    total_volume: int = 0                # Sum of market volumes
 
 @dataclass
 class Engine3Output:
@@ -57,28 +55,44 @@ Do NOT require every child market to pass. A single live market qualifies the en
 ## Implementation
 
 ```python
-def group_by_event_ticker(same_day_live_markets: list[ClassifiedMarket]) -> Engine3Output:
+def group_by_event_ticker(
+    same_day_live_markets: list[tuple[Market, ClassificationResult]],
+) -> Engine3Output:
     """
     Group same-day live markets by event_ticker.
     An event qualifies if at least one child market is same-day live.
     """
-    by_event: dict[str, list[ClassifiedMarket]] = {}
+    by_event: dict[str, dict] = {}
 
-    for item in same_day_live_markets:
-        event_ticker = item.market.event_ticker
-        if event_ticker not in by_event:
-            by_event[event_ticker] = []
-        by_event[event_ticker].append(item)
+    for market, classification in same_day_live_markets:
+        ticker = market.event_ticker
+        if ticker not in by_event:
+            by_event[ticker] = {
+                "event_ticker": ticker,
+                "event_title": market.title,
+                "markets": [],
+                "classifications": [],
+            }
+        by_event[ticker]["markets"].append(market)
+        by_event[ticker]["classifications"].append(classification)
 
-    events = [
-        ClassifiedEvent(
-            event_ticker=event_ticker,
-            market_count=len(markets),
-            same_day_live_market_count=len(markets),
-            same_day_live_markets=markets,
-        )
-        for event_ticker, markets in by_event.items()
-    ]
+    events = []
+    for ticker, data in by_event.items():
+        markets = data["markets"]
+        classifs = data["classifications"]
+        total_volume = sum(m.volume for m in markets if isinstance(m.volume, int))
+
+        # Pick the best classification for the event
+        best_c = max(classifs, key=lambda c: c.confidence)
+
+        events.append(ClassifiedEvent(
+            event_ticker=ticker,
+            event_title=markets[0].title if markets else "",
+            markets=markets,
+            classification=best_c,
+            num_markets=len(markets),
+            total_volume=total_volume,
+        ))
 
     # Sort by event_ticker for deterministic output
     events.sort(key=lambda e: e.event_ticker)
@@ -104,14 +118,15 @@ Events are the unit of real-world occurrences. A Series is a recurring template 
 
 | Scenario | Behavior |
 |----------|----------|
-| Event with 1 same-day live market and 4 non-live markets | Event qualifies, `market_count=5`, `same_day_live_market_count=1` |
+| Event with 1 same-day live market and 4 non-live markets | Event qualifies, `num_markets=5` |
 | Event with 0 same-day live markets | Not included (filtered by Engine 2) |
 | Market with no `event_ticker` | Log warning, skip market |
 | 100+ markets in one event | All included — no truncation at this stage |
 
 ## Dependencies
 
-- `backend/core/models.py` — `Market`, `Event`
+- `backend.core.models.market` — `Market`
+- `backend.core.models.classification` — `ClassificationResult`, `ClassifiedEvent`
 
 ## Testing
 

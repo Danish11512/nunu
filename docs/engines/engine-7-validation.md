@@ -60,22 +60,13 @@ class ValidationResult:
 ```python
 @dataclass
 class ValidationConfig:
-    """Tunable thresholds for pre-trade validation."""
+    """Configuration for trade validation (Engine 7)."""
 
-    # Maximum price movement since candidate was created
-    max_price_movement_percent: float = 10.0
-
-    # Maximum acceptable spread width (dollars)
-    max_spread_width: float = 0.05
-
-    # Minimum liquidity at best price (dollars)
-    min_liquidity: float = 100.0
-
-    # Maximum age of candidate before it must be re-discovered
-    max_candidate_age_seconds: float = 30.0
-
-    # Whether to allow partial fills
-    allow_partial_fill: bool = True
+    max_spread_cents: int = 5
+    min_volume: int = 100
+    max_position_size: int = 1000
+    min_confidence: float = 0.6
+    allow_overtime: bool = False
 ```
 
 ## Implementation
@@ -85,7 +76,7 @@ async def validate_candidate(
     candidate: ProgressBasedOrderCandidate,
     mode: str,
     config: ValidationConfig,
-    client: KalshiClient,
+    client: MarketReader,
     strategy: StrategyProfile,
     now: datetime | None = None,
 ) -> ValidationResult:
@@ -100,26 +91,26 @@ async def validate_candidate(
             reason="Scanner is in read-only mode.",
         )
 
-    if not candidate.should_create_order_candidate or not candidate.selected_market:
+    if not candidate.side or candidate.side not in ("yes", "no"):
         return ValidationResult(
             can_trade=False,
-            reason="Candidate is not actionable.",
+            reason="Candidate is not actionable (no valid side).",
         )
 
-    market = candidate.selected_market
-    ticker = market.ticker
+    ticker = candidate.market_ticker
 
     # Step 3: Re-fetch market
-    latest_market = await client.get_market(ticker)
-    if not latest_market:
+    markets = await client.fetch_markets(ticker=ticker)
+    if not markets:
         return ValidationResult(
             can_trade=False,
             reason=f"Market {ticker} not found during re-fetch.",
         )
+    latest_market = markets[0]
 
     # Step 4: Re-classify
     classification = classify_market(latest_market, now)
-    if not classification.same_day_live_market:
+    if not classification.is_same_day_live:
         return ValidationResult(
             can_trade=False,
             reason="Market no longer passes same-day live classification.",
@@ -127,49 +118,48 @@ async def validate_candidate(
         )
 
     # Step 5: Re-fetch orderbook
-    orderbook = await client.get_orderbook(ticker)
+    orderbook = await client.fetch_orderbook(ticker=ticker)
 
     # Step 6: Recalculate stats
     stats = compute_orderbook_stats(latest_market, orderbook)
 
-    # Step 7: Recalculate side
-    current_side = strategy.select_side(
-        RankedMarket(
-            market=latest_market,
-            classification=classification,
-            orderbook_stats=stats,
+    # Step 7: Recalculate side via strategy
+    decision = strategy.select_trade(
+        EventFeatures(
+            event_ticker=candidate.event_ticker,
+            child_markets=[MarketFeatures(
+                ticker=ticker,
+                volume=candidate.volume,
+                spread_cents=stats.spread_cents or 0,
+                yes_bid=stats.yes_bid or 0,
+                no_bid=stats.no_bid or 0,
+            )],
         ),
-        stats,
     )
 
-    if current_side != candidate.most_bet_side:
+    if decision.side != candidate.most_bet_side:
         return ValidationResult(
             can_trade=False,
-            reason=f"Most-bet side changed: was {candidate.most_bet_side}, now {current_side}.",
+            reason=f"Most-bet side changed: was {candidate.most_bet_side}, now {decision.side}.",
             details={
                 "previous_side": candidate.most_bet_side,
-                "current_side": current_side,
+                "current_side": decision.side,
                 "stats": asdict(stats),
             },
         )
 
-    # Step 8: Check price movement
-    if candidate.selected_market_stats and candidate.selected_market_stats.best_yes_bid:
-        original_price = candidate.selected_market_stats.best_yes_bid
-        current_price = stats.best_yes_bid or 0
-        if original_price > 0:
-            movement = abs(current_price - original_price) / original_price * 100
-            if movement > config.max_price_movement_percent:
-                return ValidationResult(
-                    can_trade=False,
-                    reason=f"Price moved {movement:.2f}% (max {config.max_price_movement_percent}%).",
-                )
-
-    # Step 9: Check liquidity
-    if stats.total_resting_order_quantity < config.min_liquidity:
+    # Step 8: Check spread
+    if stats.spread_cents is not None and stats.spread_cents > config.max_spread_cents:
         return ValidationResult(
             can_trade=False,
-            reason=f"Insufficient liquidity: {stats.total_resting_order_quantity:.2f} (min {config.min_liquidity}).",
+            reason=f"Spread {stats.spread_cents}¢ exceeds max {config.max_spread_cents}¢.",
+        )
+
+    # Step 9: Check volume / liquidity
+    if stats.volume < config.min_volume:
+        return ValidationResult(
+            can_trade=False,
+            reason=f"Insufficient volume: {stats.volume} (min {config.min_volume}).",
         )
 
     # All checks passed
@@ -180,7 +170,7 @@ async def validate_candidate(
             details={
                 "mode": "dry_run",
                 "stats": asdict(stats),
-                "side": current_side,
+                "side": decision.side,
             },
         )
 
@@ -190,10 +180,8 @@ async def validate_candidate(
         reason="Validation passed.",
         details={
             "mode": "live",
-            "market": asdict(latest_market),
-            "orderbook": asdict(orderbook),
             "stats": asdict(stats),
-            "side": current_side,
+            "side": decision.side,
         },
     )
 ```
@@ -210,29 +198,30 @@ async def validate_candidate(
 
 A candidate is considered stale if:
 
-- `max_candidate_age_seconds` has elapsed since Engine 6 created it (default: 30s)
 - The market's status has changed since classification
 - The orderbook has 0 resting quantity when it previously had > 0
 - The most-bet side has flipped
+- The spread exceeds `max_spread_cents`
 
 ## Edge Cases
 
 | Scenario | Behavior |
 |----------|----------|
 | Market disappears between E6 and E7 | `canTrade=False`, reason logged |
-| Orderbook goes to zero in the gap | `canTrade=False`, insufficient liquidity |
+| Orderbook goes to zero in the gap | `canTrade=False`, insufficient volume |
 | Side flips from YES to NO | `canTrade=False`, side changed |
-| Price moves 15% in 10 seconds | `canTrade=False`, price movement exceeded |
+| Spread exceeds `max_spread_cents` | `canTrade=False`, spread too wide |
 | Network error during re-fetch | Retry once, then fail |
 | Kalshi API returns 429 | Backoff, retry once, then fail |
 
 ## Dependencies
 
-- `backend/adapters/kalshi/client.py` — `KalshiClient.get_market()`, `get_orderbook()`
-- `backend/engines/engine2_classification.py` — `classify_market()`
-- `backend/engines/engine5_ranking.py` — `compute_orderbook_stats()`
-- `backend/strategies/` — Active strategy for side selection
-- `backend/core/models.py` — All data types
+- `backend.core.interfaces.adapter` — `MarketReader`
+- `backend.core.interfaces.strategy` — `StrategyProfile`, `EventFeatures`, `MarketFeatures`
+- `backend.core.models.trading` — `ProgressBasedOrderCandidate`, `ValidatedOrderCandidate`, `ValidationConfig`
+- `backend.core.models.market` — `MarketOrderbookStats`
+- `backend.core.models.classification` — `ClassificationResult`
+- `backend.engines.engine2_classification` — `classify_market()`
 
 ## Testing
 

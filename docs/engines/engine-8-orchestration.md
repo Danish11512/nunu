@@ -8,7 +8,7 @@ Run all 7 engines in sequence, manage scanner state, handle live updates, and di
 
 | Mode | Startup | Runtime Loop | Output |
 |------|---------|-------------|--------|
-| **One-shot** | E1→E2→E3→E4→E5→E6→E7 | None (exit) | Print events + candidates |
+| **Oneshot** | E1→E2→E3→E4→E5→E6→E7 | None (exit) | Print events + candidates |
 | **Live Scanner** | E1→E2→E3→E4→E5 | Discovery poller + WS updater + reranker + progress gate | Real-time dashboard |
 
 ## Input
@@ -16,14 +16,15 @@ Run all 7 engines in sequence, manage scanner state, handle live updates, and di
 ```python
 @dataclass
 class OrchestratorConfig:
-    mode: str                              # "one-shot" | "live"
+    mode: str                              # "oneshot" | "live"
     operating_mode: str                    # "dry_run" | "read_only" | "live"
-    strategy_name: str                     # "most-bet" (default)
+    strategy_name: str                     # "favorite-side-follower" (default)
     threshold_percent: int                 # 65 (default)
     discovery_poll_interval_seconds: int   # 30-60
     progress_gate_interval_seconds: int    # 5-15
-    kalshi_client: KalshiClient
+    client: MarketReader
     strategy: StrategyProfile
+    validation_config: ValidationConfig
     state: ScannerState
 ```
 
@@ -32,13 +33,25 @@ class OrchestratorConfig:
 ```python
 @dataclass
 class ScannerOutput:
-    scanned_market_count: int
-    same_day_live_event_count: int
-    same_day_live_events: list[EventWithTopMarkets]
-    progress_based_order_candidates: Engine6Output
-    validated_candidates: list[ValidatedOrderCandidate]
-    scan_timestamp: str
-    mode: str
+    """Final output after a complete scanner cycle."""
+
+    cycle: int = 0
+    completed_at: datetime | None = None
+    duration_seconds: float = 0.0
+
+    # Results
+    events: list[EventWithTopMarkets] = field(default_factory=list)
+    trades: list[ValidatedOrderCandidate] = field(default_factory=list)
+
+    # Summary
+    num_events_scanned: int = 0
+    num_markets_scanned: int = 0
+    num_candidates_found: int = 0
+    num_trades_executed: int = 0
+
+    # Error tracking
+    errors: list[str] = field(default_factory=list)
+    warnings: list[str] = field(default_factory=list)
 ```
 
 ## Pipeline Sequence (One-Shot)
@@ -49,7 +62,7 @@ async def run_one_shot(config: OrchestratorConfig) -> ScannerOutput:
     now = datetime.now(ZoneInfo("America/New_York"))
 
     # Engine 1: Discovery
-    engine1_output = await fetch_all_open_markets(config.kalshi_client)
+    engine1_output = await fetch_all_open_markets(config.client)
 
     # Engine 2: Classification
     engine2_output = get_same_day_live_markets(engine1_output.markets, now)
@@ -59,17 +72,13 @@ async def run_one_shot(config: OrchestratorConfig) -> ScannerOutput:
 
     if not engine3_output.events:
         return ScannerOutput(
-            scanned_market_count=engine1_output.scanned_market_count,
-            same_day_live_event_count=0,
-            same_day_live_events=[],
-            progress_based_order_candidates=empty_candidates(config.threshold_percent),
-            validated_candidates=[],
-            scan_timestamp=now.isoformat(),
-            mode=config.operating_mode,
+            num_markets_scanned=engine1_output.scanned_market_count,
+            num_events_scanned=0,
+            completed_at=now,
         )
 
     # Engine 4: Orderbooks
-    engine4_output = await fetch_orderbooks(engine3_output.events, config.kalshi_client)
+    engine4_output = await fetch_orderbooks(engine3_output.events, config.client)
 
     # Engine 5: Ranking
     engine5_output = rank_events(engine4_output)
@@ -83,27 +92,31 @@ async def run_one_shot(config: OrchestratorConfig) -> ScannerOutput:
     )
 
     # Engine 7: Validate each actionable candidate
-    validated = []
+    validated: list[ValidatedOrderCandidate] = []
     for candidate in engine6_output.actionable_candidates:
         result = await validate_candidate(
             candidate,
             config.operating_mode,
             config.validation_config,
-            config.kalshi_client,
+            config.client,
             config.strategy,
             now,
         )
         if result.can_trade:
-            validated.append(result)
+            validated.append(ValidatedOrderCandidate(
+                original_candidate=candidate,
+                is_valid=True,
+            ))
 
     return ScannerOutput(
-        scanned_market_count=engine1_output.scanned_market_count,
-        same_day_live_event_count=len(engine5_output.events),
-        same_day_live_events=engine5_output.events,
-        progress_based_order_candidates=engine6_output,
-        validated_candidates=validated,
-        scan_timestamp=now.isoformat(),
-        mode=config.operating_mode,
+        events=engine5_output.events,
+        trades=validated,
+        num_events_scanned=len(engine5_output.events),
+        num_markets_scanned=engine1_output.scanned_market_count,
+        num_candidates_found=len(engine6_output.actionable_candidates),
+        num_trades_executed=len(validated),
+        completed_at=datetime.now(ZoneInfo("America/New_York")),
+        duration_seconds=(datetime.now(ZoneInfo("America/New_York")) - now).total_seconds(),
     )
 ```
 
@@ -112,10 +125,10 @@ async def run_one_shot(config: OrchestratorConfig) -> ScannerOutput:
 ```
                     ┌─────────────────────────────────────────────┐
                     │               Scanner State                  │
-                    │  markets_by_ticker: dict                     │
-                    │  orderbook_stats_by_ticker: dict             │
-                    │  ranked_events: dict[str, EventWithTopMarkets]│
-                    │  candidates: dict[str, OrderCandidate]       │
+                    │  markets: list[dict]                         │
+                    │  classified_events: dict[str, ClassifiedEvent]│
+                    │  ranked_events: list[EventWithTopMarkets]     │
+                    │  candidates: list[ValidatedOrderCandidate]    │
                     └──────┬──────────┬──────────┬────────────────┘
                            │          │          │
               ┌────────────▼──┐  ┌────▼────┐  ┌─▼──────────────┐
@@ -140,7 +153,7 @@ async def run_live_scanner(config: OrchestratorConfig, stop_event: asyncio.Event
 
     # ---- Startup: full pipeline once ----
     output = await run_one_shot(config)
-    await config.state.initialize(output)
+    config.state.is_running = True
 
     # ---- Background tasks ----
     async with asyncio.TaskGroup() as tg:
@@ -157,27 +170,21 @@ async def discovery_poller_loop(config: OrchestratorConfig, stop_event: asyncio.
     """Periodically re-fetch markets and re-classify."""
     while not stop_event.is_set():
         try:
-            engine1 = await fetch_all_open_markets(config.kalshi_client)
+            engine1 = await fetch_all_open_markets(config.client)
             engine2 = get_same_day_live_markets(engine1.markets)
             engine3 = group_by_event_ticker(engine2.same_day_live_markets)
 
-            # Diff with previous state
-            added, removed, changed = diff_events(config.state.events, engine3.events)
+            # Diff with previous state (forward-looking: diff_events not yet implemented)
+            # added, removed, changed = diff_events(config.state.classified_events, engine3.events)
 
             # Fetch orderbooks for new markets
-            if added:
-                new_books = await fetch_orderbooks(
-                    [e for e in engine3.events if e.event_ticker in added],
-                    config.kalshi_client,
-                )
+            if engine3.events:
+                new_books = await fetch_orderbooks(engine3.events, config.client)
                 for event in new_books.events:
-                    rerank_event(config.state, event)
+                    # Re-rank event (forward-looking: rerank_event not yet implemented)
+                    pass
 
-            # Remove dead events
-            for event_id in removed:
-                config.state.remove_event(event_id)
-
-            config.state.last_discovery = datetime.now()
+            config.state.cycle_started_at = datetime.now()
 
         except Exception as e:
             logger.error(f"Discovery poller error: {e}")
@@ -193,20 +200,23 @@ async def progress_gate_loop(config: OrchestratorConfig, stop_event: asyncio.Eve
     while not stop_event.is_set():
         try:
             now = datetime.now(ZoneInfo("America/New_York"))
-            for event in config.state.ranked_events.values():
+            for event in config.state.ranked_events:
                 candidate = create_progress_based_candidate(
                     event, config.strategy, config.threshold_percent, now,
                 )
-                config.state.candidates[event.event_ticker] = candidate
 
-                if candidate.should_create_order_candidate:
+                if candidate.side in ("yes", "no"):
                     # Validate and dispatch
                     result = await validate_candidate(
                         candidate, config.operating_mode,
-                        config.validation_config, config.kalshi_client,
+                        config.validation_config, config.client,
                         config.strategy, now,
                     )
                     if result.can_trade:
+                        config.state.candidates.append(ValidatedOrderCandidate(
+                            original_candidate=candidate,
+                            is_valid=True,
+                        ))
                         await broadcast_candidate(config, candidate, result)
 
         except Exception as e:
@@ -220,15 +230,26 @@ async def progress_gate_loop(config: OrchestratorConfig, stop_event: asyncio.Eve
 ```python
 @dataclass
 class ScannerState:
-    """Central runtime state for the live scanner."""
-    markets_by_ticker: dict[str, Market] = field(default_factory=dict)
-    events: dict[str, ClassifiedEvent] = field(default_factory=dict)
-    orderbook_stats: dict[str, MarketOrderbookStats] = field(default_factory=dict)
-    ranked_events: dict[str, EventWithTopMarkets] = field(default_factory=dict)
-    candidates: dict[str, ProgressBasedOrderCandidate] = field(default_factory=dict)
-    last_discovery: datetime | None = None
-    last_progress_check: datetime | None = None
+    """Mutable state for the scanner's current cycle."""
+
+    # Pipeline stages
     is_running: bool = False
+    current_cycle: int = 0
+    started_at: datetime | None = None
+    cycle_started_at: datetime | None = None
+
+    # Data flowing through pipeline
+    markets: list[dict[str, Any]] = field(default_factory=list)
+    classified_events: dict[str, ClassifiedEvent] = field(default_factory=dict)
+    ranked_events: list[EventWithTopMarkets] = field(default_factory=list)
+    candidates: list[ValidatedOrderCandidate] = field(default_factory=list)
+
+    # Error tracking
+    errors: list[str] = field(default_factory=list)
+    warnings: list[str] = field(default_factory=list)
+
+    # Configuration snapshot for this cycle
+    config_snapshot: dict[str, Any] = field(default_factory=dict)
 ```
 
 ## API Dispatch
@@ -268,14 +289,16 @@ async def broadcast_event_update(config, event):
 2. **State is the source of truth** — the live scanner reads and writes state, engines are stateless.
 3. **Never block on a single engine failure** — partial data is better than no data.
 4. **Broadcast after every meaningful state change** — the frontend drives from events.
-5. **Dry-run is the default** — startup always begins in dry-run mode.
+5. **Oneshot is the default** — startup always begins in oneshot mode.
 
 ## Dependencies
 
 - All 7 engines
-- `backend/trading/trade_executor.py` — For live mode order placement
-- `backend/api/websocket_handler.py` — For broadcasting to frontend
-- `backend/core/scanner_state.py` — State management
+- `backend.core.scanner_state` — `ScannerState`, `ScannerOutput`, `CycleMetrics`
+- `backend.core.interfaces.adapter` — `MarketReader`
+- `backend.core.interfaces.strategy` — `StrategyProfile`
+- `backend.core.models.trading` — `ValidatedOrderCandidate`, `ValidationConfig`
+- `backend.core.models.classification` — `ClassifiedEvent`
 
 ## Testing
 

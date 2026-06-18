@@ -6,123 +6,107 @@ Define the contract that every prediction market platform adapter must implement
 
 ---
 
-## `MarketPlatformAdapter` Interface
+## Core Interfaces (Python ABCs)
 
-```typescript
-interface MarketPlatformAdapter {
-  /** Human-readable provider name */
-  readonly name: string;
+```python
+from abc import ABC, abstractmethod
+from typing import Any
 
-  /** IANA timezone used for "today" classification */
-  readonly timezone: string;
 
-  // ──── Engine 1: Discovery ────
+class MarketReader(ABC):
+    """Read-only market data access."""
 
-  /** Fetch all currently open markets across all events */
-  fetchAllOpenMarkets(options?: DiscoveryOptions): Promise<Market[]>;
+    @abstractmethod
+    async def fetch_markets(self, **kwargs: Any) -> list[dict[str, Any]]:
+        """Fetch all available markets (paginated internally)."""
+        ...
 
-  // ──── Engine 4: Orderbook ────
+    @abstractmethod
+    async def fetch_orderbook(self, ticker: str, **kwargs: Any) -> dict[str, Any]:
+        """Fetch orderbook for a single market by ticker."""
+        ...
 
-  /** Fetch the current orderbook for a single market */
-  fetchOrderbook(marketId: string): Promise<Orderbook>;
+    @abstractmethod
+    async def fetch_event(self, event_ticker: str, **kwargs: Any) -> dict[str, Any]:
+        """Fetch a single event by ticker."""
+        ...
 
-  /**
-   * Batch fetch orderbooks for multiple markets.
-   * Default implementation calls fetchOrderbook for each.
-   * Override if provider has a batch endpoint.
-   */
-  fetchOrderbooks?(marketIds: string[]): Promise<Map<string, Orderbook>>;
+    @abstractmethod
+    async def fetch_events(self, **kwargs: Any) -> list[dict[str, Any]]:
+        """Fetch all events."""
+        ...
 
-  // ──── Engine 7: Trade Execution (Optional) ────
 
-  /** Whether this adapter supports order placement */
-  readonly supportsTrading: boolean;
+class Trader(ABC):
+    """Write-only trading operations."""
 
-  /**
-   * Place an order. Only called after Engine 7 validation passes.
-   * Not required for read-only scanners.
-   */
-  placeOrder?(candidate: ValidatedOrderCandidate): Promise<OrderResult>;
+    @abstractmethod
+    async def place_order(
+        self, ticker: str, side: str, price: int, count: int, **kwargs: Any
+    ) -> dict[str, Any]:
+        """Place a limit order. Price in cents."""
+        ...
 
-  // ──── Live Updates (Optional) ────
+    @abstractmethod
+    async def cancel_order(self, order_id: str, **kwargs: Any) -> dict[str, Any]:
+        """Cancel an existing order by ID."""
+        ...
 
-  /** Whether this adapter supports WebSocket live updates */
-  readonly supportsWebSocket: boolean;
+    @abstractmethod
+    async def get_positions(self, **kwargs: Any) -> list[dict[str, Any]]:
+        """Get current positions."""
+        ...
 
-  /**
-   * Create a WebSocket connection for live orderbook/market updates.
-   * Return null if WebSocket is not available.
-   */
-  createWebSocketConnection?(marketIds: string[]): Promise<LiveConnection | null>;
 
-  // ──── Adapter Metadata ────
+class AbstractMarketAdapter(MarketReader, Trader, ABC):
+    """Combined interface for full market access (read + write)."""
 
-  /** Provider-specific configuration */
-  readonly config: PlatformConfig;
-}
+    @property
+    @abstractmethod
+    def name(self) -> str:
+        """Human-readable adapter name (e.g. 'Kalshi')."""
+        ...
+
+    @property
+    @abstractmethod
+    def timezone(self) -> str:
+        """Exchange timezone (e.g. 'US/Eastern')."""
+        ...
+
+    @property
+    @abstractmethod
+    def supports_trading(self) -> bool:
+        """Whether this adapter supports placing orders."""
+        ...
+
+    @property
+    @abstractmethod
+    def supports_websocket(self) -> bool:
+        """Whether this adapter supports WebSocket streaming."""
+        ...
 ```
 
-## Supporting Types
+## Supporting Types & Key Domain Objects
 
-```typescript
-interface DiscoveryOptions {
-  status?: "open" | "all";
-  limit?: number;
-}
+All adapter method signatures use `dict[str, Any]` / `list[dict[str, Any]]` for return types. The pipeline constructs domain objects from raw dicts using `backend.core.models`.
 
-interface LiveConnection {
-  /** Unique connection ID */
-  id: string;
+Key domain objects (Python dataclasses in `backend.core.models`):
 
-  /** Register a callback for orderbook updates */
-  onOrderbookUpdate(callback: (marketId: string, book: Orderbook) => void): void;
+| Object | Defined In | Key Fields |
+|--------|-----------|------------|
+| `Market` | `backend.core.models.market` | `ticker`, `event_ticker`, `yes_bid`, `yes_ask`, `no_bid`, `no_ask` (all `int` cents) |
+| `Orderbook` | `backend.core.models.market` | `market_ticker`, `yes_side: list[OrderbookLevel]`, `no_side: list[OrderbookLevel]` |
+| `OrderbookLevel` | `backend.core.models.market` | `price: int` (cents), `count: int` |
+| `MarketOrderbookStats` | `backend.core.models.market` | `market_ticker`, `event_ticker`, `spread_cents`, `total_resting_order_quantity` |
+| `ClassificationResult` | `backend.core.models.classification` | `market_ticker`, `event_ticker`, `is_same_day_live`, `confidence` |
+| `ClassifiedEvent` | `backend.core.models.classification` | `event_ticker`, `markets: list[Market]`, `classification` |
+| `OrderCandidate` | `backend.core.models.trading` | `event_ticker`, `market_ticker`, `side`, `price: int` (cents) |
+| `ProgressBasedOrderCandidate` | `backend.core.models.trading` | Extends `OrderCandidate`; `threshold_pct`, `is_overtime` |
+| `ValidatedOrderCandidate` | `backend.core.models.trading` | `original_candidate`, `is_valid`, `max_contracts`, `risk_score` |
+| `EventWithTopMarkets` | `backend.core.models.trading` | `event_ticker`, `top_markets: list[RankedMarket]` |
+| `KalshiConfig` | `backend.config.settings` | Pydantic model; `api_base_url`, rate limits, auth |
 
-  /** Register a callback for market lifecycle updates (status changes) */
-  onMarketUpdate(callback: (market: Market) => void): void;
-
-  /** Register a callback for trade execution updates */
-  onTradeUpdate(callback: (trade: TradeUpdate) => void): void;
-
-  /** Close the connection */
-  close(): Promise<void>;
-}
-
-interface TradeUpdate {
-  marketId: string;
-  side: "buy" | "sell";
-  outcome: "yes" | "no";
-  size: number;
-  price: number;
-  timestamp: string;
-}
-
-interface OrderResult {
-  success: boolean;
-  orderId?: string;
-  filledSize?: number;
-  averagePrice?: number;
-  error?: string;
-}
-
-interface ValidatedOrderCandidate extends OrderCandidate {
-  validationTimestamp: string;
-  validationLatencyMs: number;
-  preTradeMarket: Market;
-  preTradeOrderbook: Orderbook;
-  preTradeStats: MarketOrderbookStats;
-}
-
-interface PlatformConfig {
-  /** REST API base URLs */
-  restUrls: string[];
-  /** WebSocket URL (if applicable) */
-  websocketUrl?: string;
-  /** API rate limit (requests per second) */
-  rateLimit: number;
-  /** Whether authentication is needed for trading */
-  requiresAuth: boolean;
-}
-```
+**Live Connection (forward-looking):** WebSocket streaming capability is indicated via the `supports_websocket` property. A `LiveConnection` abstraction will be designed when live mode is implemented.
 
 ## Contract Rules
 
@@ -130,5 +114,5 @@ interface PlatformConfig {
 2. **Adapters must throw typed errors** — `RateLimitError`, `AuthError`, `NetworkError`, `InvalidResponseError`.
 3. **Adapters must handle pagination** internally — the pipeline gets a complete result.
 4. **Adapters must normalize timestamps** to ISO 8601 UTC strings.
-5. **Adapters must normalize prices** to dollar values (not cents, not token units).
+5. **Adapters must normalize prices** to int cents (not dollars, not token units).
 6. **Adapters should batch** when the provider supports it, but must also work with individual requests.

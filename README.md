@@ -54,4 +54,4 @@ Engine 8:  Orchestration        → Run pipeline, manage state
 
 ## Status
 
-**Planning phase.** See the plan document for open questions and next steps.
+**Phase 1 (Backend Core + Utils) implemented.** Core domain models, interfaces, configuration, and utility modules are complete. Engines (Phase 3), adapters (Phase 2), and frontend (Phase 8+) are in development. See the [build plan](docs/build-plan.md) for details and next steps.

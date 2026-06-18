@@ -17,19 +17,21 @@ class Engine5Input:
 ```python
 @dataclass
 class RankedMarket:
-    market: Market
-    classification: MarketClassification
-    orderbook_stats: MarketOrderbookStats
+    market_ticker: str
+    volume: int
+    spread_cents: int
+    yes_price: int
+    no_price: int
+    rank: int
+    score: float
 
 @dataclass
 class EventWithTopMarkets:
     event_ticker: str
-    market_count: int
-    same_day_live_market_count: int
-    total_event_resting_order_quantity: float
-    active_orderbook_market_count: int
-    top_3_markets_by_current_orders: list[RankedMarket]
-    all_same_day_live_markets_ranked: list[RankedMarket]
+    event_title: str
+    top_markets: list[RankedMarket] = field(default_factory=list)
+    total_volume: int = 0
+    num_top_markets: int = 0
 
 @dataclass
 class Engine5Output:
@@ -42,20 +44,16 @@ class Engine5Output:
 
 ```python
 def compute_orderbook_stats(market: Market, orderbook: Orderbook) -> MarketOrderbookStats:
-    yes_qty = sum(level.size for level in orderbook.yes_bids)
-    no_qty = sum(level.size for level in orderbook.no_bids)
+    yes_qty = sum(level.count for level in orderbook.yes_side)
+    no_qty = sum(level.count for level in orderbook.no_side)
 
     return MarketOrderbookStats(
-        market_id=market.id,
-        event_id=market.event_id,
+        market_ticker=market.ticker,
+        event_ticker=market.event_ticker,
         total_resting_order_quantity=yes_qty + no_qty,
-        yes_order_quantity=yes_qty,
-        no_order_quantity=no_qty,
-        depth_level_count=len(orderbook.yes_bids) + len(orderbook.no_bids),
-        best_yes_bid=orderbook.yes_bids[0].price if orderbook.yes_bids else None,
-        best_no_bid=orderbook.no_bids[0].price if orderbook.no_bids else None,
-        volume_24h=float(market.volume_24h or 0),
-        total_volume=float(market.total_volume or 0),
+        best_yes_bid=orderbook.yes_side[0].price if orderbook.yes_side else None,
+        best_no_bid=orderbook.no_side[0].price if orderbook.no_side else None,
+        volume_24h=market.volume_24h or 0,
     )
 ```
 
@@ -65,20 +63,17 @@ def compute_orderbook_stats(market: Market, orderbook: Orderbook) -> MarketOrder
 def rank_markets(markets: list[RankedMarket]) -> list[RankedMarket]:
     """
     Sort by:
-    1. total_resting_order_quantity DESC (most active first)
-    2. depth_level_count DESC (more depth levels = more activity)
-    3. volume_24h DESC (recent trade activity tiebreaker)
-    4. total_volume DESC (all-time volume tiebreaker)
+    1. volume DESC (most volume first)
+    2. spread_cents ASC (tighter spread = more active)
+    3. score DESC (composite ranking score tiebreaker)
     """
     return sorted(
         markets,
         key=lambda m: (
-            m.orderbook_stats.total_resting_order_quantity,
-            m.orderbook_stats.depth_level_count,
-            m.orderbook_stats.volume_24h,
-            m.orderbook_stats.total_volume,
+            -m.volume,
+            m.spread_cents,
+            -m.score,
         ),
-        reverse=True,
     )
 ```
 
@@ -88,36 +83,38 @@ def rank_markets(markets: list[RankedMarket]) -> list[RankedMarket]:
 async def rank_events(engine4_output: Engine4Output) -> Engine5Output:
     """
     For each event, compute orderbook stats and rank markets.
-    Returns top 3 + full ranked list for the progress gate.
+    Returns top markets for the progress gate.
     """
     ranked_events = []
 
     for event in engine4_output.events:
         # Compute stats for each market
-        markets_with_stats = [
-            RankedMarket(
-                market=ewb.market,
-                classification=ewb.classification,
-                orderbook_stats=compute_orderbook_stats(ewb.market, ewb.orderbook),
-            )
-            for ewb in event.same_day_live_markets
-        ]
+        markets_with_stats = []
+        for ewb in event.same_day_live_markets:
+            stats = compute_orderbook_stats(ewb.market, ewb.orderbook)
+            markets_with_stats.append(RankedMarket(
+                market_ticker=ewb.market.ticker,
+                volume=ewb.market.volume,
+                spread_cents=stats.spread_cents or 0,
+                yes_price=ewb.market.yes_bid or 0,
+                no_price=ewb.market.no_bid or 0,
+                rank=0,
+                score=0.0,
+            ))
 
         # Rank
         ranked = rank_markets(markets_with_stats)
+        # Re-assign ranks after sorting
+        for i, rm in enumerate(ranked):
+            rm.rank = i + 1
+            rm.score = rm.volume  # Simple score = volume
 
         ranked_events.append(EventWithTopMarkets(
             event_ticker=event.event_ticker,
-            market_count=event.market_count,
-            same_day_live_market_count=event.same_day_live_market_count,
-            total_event_resting_order_quantity=sum(
-                rm.orderbook_stats.total_resting_order_quantity for rm in ranked
-            ),
-            active_orderbook_market_count=sum(
-                1 for rm in ranked if rm.orderbook_stats.total_resting_order_quantity > 0
-            ),
-            top_3_markets_by_current_orders=ranked[:3],
-            all_same_day_live_markets_ranked=ranked,
+            event_title="",
+            top_markets=ranked,
+            total_volume=sum(rm.volume for rm in ranked),
+            num_top_markets=len(ranked),
         ))
 
     return Engine5Output(events=ranked_events)
@@ -125,10 +122,10 @@ async def rank_events(engine4_output: Engine4Output) -> Engine5Output:
 
 ## Important Rules
 
-1. **Never remove an event** at this stage — even events where all markets have zero orders remain in the output. The progress gate (Engine 6) decides candidacy.
+1. **Never remove an event** at this stage — even events where all markets have zero volume remain in the output. The progress gate (Engine 6) decides candidacy.
 2. **Rank, don't filter** — the full ranked list is passed through for the strategy profiles.
-3. **`all_same_day_live_markets_ranked`** is the authoritative ordering used by Engine 6 for market selection.
-4. **`top_3_markets_by_current_orders`** is a display optimization — the UI shows these as the "featured" markets.
+3. **`top_markets`** is the authoritative ordering used by Engine 6 for market selection.
+4. **`top_markets[:3]`** is a display optimization — the UI shows these as the "featured" markets.
 
 ## Example
 
@@ -147,7 +144,8 @@ Ranked:
 
 ## Dependencies
 
-- `backend/core/models.py` — `MarketOrderbookStats`, `RankedMarket`
+- `backend.core.models.market` — `Market`, `Orderbook`, `MarketOrderbookStats`
+- `backend.core.models.trading` — `RankedMarket`, `EventWithTopMarkets`
 
 ## Testing
 

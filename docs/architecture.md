@@ -65,8 +65,8 @@ graph TB
 ```mermaid
 graph BT
     subgraph Core["Layer 0: Core"]
-        MODELS["core/models.py"]
-        INTERFACES["core/interfaces.py"]
+        MODELS["core/models/"]
+        INTERFACES["core/interfaces/"]
         STATE["core/scanner_state.py"]
         SETTINGS["config/settings.py"]
     end
@@ -168,6 +168,8 @@ graph BT
     WS_HANDLER --> MAIN
 ```
 
+> **Note on forward-looking files:** Strategy files (`strategies/executed_volume_follower.py`, `strategies/favorite_side_follower.py`, etc.), engine files (`engine1_discovery.py` … `engine8_orchestrator.py`), and `trading/trade_executor.py` are documented here as the target architecture but do not yet exist in the codebase. See Phase 4 (Strategies) and Phase 5 (Engines) of the build plan for implementation status.
+
 ### 2.2 Engine Pipeline — Detailed Flow
 
 ```mermaid
@@ -185,7 +187,7 @@ flowchart LR
         E3["Engine 3<br/>Event Grouping<br/><i>group_by_event_ticker()</i>"]
         E4["Engine 4<br/>Orderbook Fetch<br/><i>fetch_orderbooks()</i>"]
         E5["Engine 5<br/>Market Ranking<br/><i>rank_by_resting_orders()</i>"]
-        E6["Engine 6<br/>Progress Gate<br/><i>select_market + select_side</i>"]
+        E6["Engine 6<br/>Progress Gate<br/><i>select_trade(event_features)</i>"]
         E7["Engine 7<br/>Pre-Trade Validate<br/><i>re-validate live data</i>"]
         E8["Engine 8<br/>Orchestration<br/><i>coordinate + dispatch</i>"]
     end
@@ -224,13 +226,13 @@ flowchart LR
 ```mermaid
 flowchart LR
     E1["Engine 1"] -->|"list[Market]"| E2
-    E2["Engine 2"] -->|"list[tuple[Market, Classification]]"| E3
+    E2["Engine 2"] -->|"list[ClassificationResult]"| E3
     E3["Engine 3"] -->|"list[ClassifiedEvent]"| E4
     E4["Engine 4"] -->|"list[tuple[ClassifiedEvent, dict[str, Orderbook]]]"| E5
     E5["Engine 5"] -->|"list[EventWithTopMarkets]"| E6
     E6["Engine 6"] -->|"list[ProgressBasedOrderCandidate]"| E7
     E7["Engine 7"] -->|"list[ValidatedOrderCandidate]"| E8
-    E8["Engine 8"] -->|"ScannerResult"| API["API Layer"]
+    E8["Engine 8"] -->|"ScannerOutput"| API["API Layer"]
 
     style E1 fill:#4A90D9,color:#fff
     style E2 fill:#4A90D9,color:#fff
@@ -246,19 +248,19 @@ flowchart LR
 
 ```mermaid
 flowchart TB
-    CONFIG["settings.yaml<br/>strategy.active_experiment: executed-volume-follower"] --> REGISTRY
+    CONFIG["settings.yaml<br/>strategy.active_experiment: favorite-side-follower"] --> REGISTRY
     REGISTRY["strategies/__init__.py<br/>EXPERIMENT_REGISTRY"] --> FACTORY["get_experiment()"]
-    FACTORY --> EVF["ExecutedVolumeFollower ✅ primary target"]
+    FACTORY --> FAV["FavoriteSideFollower ✅ primary target"]
+    FACTORY --> EVF["ExecutedVolumeFollower ⏸"]
     FACTORY --> EVFD["ExecutedVolumeFade ⏸"]
-    FACTORY --> FAV["FavoriteSideFollower ⏸"]
     FACTORY --> MOM["MomentumFollower ⏸"]
     FACTORY --> LQF["LiquidityFilteredFollower ⏸"]
     FACTORY --> RDF["RestingDepthFollower ⏸"]
     FACTORY --> HYB["HybridScoreFollower ⏸"]
     
-    EVF --> E6["Engine 6<br/>Progress Gate"]
+    FAV --> E6["Engine 6<br/>Progress Gate"]
+    EVF -.-> E6
     EVFD -.-> E6
-    FAV -.-> E6
     MOM -.-> E6
     LQF -.-> E6
     RDF -.-> E6
@@ -294,10 +296,6 @@ flowchart LR
     EXIT --> METRICS
     METRICS --> RESULTS["Strategy Leaderboard<br/>result_table.csv"]
 ```
-    CT -.-> E6
-    
-    E6 -->|"select_market()"| MARKET["Picks market from ranked list"]
-    E6 -->|"select_side()"| SIDE["Returns yes/no/tie/none"]
 ```
 
 ---
@@ -329,7 +327,7 @@ sequenceDiagram
     E1-->>E8: list[Market]
     
     E8->>E2: get_same_day_live_markets()
-    E2-->>E8: list[tuple[Market, Classification]]
+    E2-->>E8: list[ClassificationResult]
     
     E8->>E3: group_by_event_ticker()
     E3-->>E8: list[ClassifiedEvent]
@@ -356,7 +354,7 @@ sequenceDiagram
     K-->>E7: fresh data
     E7-->>E8: ValidatedOrderCandidate
     
-    E8-->>API: ScannerResult
+    E8-->>API: ScannerOutput
     API-->>User: JSON response
 ```
 
@@ -434,18 +432,16 @@ graph TB
         end
     end
 
-    subgraph State["Shared State<br/>(thread-safe via asyncio)"]
-        MARKETS["markets_by_ticker: dict[str, Market]"]
-        EVENTS["events: dict[str, ClassifiedEvent]"]
-        OB_STATS["orderbook_stats: dict[str, MarketOrderbookStats]"]
-        RANKED["ranked_events: dict[str, EventWithTopMarkets]"]
-        CANDIDATES["candidates: dict[str, ProgressBasedOrderCandidate]"]
+    subgraph State["ScannerState"]
+        MARKETS["markets: list[dict]"]
+        EVENTS["classified_events: dict[str, ClassifiedEvent]"]
+        RANKED["ranked_events: list[EventWithTopMarkets]"]
+        CANDIDATES["candidates: list[ValidatedOrderCandidate]"]
     end
 
     Task1 -->|"writes"| EVENTS
-    Task2 -->|"writes"| OB_STATS
-    Task2 -->|"writes"| RANKED
-    Task3 -->|"reads"| RANKED
+    Task1 -->|"writes"| MARKETS
+    Task3 -->|"writes"| RANKED
     Task3 -->|"writes"| CANDIDATES
 
     subgraph Concurrency["Concurrency Controls"]
@@ -471,10 +467,9 @@ flowchart LR
         PG["Progress Gate<br/>writes: candidates"]
     end
 
-    subgraph StateLayer["ScannerState (dicts)"]
-        MARKETS["markets_by_ticker"]
-        EVENTS["events"]
-        OB["orderbook_stats"]
+    subgraph StateLayer["ScannerState"]
+        MARKETS["markets"]
+        EVENTS["classified_events"]
         RANKED["ranked_events"]
         CAND["candidates"]
     end
@@ -487,8 +482,7 @@ flowchart LR
 
     DP --> MARKETS
     DP --> EVENTS
-    WS_U --> OB
-    WS_U --> RANKED
+    PG --> RANKED
     PG --> CAND
 
     REST_API --> MARKETS
@@ -790,7 +784,7 @@ graph TB
     end
     
     subgraph ExternalServices["External"]
-        KALSHI["Kalshi API<br/>external-api.kalshi.com"]
+        KALSHI["Kalshi API<br/>api.elections.kalshi.com"]
     end
 
     CODE --> DOCKER
@@ -822,46 +816,55 @@ erDiagram
         string ticker PK
         string event_ticker FK
         string status
-        string open_time
-        string close_time
-        string expected_expiration_time
+        int yes_bid
+        int yes_ask
+        int no_bid
+        int no_ask
+        int volume
+        int open_interest
+        string expiry
+        string result
     }
     
     Event {
         string event_ticker PK
-        int market_count
-        int live_market_count
+        int num_markets
+        int total_volume
     }
     
     Orderbook {
-        string market_id FK
-        list yes_bids
-        list no_bids
+        string market_ticker FK
+        list yes_side
+        list no_side
     }
     
     OrderCandidate {
         string event_ticker FK
-        string market_id FK
+        string market_ticker FK
         string side
-        float progress_percent
-        float threshold_percent
-        bool should_create
+        int price
+        float progress_pct
+        float confidence
     }
     
     ValidatedOrderCandidate {
-        string event_ticker FK
-        bool can_trade
-        string confirmed_side
-        float validation_latency_ms
+        bool is_valid
+        int estimated_entry_price
+        int estimated_exit_price
+        int max_contracts
+        float risk_score
     }
     
     TradeRecord {
         string trade_id PK
         string market_ticker FK
-        string mode
+        string event_ticker FK
+        string side
+        int entry_price
+        int exit_price
+        int quantity
         string status
-        float price
-        float size
+        float pnl
     }
 ```
 

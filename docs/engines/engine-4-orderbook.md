@@ -18,15 +18,14 @@ class Engine4Input:
 @dataclass
 class MarketWithOrderbook:
     market: Market
-    classification: MarketClassification
     orderbook: Orderbook
 
 @dataclass
 class EventWithOrderbooks:
     event_ticker: str
-    market_count: int
-    same_day_live_market_count: int
-    same_day_live_markets: list[MarketWithOrderbook]
+    event_title: str
+    markets: list[MarketWithOrderbook]   # One per child market
+    total_volume: int = 0
 
 @dataclass
 class Engine4Output:
@@ -36,7 +35,7 @@ class Engine4Output:
 ## Kalshi Endpoint
 
 ```
-GET https://external-api.kalshi.com/trade-api/v2/markets/{ticker}/orderbook
+GET https://api.elections.kalshi.com/trade-api/v2/markets/{ticker}/orderbook
 ```
 
 ### Response Format
@@ -56,49 +55,72 @@ Each level is `[price_dollars, count_fp]` — a string tuple.
 
 ### Orderbook Semantics (Kalshi)
 
-- `yes_dollars` = bids for the YES outcome (people offering to buy YES)
-- `no_dollars` = bids for the NO outcome (people offering to buy NO)
+- `yes_dollars` = bids for the YES outcome (people offering to buy YES) — parsed into `yes_side` list
+- `no_dollars` = bids for the NO outcome (people offering to buy NO) — parsed into `no_side` list
 - Kalshi does **not** directly expose asks in the orderbook endpoint
 - For ranking purposes, we use resting bid quantities directly
+- The parsed `Orderbook` model uses `yes_side`/`no_side` (list of `OrderbookLevel` with int cents)
 
 ## Implementation
 
 ```python
-async def fetch_orderbooks(events: list[ClassifiedEvent], client: KalshiClient) -> Engine4Output:
+async def fetch_orderbooks(events: list[ClassifiedEvent], client: MarketReader) -> Engine4Output:
     """
-    Fetch orderbooks for all same-day live markets across all events.
+    Fetch orderbooks for all markets across all qualified events.
     Markets with no orderbook data are still included (empty orderbook).
+
+    Uses MarketReader.fetch_orderbook(ticker) -> dict[str, Any].
     """
     result_events = []
 
     for event in events:
         markets_with_books = []
 
-        for cm in event.same_day_live_markets:
+        for market in event.markets:
             try:
-                orderbook = await client.get_orderbook(cm.market.ticker)
-            except OrderbookNotFoundError:
-                # Market has no orderbook yet — still include it
-                orderbook = Orderbook(market_id=cm.market.ticker)
+                raw = await client.fetch_orderbook(market.ticker)
+                orderbook = parse_orderbook_response(raw, market.ticker)
             except Exception:
                 # Network error — log and continue with empty book
-                logger.warning(f"Failed to fetch orderbook for {cm.market.ticker}")
-                orderbook = Orderbook(market_id=cm.market.ticker)
+                logger.warning(f"Failed to fetch orderbook for {market.ticker}")
+                orderbook = Orderbook(market_ticker=market.ticker)
 
             markets_with_books.append(MarketWithOrderbook(
-                market=cm.market,
-                classification=cm.classification,
+                market=market,
                 orderbook=orderbook,
             ))
 
+        total_vol = sum(m.volume for m in event.markets if isinstance(m.volume, int))
         result_events.append(EventWithOrderbooks(
             event_ticker=event.event_ticker,
-            market_count=event.market_count,
-            same_day_live_market_count=event.same_day_live_market_count,
-            same_day_live_markets=markets_with_books,
+            event_title=event.event_title,
+            markets=markets_with_books,
+            total_volume=total_vol,
         ))
 
     return Engine4Output(events=result_events)
+
+
+def parse_orderbook_response(raw: dict[str, Any], ticker: str) -> Orderbook:
+    """Convert raw Kalshi API orderbook response to Orderbook model."""
+    ob_fp = raw.get("orderbook_fp", {})
+    yes_raw = ob_fp.get("yes_dollars", [])
+    no_raw = ob_fp.get("no_dollars", [])
+
+    def parse_levels(levels: list) -> list[OrderbookLevel]:
+        if not levels:
+            return []
+        return [
+            OrderbookLevel(price=int(float(price) * 100), count=int(float(count)))
+            for price, count in levels
+        ]
+
+    return Orderbook(
+        market_ticker=ticker,
+        yes_side=parse_levels(yes_raw),
+        no_side=parse_levels(no_raw),
+        fetch_time=datetime.now(),
+    )
 ```
 
 ## Orderbook Parsing
@@ -108,13 +130,13 @@ def parse_orderbook_levels(
     yes_dollars: list[tuple[str, str]] | None,
     no_dollars: list[tuple[str, str]] | None,
 ) -> tuple[list[OrderbookLevel], list[OrderbookLevel]]:
-    """Parse Kalshi FP string tuples into OrderbookLevel objects."""
+    """Parse Kalshi FP string tuples into OrderbookLevel objects (int cents)."""
 
     def parse_levels(levels: list[tuple[str, str]] | None) -> list[OrderbookLevel]:
         if not levels:
             return []
         return [
-            OrderbookLevel(price=float(price), size=float(count))
+            OrderbookLevel(price=int(float(price) * 100), count=int(float(count)))
             for price, count in levels
         ]
 
@@ -133,7 +155,8 @@ semaphore = asyncio.Semaphore(10)  # Max 10 concurrent requests
 
 async def fetch_with_limit(ticker: str) -> Orderbook:
     async with semaphore:
-        return await client.get_orderbook(ticker)
+        raw = await client.fetch_orderbook(ticker)
+        return parse_orderbook_response(raw, ticker)
 ```
 
 ## Error Handling
@@ -162,8 +185,8 @@ This engine fetches orderbooks for **all** same-day live markets, even ones with
 
 ## Dependencies
 
-- `backend/adapters/kalshi/client.py` — `KalshiClient.get_orderbook()`
-- `backend/core/models.py` — `Orderbook`, `OrderbookLevel`
+- `backend/core/interfaces/adapter.py` — `MarketReader` (provides `fetch_orderbook(ticker)`)
+- `backend.core.models.market` — `Orderbook`, `OrderbookLevel`, `Market`
 
 ## Testing
 
