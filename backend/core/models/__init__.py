@@ -1,3 +1,9 @@
+from backend.core.models.backtesting import (
+    HistoricalTrade,
+    Candlestick,
+    OrderbookSnapshot,
+    HistoricalEvent,
+)
 from backend.core.models.market import Market, OrderbookLevel, Orderbook, MarketOrderbookStats
 from backend.core.models.classification import ClassificationResult, ClassifiedEvent
 from backend.core.models.trading import (
@@ -26,4 +32,8 @@ __all__ = [
     "TradeRecord",
     "ValidationConfig",
     "RiskConfig",
+    "HistoricalTrade",
+    "Candlestick",
+    "OrderbookSnapshot",
+    "HistoricalEvent",
 ]

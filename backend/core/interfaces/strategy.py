@@ -51,6 +51,7 @@ class TradeDecision:
     side: str                              # "yes" or "no"
     confidence: float = 0.0
     reason: str = ""
+    experiment_id: str = ""                # set by backtest engine for tracing
     entry_price_cents: int = 0
     max_contracts: int = 0
     should_trade: bool = False
