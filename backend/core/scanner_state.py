@@ -27,7 +27,9 @@ class ScannerState:
     # Error tracking
     errors: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
-
+    # Live tracking
+    last_discovery: datetime | None = None
+    last_progress_check: datetime | None = None
     # Configuration snapshot for this cycle
     config_snapshot: dict[str, Any] = field(default_factory=dict)
 

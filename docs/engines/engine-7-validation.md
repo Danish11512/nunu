@@ -18,8 +18,8 @@ class Engine7Input:
 
 ```python
 @dataclass
-class ValidationResult:
-    can_trade: bool
+class ValidatedOrderCandidate:
+    is_valid: bool
     reason: str | None
     details: dict | None = None
 ```
@@ -30,14 +30,14 @@ class ValidationResult:
 1. Receive OrderCandidate from Engine 6
        │
 2. Check operating mode
-       ├── read_only → return canTrade=False, "Read-only mode"
+       ├── read_only → return is_valid=False, "Read-only mode"
        ├── dry_run   → proceed to validation, return simulated result
        └── live      → proceed to validation, return real result
        │
 3. Re-fetch the market from Kalshi API
        │
 4. Re-run SAME_DAY_LIVE_MARKET classification
-       ├── FAIL → canTrade=False, "Market no longer same-day live"
+       ├── FAIL → is_valid=False, "Market no longer same-day live"
        │
 5. Re-fetch the orderbook
        │
@@ -79,40 +79,46 @@ async def validate_candidate(
     client: MarketReader,
     strategy: StrategyProfile,
     now: datetime | None = None,
-) -> ValidationResult:
+) -> ValidatedOrderCandidate:
     """Pre-trade validation. Re-fetches all data before deciding."""
     if now is None:
         now = datetime.now(ZoneInfo("America/New_York"))
 
     # Mode check
     if mode == "read_only":
-        return ValidationResult(
-            can_trade=False,
+        return ValidatedOrderCandidate(
+            is_valid=False,
             reason="Scanner is in read-only mode.",
         )
 
     if not candidate.side or candidate.side not in ("yes", "no"):
-        return ValidationResult(
-            can_trade=False,
+        return ValidatedOrderCandidate(
+            is_valid=False,
             reason="Candidate is not actionable (no valid side).",
         )
 
     ticker = candidate.market_ticker
 
     # Step 3: Re-fetch market
-    markets = await client.fetch_markets(ticker=ticker)
-    if not markets:
-        return ValidationResult(
-            can_trade=False,
+    # MarketReader doesn't have a single-market fetch method, so fetch all and find ours
+    from backend.adapters.kalshi.types import parse_market
+    all_markets = await client.fetch_markets()
+    latest_market = None
+    for m in all_markets:
+        if m.get("ticker") == ticker:
+            latest_market = parse_market(m)
+            break
+    if not latest_market:
+        return ValidatedOrderCandidate(
+            is_valid=False,
             reason=f"Market {ticker} not found during re-fetch.",
         )
-    latest_market = markets[0]
 
     # Step 4: Re-classify
     classification = classify_market(latest_market, now)
     if not classification.is_same_day_live:
-        return ValidationResult(
-            can_trade=False,
+        return ValidatedOrderCandidate(
+            is_valid=False,
             reason="Market no longer passes same-day live classification.",
             details={"classification": asdict(classification)},
         )
@@ -121,7 +127,7 @@ async def validate_candidate(
     orderbook = await client.fetch_orderbook(ticker=ticker)
 
     # Step 6: Recalculate stats
-    stats = compute_orderbook_stats(latest_market, orderbook)
+    stats = calculate_orderbook_stats(latest_market, orderbook)
 
     # Step 7: Recalculate side via strategy
     decision = strategy.select_trade(
@@ -138,8 +144,8 @@ async def validate_candidate(
     )
 
     if decision.side != candidate.most_bet_side:
-        return ValidationResult(
-            can_trade=False,
+        return ValidatedOrderCandidate(
+            is_valid=False,
             reason=f"Most-bet side changed: was {candidate.most_bet_side}, now {decision.side}.",
             details={
                 "previous_side": candidate.most_bet_side,
@@ -150,22 +156,22 @@ async def validate_candidate(
 
     # Step 8: Check spread
     if stats.spread_cents is not None and stats.spread_cents > config.max_spread_cents:
-        return ValidationResult(
-            can_trade=False,
+        return ValidatedOrderCandidate(
+            is_valid=False,
             reason=f"Spread {stats.spread_cents}¢ exceeds max {config.max_spread_cents}¢.",
         )
 
     # Step 9: Check volume / liquidity
     if stats.volume < config.min_volume:
-        return ValidationResult(
-            can_trade=False,
+        return ValidatedOrderCandidate(
+            is_valid=False,
             reason=f"Insufficient volume: {stats.volume} (min {config.min_volume}).",
         )
 
     # All checks passed
     if mode == "dry_run":
-        return ValidationResult(
-            can_trade=True,
+        return ValidatedOrderCandidate(
+            is_valid=True,
             reason="DRY RUN: Validation passed. No real order placed.",
             details={
                 "mode": "dry_run",
@@ -175,8 +181,8 @@ async def validate_candidate(
         )
 
     # Live mode — ready to place
-    return ValidationResult(
-        can_trade=True,
+    return ValidatedOrderCandidate(
+        is_valid=True,
         reason="Validation passed.",
         details={
             "mode": "live",
@@ -191,7 +197,7 @@ async def validate_candidate(
 | Mode | Validation Runs? | Order Placed? | Output |
 |------|-----------------|---------------|--------|
 | **Dry-Run** | ✅ Full validation | ❌ Simulated | Validation result + simulated fill |
-| **Read-Only** | ❌ Skipped | ❌ Never | `canTrade=False, "Read-only mode"` |
+| **Read-Only** | ❌ Skipped | ❌ Never | `is_valid=False, "Read-only mode"` |
 | **Live** | ✅ Full validation | ✅ If valid | Real order via Kalshi API |
 
 ## What "Stale Data" Means
@@ -207,10 +213,10 @@ A candidate is considered stale if:
 
 | Scenario | Behavior |
 |----------|----------|
-| Market disappears between E6 and E7 | `canTrade=False`, reason logged |
-| Orderbook goes to zero in the gap | `canTrade=False`, insufficient volume |
-| Side flips from YES to NO | `canTrade=False`, side changed |
-| Spread exceeds `max_spread_cents` | `canTrade=False`, spread too wide |
+| Market disappears between E6 and E7 | `is_valid=False`, reason logged |
+| Orderbook goes to zero in the gap | `is_valid=False`, insufficient volume |
+| Side flips from YES to NO | `is_valid=False`, side changed |
+| Spread exceeds `max_spread_cents` | `is_valid=False`, spread too wide |
 | Network error during re-fetch | Retry once, then fail |
 | Kalshi API returns 429 | Backoff, retry once, then fail |
 
@@ -227,11 +233,11 @@ A candidate is considered stale if:
 
 ```python
 async def test_live_mode_rejects_changed_side():
-    """Side flipped between E6 and E7 → canTrade=False."""
+    """Side flipped between E6 and E7 → is_valid=False."""
     ...
 
 async def test_live_mode_rejects_expired_market():
-    """Market expired between E6 and E7 → canTrade=False."""
+    """Market expired between E6 and E7 → is_valid=False."""
     ...
 
 async def test_dry_run_returns_simulated_success():
@@ -239,11 +245,11 @@ async def test_dry_run_returns_simulated_success():
     ...
 
 async def test_read_only_skips_validation():
-    """Read-only immediately returns canTrade=False."""
+    """Read-only immediately returns is_valid=False."""
     ...
 
 async def test_passes_when_nothing_changed():
-    """Market, orderbook, and side unchanged → canTrade=True."""
+    """Market, orderbook, and side unchanged → is_valid=True."""
     ...
 
 async def test_checks_price_movement_threshold():

@@ -21,18 +21,18 @@ None (or config containing base URL and pagination settings).
 GET https://api.elections.kalshi.com/trade-api/v2/markets
 ```
 
-Pagination is handled internally by the adapter layer (see `KalshiClient.fetch_all_open_markets()`). The engine calls `adapter.get_all_open_markets()` which returns fully parsed `Market` domain objects.
+Pagination is handled internally by the client layer (see `KalshiClient.fetch_all_open_markets()`). The engine calls `client.get_all_open_markets()` which returns fully parsed `Market` domain objects.
 
 ## Implementation
 
 ```python
-async def fetch_all_open_markets(adapter: KalshiAdapter) -> list[Market]:
+async def fetch_all_open_markets(client: MarketReader) -> list[Market]:
     """
-    Fetch all open markets using the adapter's internal pagination.
-    The adapter handles cursor-based pagination internally.
+    Fetch all open markets using the client's internal pagination.
+    The client handles cursor-based pagination internally.
     Returns parsed Market domain objects.
     """
-    markets = await adapter.get_all_open_markets()
+    markets = await client.get_all_open_markets()
     logger.info("Fetched %d open markets.", len(markets))
     return markets
 ```

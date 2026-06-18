@@ -102,7 +102,7 @@ async def run_one_shot(config: OrchestratorConfig) -> ScannerOutput:
             config.strategy,
             now,
         )
-        if result.can_trade:
+        if result.is_valid:
             validated.append(ValidatedOrderCandidate(
                 original_candidate=candidate,
                 is_valid=True,
@@ -212,7 +212,7 @@ async def progress_gate_loop(config: OrchestratorConfig, stop_event: asyncio.Eve
                         config.validation_config, config.client,
                         config.strategy, now,
                     )
-                    if result.can_trade:
+                    if result.is_valid:
                         config.state.candidates.append(ValidatedOrderCandidate(
                             original_candidate=candidate,
                             is_valid=True,

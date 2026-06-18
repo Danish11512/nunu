@@ -2252,6 +2252,9 @@ python-dotenv==1.0.1
 > (parse_date, calculate_progress) instead of defining their own.
 > **Cross-ref:** Each engine has a detailed spec doc in `docs/engines/`.
 
+> **⚠️ WARNING — Build plan pseudocode known errors have been corrected below.**
+> The pseudocode for Engines 1, 4, 5, 6, and 7 originally contained bugs (wrong API keys, fictional dataclass fields, undefined variables). These have been fixed in the code blocks below. If you see discrepancies with the engine spec docs in `docs/engines/`, the spec docs are authoritative for algorithm logic. The actual codebase models (`core/models/*`, `core/interfaces/*`) are authoritative for field names and types.
+
 | Engine | File | Spec Doc | Implements |
 |--------|------|----------|------------|
 | E1 Discovery | `engine1_discovery.py` | `docs/engines/engine-1-discovery.md` | `AbstractEngine` |
@@ -2304,10 +2307,9 @@ async def fetch_all_open_markets(client: MarketReader) -> list[Market]:
     Returns deduplicated list of all open Markets, or empty list on failure.
     """
     try:
+        from backend.adapters.kalshi.types import parse_market
         raw_markets = await client.fetch_markets(status="open", limit=1000)
-        # The adapter returns raw dicts; parsing to Market is done in the
-        # convenience wrapper (Phase 2). For now, this is a placeholder.
-        return [Market(**m) for m in raw_markets] if raw_markets else []
+        return [parse_market(m) for m in raw_markets] if raw_markets else []
     except Exception as e:
         logger.error(f"Engine 1 failed: {e}")
         return []
@@ -2512,20 +2514,27 @@ async def fetch_orderbooks(
 
 
 def parse_orderbook_response(raw: dict, ticker: str) -> Orderbook:
-    """Parse Kalshi API orderbook response into Orderbook model."""
-    ob_fp = raw.get("orderbook_fp", {})
-    yes_raw = ob_fp.get("yes_dollars", [])
-    no_raw = ob_fp.get("no_dollars", [])
+    """Parse Kalshi API orderbook response into Orderbook model.
+
+    The API returns {"yes": [{"price": 65, "count": 1000}, ...],
+    "no": [{"price": 35, "count": 800}, ...]} with int cents and int contracts.
+    """
+    from backend.core.models.market import OrderbookLevel
+    yes_raw = raw.get("yes", [])
+    no_raw = raw.get("no", [])
 
     def parse_levels(levels: list) -> list:
         if not levels:
             return []
-        return [type('OL', (), {'price': int(float(p) * 100), 'count': int(float(c))})() for p, c in levels]
+        return [
+            OrderbookLevel(price=level["price"], count=level["count"])
+            for level in levels
+        ]
 
     return Orderbook(
         market_ticker=ticker,
-        yes_side=[l for l in parse_levels(yes_raw)],
-        no_side=[l for l in parse_levels(no_raw)],
+        yes_side=parse_levels(yes_raw),
+        no_side=parse_levels(no_raw),
         fetch_time=datetime.now(),
     )
 ```
@@ -2554,15 +2563,16 @@ def compute_orderbook_stats(market: Market, orderbook: Orderbook) -> MarketOrder
     """Derive orderbook statistics for ranking."""
     yes_qty = sum(level.count for level in orderbook.yes_side)
     no_qty = sum(level.count for level in orderbook.no_side)
-    spread = None
+    spread_cents = None
     if orderbook.yes_side and orderbook.no_side:
-        spread = abs(orderbook.yes_side[0].price - orderbook.no_side[0].price)
+        spread_cents = abs(orderbook.yes_side[0].price - orderbook.no_side[0].price)
     return MarketOrderbookStats(
         market_ticker=market.ticker,
         event_ticker=market.event_ticker,
+        spread_cents=spread_cents,
         total_resting_order_quantity=yes_qty + no_qty,
-        best_yes_bid=orderbook.yes_side[0].price if orderbook.yes_side else None,
-        best_no_bid=orderbook.no_side[0].price if orderbook.no_side else None,
+        yes_bid=orderbook.yes_side[0].price if orderbook.yes_side else None,
+        no_bid=orderbook.no_side[0].price if orderbook.no_side else None,
         volume_24h=market.volume_24h or 0,
     )
 
@@ -2584,7 +2594,7 @@ def rank_event_markets(
         ranked.append(RankedMarket(
             market_ticker=market.ticker,
             volume=market.volume,
-            spread_cents=spread or 0,
+            spread_cents=stats.spread_cents or 0,
             yes_price=market.yes_bid or 0,
             no_price=market.no_bid or 0,
             rank=0,
@@ -2592,8 +2602,7 @@ def rank_event_markets(
         ))
     
     ranked.sort(
-        key=lambda r: (r.score, r.volume),
-        reverse=True,
+        key=lambda r: (-r.volume, r.spread_cents, -r.score),
     )
     for i, rm in enumerate(ranked):
         rm.rank = i + 1
@@ -2688,9 +2697,13 @@ def create_candidate(
     reason_parts: list[str] = []
     
     # Calculate progress from first top market
+    # NOTE: Proper temporal progress requires market expiry data (carried through
+    # ClassifiedEvent.markets). Engine 6 receives EventWithTopMarkets which lacks
+    # Market objects. Once the pipeline is extended, use:
+    #   progress_pct = calculate_progress(market.expiry, now, market.create_date)
+    # For now, use a volume-based proxy (0-100 scale).
     if event.top_markets:
         top_rm = event.top_markets[0]
-        # Estimate progress from market data (volume-based heuristic)
         progress_pct = min(float(top_rm.volume) / 1000.0 * 100.0, 100.0) if top_rm.volume > 0 else 0.0
     else:
         progress_pct = 0.0
@@ -2746,72 +2759,6 @@ def process_all_events(
     actionable = [c for c in candidates if c.side in ("yes", "no") and c.confidence > 0]
     
     return candidates, actionable
-```
-            event_ticker=event.event_ticker,
-            threshold_percent=threshold_percent,
-            event_progress_percent=0,
-            event_passes_progress_threshold=False,
-            should_create_order_candidate=False,
-            reasons=[f"Selected market {decision.market_ticker} not in ranked list."],
-        )
-    
-    progress = calculate_progress(selected_market, now)
-    passes = progress >= threshold_percent
-    
-    if not passes:
-        reasons.append(f"Progress {progress:.1f}% < threshold {threshold_percent}%.")
-    
-    classification = classify_market(selected_market, now)
-    still_live = classification.same_day_live_market
-    if not still_live:
-        reasons.append("Market no longer same-day live.")
-    
-    has_orders = selected_stats.total_resting_order_quantity > 0
-    if not has_orders:
-        reasons.append("Market has zero resting order quantity.")
-    
-    side = decision.selected_side.lower() if decision.selected_side else "none"
-    should_create = passes and still_live and has_orders and side in ("yes", "no")
-    
-    return ProgressBasedOrderCandidate(
-        event_ticker=event.event_ticker,
-        threshold_percent=threshold_percent,
-        event_progress_percent=progress,
-        event_passes_progress_threshold=passes,
-        selected_market=selected_market,
-        selected_market_stats=selected_stats,
-        most_bet_side=side,
-        yes_order_quantity=selected_stats.yes_order_quantity,
-        no_order_quantity=selected_stats.no_order_quantity,
-        total_resting_order_quantity=selected_stats.total_resting_order_quantity,
-        should_create_order_candidate=should_create,
-        requires_manual_review=False,
-        reasons=reasons,
-    )
-
-
-def process_all_events(
-    events: list[EventWithTopMarkets],
-    strategy: StrategyProfile,
-    threshold_percent: int = 65,
-    now: Optional[datetime] = None,
-) -> tuple[list[ProgressBasedOrderCandidate], list[ProgressBasedOrderCandidate], list[ProgressBasedOrderCandidate]]:
-    """
-    Run Engine 6 across all events.
-    Returns (all_candidates, actionable, manual_review).
-    """
-    if now is None:
-        now = datetime.now(ET)
-    
-    candidates = [
-        create_candidate(e, strategy, threshold_percent, now)
-        for e in events
-    ]
-    
-    actionable = [c for c in candidates if c.should_create_order_candidate]
-    manual = [c for c in candidates if c.requires_manual_review]
-    
-    return candidates, actionable, manual
 ```
 
 ### 3.7 — `backend/engines/engine7_validation.py`
@@ -2871,19 +2818,23 @@ async def validate_candidate(
     ticker = candidate.market_ticker
 
     # Re-fetch market
-    markets_raw = await client.fetch_markets(ticker=ticker)
-    if not markets_raw:
+    from backend.adapters.kalshi.types import parse_market
+    from backend.adapters.kalshi.client import KalshiClient
+    markets_raw = await client.fetch_markets()
+    market_obj = None
+    for m in markets_raw:
+        if m.get("ticker") == ticker:
+            market_obj = parse_market(m)
+            break
+    if market_obj is None:
         return ValidatedOrderCandidate(
             original_candidate=candidate,
             is_valid=False,
             validation_errors=[f"Market {ticker} not found."],
         )
-    market_data = markets_raw[0]  # Raw dict from API
 
-    # Re-classify (pass the raw dict — the adapter parses it)
-    from backend.core.models.market import Market
-    # In practice, the adapter returns a Market model; this is simplified
-    classification = classify_market(market_data, now)
+    # Re-classify using parsed Market object
+    classification = classify_market(market_obj, now)
     if not classification.is_same_day_live:
         return ValidatedOrderCandidate(
             original_candidate=candidate,
@@ -2891,7 +2842,8 @@ async def validate_candidate(
             validation_errors=["Market no longer same-day live."],
         )
 
-    # Re-fetch orderbook
+    # Re-fetch orderbook and parse
+    from backend.adapters.kalshi.types import parse_orderbook, calculate_orderbook_stats
     orderbook_raw = await client.fetch_orderbook(ticker)
     if not orderbook_raw:
         return ValidatedOrderCandidate(
@@ -2899,6 +2851,8 @@ async def validate_candidate(
             is_valid=False,
             validation_errors=[f"Orderbook for {ticker} not available."],
         )
+    orderbook = parse_orderbook(orderbook_raw, ticker)
+    stats = calculate_orderbook_stats(market_obj, orderbook)
 
     # Recalculate side via strategy
     event_features = EventFeatures(
@@ -2910,9 +2864,13 @@ async def validate_candidate(
     if decision.side != candidate.side:
         errors.append(f"Side changed: was {candidate.side}, now {decision.side}.")
 
-    # Spread check (defensive — config.max_spread_cents)
-    # Volume check (config.min_volume)
-    # These are simplified; real implementation re-fetches proper Market objects
+    # Spread check
+    if stats.spread_cents is not None and stats.spread_cents > config.max_spread_cents:
+        errors.append(f"Spread {stats.spread_cents}¢ exceeds max {config.max_spread_cents}¢.")
+
+    # Volume check
+    if stats.volume < config.min_volume:
+        errors.append(f"Insufficient volume: {stats.volume} (min {config.min_volume}).")
 
     if not errors:
         return ValidatedOrderCandidate(
@@ -3032,7 +2990,7 @@ These are poller/updater classes for the live scanner loop. Each runs as an asyn
 > **CRITICAL — Use `MarketReader` interface** (NOT `KalshiAdapter`).
 > The `ScannerState` has these fields: `markets`, `classified_events` (dict[str, ClassifiedEvent]),
 > `ranked_events` (list[EventWithTopMarkets]), `candidates` (list[ValidatedOrderCandidate]),
-> `is_running`, `last_discovery`, `last_progress_check`.
+> `is_running`, `cycle_started_at`.
 
 ```python
 # backend/engines/live/discovery_poller.py
@@ -3088,7 +3046,7 @@ class DiscoveryPoller:
                     await callback([e for e in events if e.event_ticker in added])
                 
                 self.state.classified_events = {e.event_ticker: e for e in events}
-                self.state.last_discovery = now.isoformat()
+                self.state.cycle_started_at = now
                 
                 logger.info(f"Discovery: {len(live)} live markets, {len(events)} events. +{len(added)} -{len(removed)}")
             
@@ -3167,7 +3125,7 @@ from backend.engines.engine4_orderbook import fetch_orderbooks
 from backend.engines.engine5_ranking import rank_event_markets, rank_all_events
 from backend.engines.engine6_progress_gate import create_candidate, process_all_events
 from backend.engines.engine7_validation import validate_candidate
-from backend.engines.engine8_orchestrator import run_one_shot, ScannerResult
+from backend.engines.engine8_orchestrator import run_one_shot
 print('All 8 engines import OK')
 "
 ```

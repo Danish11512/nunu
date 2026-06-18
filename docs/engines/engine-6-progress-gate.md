@@ -113,8 +113,10 @@ def create_progress_based_candidate(
         return empty_candidate(event.event_ticker, threshold_percent, reasons)
 
     # Step 2: Calculate progress
-    top_market = event.top_markets[0] if event.top_markets else None
-    progress = calculate_event_progress(top_market, now) if top_market else 0.0
+    top_ranked = event.top_markets[0] if event.top_markets else None
+    # calculate_event_progress expects Market, not RankedMarket.
+    # TODO: Look up original Market object from event data.
+    progress = calculate_event_progress(top_ranked, now) if top_ranked else 0.0
     passes_threshold = progress >= threshold_percent
     if not passes_threshold:
         reasons.append(f"Progress {progress:.2f}% < threshold {threshold_percent}%.")
@@ -124,7 +126,12 @@ def create_progress_based_candidate(
         (rm for rm in event.top_markets if rm.market_ticker == decision.market_ticker),
         None,
     )
-    classification = classify_market(selected_market_data, now) if selected_market_data else None
+    # classify_market expects Market, not RankedMarket.
+    # TODO: Look up original Market object from event data.
+    classification = None  # Requires Market object lookup
+    if selected_market_data:
+        # TODO: Look up original Market object from event data
+        pass
     if classification and not classification.is_same_day_live:
         reasons.append("Selected market no longer passes same-day live classification.")
 
