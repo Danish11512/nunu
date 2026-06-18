@@ -33,6 +33,41 @@ class ScannerState:
     # Configuration snapshot for this cycle
     config_snapshot: dict[str, Any] = field(default_factory=dict)
 
+    def get_event(self, event_ticker: str) -> EventWithTopMarkets | None:
+        """Return the ranked event matching *event_ticker*, or None."""
+        for ev in self.ranked_events:
+            if ev.event_ticker == event_ticker:
+                return ev
+        return None
+
+    def get_candidate(self, event_ticker: str) -> ValidatedOrderCandidate | None:
+        """Return the candidate matching *event_ticker*, or None."""
+        for c in self.candidates:
+            if c.original_candidate.event_ticker == event_ticker:
+                return c
+        return None
+
+    def get_candidates_for_event(self, event_ticker: str) -> list[ValidatedOrderCandidate]:
+        """Return all candidates for a given event ticker."""
+        return [
+            c for c in self.candidates
+            if c.original_candidate.event_ticker == event_ticker
+        ]
+
+    @property
+    def markets_by_ticker(self) -> dict[str, dict[str, Any]]:
+        """Build a lookup dict of markets keyed by their ``ticker``."""
+        return {
+            m.get("ticker", ""): m
+            for m in self.markets
+            if m.get("ticker")
+        }
+
+    @property
+    def active_candidates(self) -> list[ValidatedOrderCandidate]:
+        """Return only candidates where ``is_valid`` is True."""
+        return [c for c in self.candidates if c.is_valid]
+
 
 @dataclass
 class ScannerOutput:

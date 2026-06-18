@@ -6,7 +6,7 @@ from backend.core.interfaces.adapter import MarketReader
 from backend.core.models.trading import (
     ProgressBasedOrderCandidate, ValidatedOrderCandidate, ValidationConfig,
 )
-from backend.core.interfaces import StrategyProfile, EventFeatures, MarketFeatures
+from backend.core.interfaces.strategy import StrategyProfile, EventFeatures, MarketFeatures
 from backend.adapters.kalshi.types import parse_market, calculate_orderbook_stats, parse_orderbook
 from backend.engines.engine2_classification import classify_market
 
@@ -44,13 +44,14 @@ async def validate_candidate(
 
     ticker = candidate.market_ticker
 
-    # Re-fetch market and parse to Market object
-    markets_raw = await client.fetch_markets()
+    # Fetch event (single API call, not paginated) and find our market
+    event_raw = await client.fetch_event(candidate.event_ticker)
     market_obj = None
-    for m in markets_raw:
-        if m.get("ticker") == ticker:
-            market_obj = parse_market(m)
-            break
+    if event_raw:
+        for m in event_raw.get("markets", []):
+            if m.get("ticker") == ticker:
+                market_obj = parse_market(m)
+                break
     if market_obj is None:
         return ValidatedOrderCandidate(
             original_candidate=candidate,

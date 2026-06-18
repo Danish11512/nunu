@@ -3,9 +3,8 @@ from zoneinfo import ZoneInfo
 from typing import Optional
 
 from backend.core.models.trading import EventWithTopMarkets, ProgressBasedOrderCandidate
-from backend.core.interfaces import StrategyProfile, EventFeatures, MarketFeatures, TradeDecision
+from backend.core.interfaces.strategy import StrategyProfile, EventFeatures, MarketFeatures, TradeDecision
 from backend.utils.datetime_utils import calculate_progress, parse_date
-from backend.engines.engine2_classification import classify_market
 
 ET = ZoneInfo("America/New_York")
 

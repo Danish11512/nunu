@@ -121,10 +121,11 @@ def calculate_orderbook_stats(
     if yes_bid is not None and yes_ask is not None:
         spread = abs(yes_ask - yes_bid)
 
-    # Total resting quantity across both sides
-    total_resting = sum(level.count for level in orderbook.yes_side) + sum(
-        level.count for level in orderbook.no_side
-    )
+    # Per-side and total resting quantity
+    yes_order_quantity = sum(level.count for level in orderbook.yes_side)
+    no_order_quantity = sum(level.count for level in orderbook.no_side)
+    total_resting = yes_order_quantity + no_order_quantity
+    depth_level_count = len(orderbook.yes_side) + len(orderbook.no_side)
 
     return MarketOrderbookStats(
         market_ticker=market.ticker,
@@ -139,4 +140,7 @@ def calculate_orderbook_stats(
         open_interest=market.open_interest,
         volume_24h=market.volume_24h,
         total_resting_order_quantity=total_resting,
+        yes_order_quantity=yes_order_quantity,
+        no_order_quantity=no_order_quantity,
+        depth_level_count=depth_level_count,
     )

@@ -1,16 +1,11 @@
 from __future__ import annotations
 
 import base64
-import hashlib
-import logging
 from datetime import datetime, timezone
-from typing import Any
 
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding, rsa
 from cryptography.hazmat.primitives.asymmetric.rsa import RSAPrivateKey
-
-logger = logging.getLogger(__name__)
 
 
 class KalshiSigner:

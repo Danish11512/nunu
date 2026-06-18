@@ -73,10 +73,10 @@ def calculate_progress(
         now = now.replace(tzinfo=UTC)
 
     total_seconds = (expires_at - (start_at or now)).total_seconds()
-    elapsed_seconds = (expires_at - now).total_seconds()
+    remaining_seconds = (expires_at - now).total_seconds()
 
     if total_seconds <= 0:
         return 100.0
 
-    progress = (1.0 - (elapsed_seconds / total_seconds)) * 100.0
+    progress = (1.0 - (remaining_seconds / total_seconds)) * 100.0
     return max(0.0, min(100.0, progress))

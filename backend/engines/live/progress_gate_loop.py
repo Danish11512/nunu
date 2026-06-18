@@ -3,7 +3,7 @@ import logging
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
-from backend.core.interfaces import StrategyProfile
+from backend.core.interfaces.strategy import StrategyProfile
 from backend.engines.engine6_progress_gate import create_candidate
 
 logger = logging.getLogger(__name__)

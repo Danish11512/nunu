@@ -4,7 +4,7 @@ from typing import Optional
 import logging
 
 from backend.core.interfaces.adapter import MarketReader
-from backend.core.interfaces import StrategyProfile
+from backend.core.interfaces.strategy import StrategyProfile
 from backend.core.models.trading import ValidatedOrderCandidate, ValidationConfig
 from backend.core.scanner_state import ScannerOutput
 from backend.engines.engine1_discovery import fetch_all_open_markets

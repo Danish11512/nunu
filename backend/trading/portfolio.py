@@ -6,7 +6,7 @@ import logging
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Optional
-from backend.core.models import TradeRecord
+from backend.core.models.trading import TradeRecord
 
 logger = logging.getLogger(__name__)
 

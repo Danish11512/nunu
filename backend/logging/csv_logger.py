@@ -4,7 +4,7 @@ CSV logging — one file per event type (candidates, trades, opportunities).
 import csv
 import os
 from datetime import datetime
-from backend.core.models import ProgressBasedOrderCandidate, TradeRecord
+from backend.core.models.trading import ProgressBasedOrderCandidate, TradeRecord
 
 
 class CSVLogger:

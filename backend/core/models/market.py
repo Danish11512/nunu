@@ -62,3 +62,6 @@ class MarketOrderbookStats:
     open_interest: int = 0
     volume_24h: int | None = None
     total_resting_order_quantity: int = 0
+    yes_order_quantity: int = 0
+    no_order_quantity: int = 0
+    depth_level_count: int = 0

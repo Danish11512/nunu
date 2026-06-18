@@ -2,8 +2,7 @@
 Thin facade — validates a candidate and submits it to the ExecutionEngine.
 Kept for backward compat with the API layer; new code calls ExecutionEngine directly.
 """
-from typing import Optional
-from backend.core.models import ProgressBasedOrderCandidate
+from backend.core.models.trading import ProgressBasedOrderCandidate
 from backend.trading.execution_engine import ExecutionEngine
 
 

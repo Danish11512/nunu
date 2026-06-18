@@ -23,11 +23,11 @@ def group_by_event_ticker(
     for ticker, markets in by_event.items():
         classifs = [c for _, c in markets]
         best_c = max(classifs, key=lambda c: c.confidence)
-        total_volume = sum(m.volume for m, _ in markets if isinstance(m.volume, int))
+        total_volume = sum(m.volume for m, _ in markets)
 
         events.append(ClassifiedEvent(
             event_ticker=ticker,
-            event_title=markets[0][0].title if markets else "",
+            event_title=markets[0][0].title,
             markets=[m for m, _ in markets],
             classification=best_c,
             num_markets=len(markets),

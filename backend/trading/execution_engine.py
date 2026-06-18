@@ -9,12 +9,12 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Optional
 
-from backend.core.models import (
+from backend.core.models.trading import (
     ProgressBasedOrderCandidate, ValidatedOrderCandidate,
     TradeRecord, ValidationConfig,
 )
 from backend.adapters.kalshi.adapter import KalshiAdapter
-from backend.core.interfaces import StrategyProfile
+from backend.core.interfaces.strategy import StrategyProfile
 from backend.engines.engine7_validation import validate_candidate
 from backend.trading.portfolio import Portfolio
 
@@ -64,7 +64,7 @@ class ExecutionEngine:
         self.strategy = strategy
         self.portfolio = portfolio
         self.mode = mode
-        self.config = config or ExecutionConfig(dry_run=(mode == "dry_run"))
+        self.config = config or ExecutionConfig(dry_run=(mode != "live"))
         self.stats = ExecutionStats()
 
         # Signal queue
