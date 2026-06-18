@@ -28,10 +28,10 @@ cp backend/.env.example backend/.env
 # 6. Follow phases below — each tells you what to build and how to verify
 ```
 
-> **⚠️ Implementation status (2026-06-17):** Phase 1 (Core + Utils) is complete.
-> Phase 2 (Kalshi Adapter) is complete. Phases 3–13 are **not yet implemented**. No frontend/ directory exists yet.
-> The `frontend/` scaffolding will be created in Phase 8 using `create-vite` with React+TypeScript.
-> See `docs/api-contract.md` for the frontend contract that must be implemented.
+> **⚠️ Implementation status (2026-06-18):** Phases 0–8 are complete.
+> Phase 9 (Frontend Pages — Dashboard + Settings) is complete.
+> Phase 10 (Frontend Components — Badge, ConfirmDialog, ProgressBar, ThresholdSlider, ModeSelector) is complete.
+> Phases 11–13 are **not yet implemented**.
 
 ---
 
@@ -81,20 +81,19 @@ For the full detailed step list with pseudocode references, see the [Full Build 
 
 **Quick reference:**
 ```
-Phase 0:  Scaffolding (dirs + configs)      — Step 0
-Phase 1:  Backend Core + Utils              — Steps 1–16
-Phase 2:  Kalshi Adapter (SOLID split)      — Steps 17–22
-Phase 3:  Engines + Live                     — Steps 23–33
-Phase 4:  Strategies + Registry              — Steps 34–41
-Phase 5:  Backtesting Infrastructure         — Steps 42–46
-Phase 6:  Trading + Logging + Portfolio       — Steps 47–51
-Phase 7:  API Layer (DRY errors.py)         — Steps 52–54
-Phase 8:  Frontend lib (Types + API Client)  — Steps 55–56
-Phase 9:  Frontend Hooks                     — Steps 57–59
-Phase 10: Frontend Pages                     — Steps 60–66
-Phase 11: Frontend Components                — Steps 67–76
-Phase 12: Test Infrastructure                — After all steps
-Phase 13: Docker + Integration               — After all steps
+Phase 0:  Scaffolding (dirs + configs)              — Step 0          ✅
+Phase 1:  Backend Core + Utils                      — Steps 1–16      ✅
+Phase 2:  Kalshi Adapter (SOLID split)              — Steps 17–22     ✅
+Phase 3:  Engines + Live                            — Steps 23–33     ✅
+Phase 4:  Strategies + Registry                     — Steps 34–41     ✅
+Phase 5:  Backtesting Infrastructure                — Steps 42–46     ✅
+Phase 6:  Trading + Logging + Portfolio             — Steps 47–51     ✅
+Phase 7:  API Layer (DRY errors.py)                — Steps 52–54     ✅
+Phase 8:  Frontend lib (Types + API Client)         — Steps 55–56     ✅
+Phase 9:  Frontend Hooks + Pages                    — Steps 57–66     ✅
+Phase 10: Frontend Components                       — Steps 67–76     ✅
+Phase 11: Test Infrastructure                       — After all steps ⬜
+Phase 12: Docker + Integration                      — After all steps ⬜
 ```
 
 ### Dependency Graph

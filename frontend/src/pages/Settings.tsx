@@ -1,6 +1,8 @@
 import { useState } from 'react';
 import { useScannerConfig } from '../hooks/useScannerConfig';
-import { ScannerMode, LiveMode } from '../lib/types';
+import { ScannerMode } from '../lib/types';
+import ModeSelector from '../components/ModeSelector';
+import ThresholdSlider from '../components/ThresholdSlider';
 
 export default function Settings() {
   const { config, updateConfig, switchMode } = useScannerConfig();
@@ -18,7 +20,6 @@ export default function Settings() {
   };
 
   const currentMode = config.data?.mode ?? ScannerMode.DRY_RUN;
-  const isLive = currentMode === ScannerMode.LIVE;
 
   return (
     <div className="min-h-screen bg-gray-900 text-gray-100">
@@ -39,7 +40,7 @@ export default function Settings() {
 
         {config.isError && (
           <div className="bg-red-900/50 border border-red-700 rounded-lg p-4">
-            <p className="text-red-200">{(config.error as Error)?.message ?? 'Failed to load config'}</p>
+            <p className="text-red-200">{config.error?.message ?? 'Failed to load config'}</p>
           </div>
         )}
 
@@ -48,23 +49,12 @@ export default function Settings() {
             {/* Mode Section */}
             <section className="bg-gray-800 rounded-lg p-5 border border-gray-700">
               <h2 className="text-lg font-semibold mb-3">Mode</h2>
-              <div className="flex items-center justify-between">
-                <div className="flex items-center gap-3">
-                  <span className={`px-3 py-1 rounded text-sm font-semibold ${isLive ? 'bg-green-800 text-green-200' : 'bg-yellow-800 text-yellow-200'}`}>
-                    {currentMode}
-                  </span>
-                  <span className="text-gray-400 text-sm">
-                    {isLive ? 'Live trading enabled' : 'Dry run / read only'}
-                  </span>
-                </div>
-                <button
-                  onClick={() => switchMode.mutate({ mode: isLive ? LiveMode.DRY_RUN : LiveMode.LIVE })}
-                  disabled={switchMode.isPending}
-                  className="px-4 py-1.5 bg-blue-700 hover:bg-blue-600 disabled:opacity-50 rounded text-sm"
-                >
-                  {switchMode.isPending ? 'Switching...' : `Switch to ${isLive ? 'Dry Run' : 'Live'}`}
-                </button>
-              </div>
+              <ModeSelector
+                currentMode={currentMode}
+                onSwitch={(mode) => switchMode.mutate({ mode })}
+                hasCredentials={config.data.has_credentials}
+                switching={switchMode.isPending}
+              />
             </section>
 
             {/* Strategy Section */}
@@ -86,19 +76,10 @@ export default function Settings() {
             {/* Threshold Section */}
             <section className="bg-gray-800 rounded-lg p-5 border border-gray-700">
               <h2 className="text-lg font-semibold mb-3">Progress Threshold</h2>
-              <div className="flex items-center gap-4">
-                <input
-                  type="range"
-                  min={0}
-                  max={100}
-                  value={resolvedThreshold}
-                  onChange={(e) => setThreshold(Number(e.target.value))}
-                  className="flex-1 accent-blue-500"
-                />
-                <span className="text-xl font-mono font-bold text-blue-400 min-w-[3rem] text-right">
-                  {resolvedThreshold}%
-                </span>
-              </div>
+              <ThresholdSlider
+                value={resolvedThreshold}
+                onChange={(value) => setThreshold(value)}
+              />
             </section>
 
             {/* Save Button */}

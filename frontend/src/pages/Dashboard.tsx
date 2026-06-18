@@ -1,15 +1,17 @@
 import { useState, useCallback } from 'react';
 import { useEvents } from '../hooks/useEvents';
 import { useWebSocket } from '../hooks/useWebSocket';
+import ProgressBar from '../components/ProgressBar';
+import Badge from '../components/Badge';
 import type { EventSummary } from '../lib/types';
 
 function EventCard({ event }: { event: EventSummary }) {
-  const progressColor = event.event_progress_percent >= 65 ? 'bg-green-500' : 'bg-gray-500';
+  const progressColor = event.event_progress_percent >= 65 ? 'green' : 'gray';
   const candidateBadge = () => {
     if (!event.has_active_candidate) return null;
-    if (event.candidate_side === 'yes') return <span className="ml-2 px-2 py-0.5 rounded bg-green-800 text-green-200 text-xs font-semibold">YES</span>;
-    if (event.candidate_side === 'no') return <span className="ml-2 px-2 py-0.5 rounded bg-red-800 text-red-200 text-xs font-semibold">NO</span>;
-    return <span className="ml-2 px-2 py-0.5 rounded bg-yellow-700 text-yellow-200 text-xs font-semibold">REVIEW</span>;
+    if (event.candidate_side === 'yes') return <Badge variant="yes" label="YES" />;
+    if (event.candidate_side === 'no') return <Badge variant="no" label="NO" />;
+    return <Badge variant="tie" label="REVIEW" />;
   };
 
   return (
@@ -21,14 +23,8 @@ function EventCard({ event }: { event: EventSummary }) {
       <div className="mb-3">
         <div className="flex justify-between text-xs text-gray-400 mb-1">
           <span>Progress</span>
-          <span>{event.event_progress_percent.toFixed(1)}%</span>
         </div>
-        <div className="w-full bg-gray-700 rounded-full h-2">
-          <div
-            className={`h-2 rounded-full transition-all duration-500 ${progressColor}`}
-            style={{ width: `${Math.min(event.event_progress_percent, 100)}%` }}
-          />
-        </div>
+        <ProgressBar percent={event.event_progress_percent} color={progressColor} size="sm" decimals={1} />
       </div>
       <div className="space-y-1">
         {event.top_markets.slice(0, 3).map((m) => (
@@ -95,7 +91,7 @@ export default function Dashboard() {
 
         {isError && (
           <div className="bg-red-900/50 border border-red-700 rounded-lg p-4 mb-4">
-            <p className="text-red-200">{(error as Error)?.message ?? 'Failed to load events'}</p>
+            <p className="text-red-200">{error?.message ?? 'Failed to load events'}</p>
             <button
               onClick={() => refetch()}
               className="mt-2 px-4 py-1.5 bg-red-700 hover:bg-red-600 text-white rounded text-sm"
