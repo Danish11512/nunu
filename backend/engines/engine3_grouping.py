@@ -27,7 +27,7 @@ def group_by_event_ticker(
 
         events.append(ClassifiedEvent(
             event_ticker=ticker,
-            event_title=markets[0][0].title,
+            event_title=markets[0][0].title if markets else "",  # Initial value, enriched later
             markets=[m for m, _ in markets],
             classification=best_c,
             num_markets=len(markets),

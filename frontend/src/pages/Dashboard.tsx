@@ -21,7 +21,7 @@ function EventCard({ event }: { event: EventSummary }) {
   return (
     <div className="bg-gray-800 rounded-lg p-4 border border-gray-700">
       <div className="flex items-center justify-between mb-2">
-        <h3 className="text-lg font-semibold text-gray-100">{event.event_ticker}</h3>
+        <h3 className="text-lg font-semibold text-gray-100">{event.event_sub_title || event.event_title || event.event_ticker}</h3>
         {candidateBadge()}
       </div>
       <div className="mb-3">
@@ -33,7 +33,7 @@ function EventCard({ event }: { event: EventSummary }) {
       <div className="space-y-1">
         {event.top_markets.slice(0, 3).map((m) => (
           <div key={m.ticker} className="flex items-center justify-between text-sm">
-            <span className="text-gray-300 truncate flex-1">{m.ticker}</span>
+            <span className="text-gray-300 truncate flex-1">{m.title || m.ticker}</span>
             <span className="text-green-400 font-mono ml-2">{m.yes_bid?.toFixed(2) ?? '-'}</span>
             <span className="text-gray-500 mx-1">/</span>
             <span className="text-red-400 font-mono">{m.no_bid?.toFixed(2) ?? '-'}</span>

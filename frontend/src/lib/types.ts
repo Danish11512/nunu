@@ -32,6 +32,13 @@ export const LiveMode = {
 } as const;
 export type LiveMode = (typeof LiveMode)[keyof typeof LiveMode];
 
+/** Cycle mode: live-cycle (continuous) or one-shot (manual trigger) */
+export const CycleMode = {
+  LIVE: "live",
+  ONE_SHOT: "one-shot",
+} as const;
+export type CycleMode = (typeof CycleMode)[keyof typeof CycleMode];
+
 // ============================================================
 // Response Envelope
 // ============================================================
@@ -60,6 +67,7 @@ export interface APIResponse<T> {
 
 export interface ScannerStatus {
   mode: ScannerMode;
+  cycle_mode: CycleMode;
   is_running: boolean;
   connected_to_kalshi: boolean;
   uptime_seconds: number;
@@ -115,6 +123,8 @@ export interface MarketSummary {
 
 export interface EventSummary {
   event_ticker: string;
+  event_title: string;
+  event_sub_title: string;
   market_count: number;
   live_market_count: number;
   total_resting_order_quantity: number;
@@ -252,6 +262,7 @@ export interface UpdateConfigRequest {
 
 export interface ScannerConfigResponse {
   mode: ScannerMode;
+  cycle_mode: CycleMode;
   strategy: {
     name: string | null;
     params: Record<string, unknown>;
@@ -291,6 +302,20 @@ export interface SwitchModeResult {
   switched_at: string;
   requires_auth: boolean;
   auth_configured: boolean;
+}
+
+// ============================================================
+// Cycle Mode Switch
+// ============================================================
+
+export interface SwitchCycleModeRequest {
+  cycle_mode: CycleMode;
+}
+
+export interface SwitchCycleModeResult {
+  previous_mode: string;
+  current_mode: string;
+  switched_at: string;
 }
 
 // ============================================================
@@ -436,6 +461,7 @@ export interface CandidateSummary {
 
 export interface ScannerStatusInfo {
   mode: ScannerMode;
+  cycle_mode: CycleMode;
   is_running: boolean;
   connected_to_kalshi: boolean;
   uptime_seconds: number;

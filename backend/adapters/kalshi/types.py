@@ -74,6 +74,7 @@ def parse_market(raw: dict[str, Any]) -> Market:
         result=raw.get("result"),
         rules_primary=raw.get("rules_primary"),
         rule_key=None,  # Not present in V2 markets response
+        yes_sub_title=raw.get("yes_sub_title", ""),
         volume_24h=_to_int(raw.get("volume_24h_fp")),
         volume_24h_adjusted=None,  # Not present in V2 markets response
     )

@@ -1,7 +1,7 @@
 import { useState, useCallback, useMemo, lazy, Suspense, memo } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { useScannerConfig } from '../hooks/useScannerConfig';
-import { ScannerMode, LiveMode } from '../lib/types';
+import { ScannerMode, LiveMode, CycleMode } from '../lib/types';
 import { ROUTES } from '../lib/routes';
 import ModeSelector from '../components/ModeSelector';
 import ThresholdSlider from '../components/ThresholdSlider';
@@ -10,7 +10,7 @@ const DiagnosticsPanel = lazy(() => import('../components/DiagnosticsPanel'));
 
 function SettingsInner() {
   const navigate = useNavigate();
-  const { config, updateConfig, switchMode } = useScannerConfig();
+  const { config, updateConfig, switchMode, switchCycleMode } = useScannerConfig();
   const [threshold, setThreshold] = useState<number | null>(null);
   const [selectedStrategy, setSelectedStrategy] = useState<string | null>(null);
 
@@ -23,6 +23,9 @@ function SettingsInner() {
     [selectedStrategy, config.data?.strategy.name],
   );
 
+  const currentCycleMode = config.data?.cycle_mode ?? CycleMode.LIVE;
+  const isLiveCycle = currentCycleMode === CycleMode.LIVE;
+
   const handleSave = useCallback(() => {
     updateConfig.mutate({
       threshold_percent: resolvedThreshold,
@@ -34,6 +37,11 @@ function SettingsInner() {
     (mode: LiveMode) => switchMode.mutate({ mode, confirm: true }),
     [switchMode],
   );
+
+  const handleCycleModeToggle = useCallback(() => {
+    const next = isLiveCycle ? CycleMode.ONE_SHOT : CycleMode.LIVE;
+    switchCycleMode.mutate({ cycle_mode: next });
+  }, [isLiveCycle, switchCycleMode]);
 
   const handleStrategyChange = useCallback(
     (e: React.ChangeEvent<HTMLSelectElement>) => setSelectedStrategy(e.target.value),
@@ -81,6 +89,34 @@ function SettingsInner() {
                 hasCredentials={kalshiConnected}
                 switching={switchMode.isPending}
               />
+            </section>
+
+            {/* Cycle Mode Section */}
+            <section className="bg-gray-800 rounded-lg p-5 border border-gray-700">
+              <h2 className="text-lg font-semibold mb-3">Scanner Cycle</h2>
+              <div className="flex items-center justify-between">
+                <div className="flex items-center gap-3">
+                  <span className={`px-2 py-0.5 rounded text-xs font-semibold ${isLiveCycle ? 'bg-green-700 text-green-200' : 'bg-blue-700 text-blue-200'}`}>
+                    {isLiveCycle ? 'Live Cycle' : 'One-Shot'}
+                  </span>
+                  <span className="text-gray-400 text-sm">
+                    {isLiveCycle
+                      ? 'Continuous discovery + progress gate running in background'
+                      : 'Run pipeline once on demand via Start Scanner'}
+                  </span>
+                </div>
+                <button
+                  onClick={handleCycleModeToggle}
+                  disabled={switchCycleMode.isPending}
+                  className="px-4 py-1.5 bg-blue-700 hover:bg-blue-600 disabled:opacity-50 disabled:cursor-not-allowed rounded text-sm"
+                >
+                  {switchCycleMode.isPending
+                    ? 'Switching...'
+                    : isLiveCycle
+                      ? 'Switch to One-Shot'
+                      : 'Switch to Live Cycle'}
+                </button>
+              </div>
             </section>
 
             {/* Strategy Section */}

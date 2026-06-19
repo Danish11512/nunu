@@ -85,6 +85,8 @@ class KalshiClient:
         self, status: str = "open", limit: int = 1000, cursor: str | None = None
     ) -> dict[str, Any]:
         params: dict[str, Any] = {"status": status, "limit": limit}
+        # Exclude multivariate combo markets — they're not simple binary markets
+        params["mve_filter"] = "exclude"
         if cursor:
             params["cursor"] = cursor
         headers = self._sign_headers("GET", "/markets")

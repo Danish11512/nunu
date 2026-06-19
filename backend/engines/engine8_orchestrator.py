@@ -166,6 +166,7 @@ async def run_one_shot(
         t0 = time_module.monotonic()
         events = group_by_event_ticker(live)
         t1 = time_module.monotonic()
+
         stages["E3"] = PipelineStage(stage="E3", label="Grouping", status="done",
                                       input_count=len(live), output_count=len(events),
                                       duration_ms=int((t1 - t0) * 1000))

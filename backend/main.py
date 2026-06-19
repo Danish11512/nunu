@@ -34,6 +34,7 @@ class TradingBot:
         self.portfolio: Any = None
         self.execution_engine: Any = None
         self.mode: str = "dry_run"
+        self.cycle_mode: str = "live"  # "live" or "one-shot"
 
     async def start(self, config_path: str | None = None) -> None:
         """Initialize all dependencies and start background loops."""
@@ -44,12 +45,14 @@ class TradingBot:
         from backend.trading.execution_engine import ExecutionEngine
         from backend.engines.live.discovery_poller import DiscoveryPoller
         from backend.engines.live.progress_gate_loop import ProgressGateLoop
+        from backend.engines.live.price_refresher import PriceRefresher
 
         self.settings = load_settings(config_path)
 
         # Map oneshot → dry_run for API mode consistency
         raw_mode = self.settings.scanner.default_mode
         self.mode = "dry_run" if raw_mode == "oneshot" else raw_mode
+        self.cycle_mode = self.settings.scanner.default_mode if self.settings.scanner.default_mode in ("live", "one-shot") else "live"
 
         # ── Kalshi client ──
         kc = self.settings.kalshi
@@ -80,6 +83,33 @@ class TradingBot:
         await self.execution_engine.start()
 
         # ── Live engine background loops ──
+        self._stop_live: asyncio.Event | None = None
+        self._discovery_poller: DiscoveryPoller | None = None
+        self._progress_gate: ProgressGateLoop | None = None
+        self._live_tasks: list[asyncio.Task] = []
+
+        if self.cycle_mode == "live":
+            await self._start_live_tasks()
+
+        # ── State ──
+        self.scanner_state.started_at = datetime.now(timezone.utc)
+        self.scanner_state.config_snapshot = {
+            "mode": self.mode,
+            "strategy": strategy_name,
+            "threshold": self.settings.scanner.default_threshold,
+        }
+
+        logger.info(f"TradingBot started: mode={self.mode}, cycle_mode={self.cycle_mode}, strategy={strategy_name}")
+
+    async def _start_live_tasks(self) -> None:
+        """Start background discovery poller + progress gate + price refresher loops."""
+        from backend.engines.live.discovery_poller import DiscoveryPoller
+        from backend.engines.live.progress_gate_loop import ProgressGateLoop
+        from backend.engines.live.price_refresher import PriceRefresher
+
+        if self._live_tasks:
+            await self._stop_live_tasks()
+
         self._stop_live = asyncio.Event()
         self._discovery_poller = DiscoveryPoller(
             self.kalshi_adapter, self.scanner_state,
@@ -91,31 +121,34 @@ class TradingBot:
             threshold=self.settings.scanner.default_threshold,
             interval=self.settings.scanner.progress_check_interval_seconds,
         )
+        self._price_refresher = PriceRefresher(
+            self.kalshi_adapter, self.scanner_state,
+            interval=5,
+        )
         self._live_tasks = [
             asyncio.create_task(self._discovery_poller.run(self._stop_live), name="discovery_poller"),
             asyncio.create_task(self._progress_gate.run(self._stop_live), name="progress_gate"),
+            asyncio.create_task(self._price_refresher.run(self._stop_live), name="price_refresher"),
         ]
+        logger.info("Live cycle tasks started")
 
-        # ── State ──
-        self.scanner_state.started_at = datetime.now(timezone.utc)
-        self.scanner_state.config_snapshot = {
-            "mode": self.mode,
-            "strategy": strategy_name,
-            "threshold": self.settings.scanner.default_threshold,
-        }
-
-        logger.info(f"TradingBot started: mode={self.mode}, strategy={strategy_name}")
+    async def _stop_live_tasks(self) -> None:
+        """Stop background discovery poller + progress gate loops."""
+        if self._stop_live:
+            self._stop_live.set()
+        for task in getattr(self, '_live_tasks', []):
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+        self._live_tasks = []
+        self._stop_live = None
+        logger.info("Live cycle tasks stopped")
 
     async def stop(self) -> None:
         """Shut down all components gracefully."""
-        if hasattr(self, '_stop_live'):
-            self._stop_live.set()
-            for task in getattr(self, '_live_tasks', []):
-                task.cancel()
-                try:
-                    await task
-                except asyncio.CancelledError:
-                    pass
+        await self._stop_live_tasks()
         if self.execution_engine:
             await self.execution_engine.stop()
         if self.kalshi_client:

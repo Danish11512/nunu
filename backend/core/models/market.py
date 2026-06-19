@@ -24,6 +24,7 @@ class Market:
     result: str | None  # "yes" | "no" | None (before settlement)
     rules_primary: str | None  # The main "Yes/No" rule
     rule_key: str | None
+    yes_sub_title: str = ""  # Shortened title from Kalshi V2 (e.g. "BTC >$100k 12am EDT")
     volume_24h: int | None = None  # 24-hour volume
     volume_24h_adjusted: int | None = None
 

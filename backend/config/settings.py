@@ -73,7 +73,7 @@ class ScannerConfig(BaseSettings):
 
     # Core settings
     default_mode: str = Field(
-        default="oneshot", alias="SCANNER_DEFAULT_MODE", description="Scanner mode: oneshot or live"
+        default="live", alias="SCANNER_DEFAULT_MODE", description="Scanner mode: oneshot or live"
     )
     default_threshold: int = Field(
         default=65, alias="SCANNER_DEFAULT_THRESHOLD", description="Progress threshold (0-100)"

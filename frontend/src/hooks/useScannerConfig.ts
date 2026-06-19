@@ -1,6 +1,6 @@
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { ScannerAPI } from '../lib/api';
-import type { ScannerConfigResponse, UpdateConfigRequest, SwitchModeRequest } from '../lib/types';
+import type { ScannerConfigResponse, UpdateConfigRequest, SwitchModeRequest, SwitchCycleModeRequest } from '../lib/types';
 
 const api = new ScannerAPI();
 
@@ -34,5 +34,14 @@ export function useScannerConfig() {
     onSuccess: () => queryClient.invalidateQueries({ queryKey: ['config'] }),
   });
 
-  return { config, updateConfig, switchMode };
+  const switchCycleMode = useMutation({
+    mutationFn: async (req: SwitchCycleModeRequest) => {
+      const res = await api.switchCycleMode(req);
+      if (!res.success) throw new Error(res.error?.message ?? 'Failed to switch cycle mode');
+      return res.data;
+    },
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: ['config'] }),
+  });
+
+  return { config, updateConfig, switchMode, switchCycleMode };
 }

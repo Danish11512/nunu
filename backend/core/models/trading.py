@@ -7,6 +7,7 @@ class RankedMarket:
     """A market with its ranking score and price data."""
 
     market_ticker: str
+    title: str
     volume: int
     spread_cents: int
     yes_price: int  # Current yes bid or valuation
@@ -21,6 +22,7 @@ class EventWithTopMarkets:
 
     event_ticker: str
     event_title: str
+    event_sub_title: str = ""
     top_markets: list[RankedMarket] = field(default_factory=list)
     total_volume: int = 0
     num_top_markets: int = 0

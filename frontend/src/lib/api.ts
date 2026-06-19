@@ -17,6 +17,8 @@ import type {
   ScannerConfigResponse,
   SwitchModeRequest,
   SwitchModeResult,
+  SwitchCycleModeRequest,
+  SwitchCycleModeResult,
 } from "./types";
 import { API_BASE } from "./constants";
 
@@ -169,6 +171,12 @@ class ScannerAPI {
 
   async switchMode(req: SwitchModeRequest): Promise<APIResponse<SwitchModeResult>> {
     return this.request<SwitchModeResult>("POST", "/mode", req);
+  }
+
+  // ── Cycle Mode ──────────────────────────────────────────────
+
+  async switchCycleMode(req: SwitchCycleModeRequest): Promise<APIResponse<SwitchCycleModeResult>> {
+    return this.request<SwitchCycleModeResult>("POST", "/scanner/cycle-mode", req);
   }
 }
 

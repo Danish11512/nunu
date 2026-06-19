@@ -24,6 +24,7 @@ def rank_event_markets(
         stats = calculate_orderbook_stats(market, ob)
         ranked.append(RankedMarket(
             market_ticker=market.ticker,
+            title=market.yes_sub_title,
             volume=market.volume,
             spread_cents=stats.spread_cents or 0,
             yes_price=market.yes_bid or 0,
@@ -41,6 +42,7 @@ def rank_event_markets(
     return EventWithTopMarkets(
         event_ticker=event.event_ticker,
         event_title=event.event_title or "",
+        event_sub_title=event.event_sub_title or "",
         top_markets=ranked,
         total_volume=sum(r.volume for r in ranked),
         num_top_markets=len(ranked),

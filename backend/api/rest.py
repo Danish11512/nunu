@@ -121,6 +121,7 @@ async def get_scanner_status(bot: Any = Depends(get_bot)):
     has_creds = bot.kalshi_client.signer is not None if hasattr(bot, "kalshi_client") else False
     return ok({
         "mode": bot.mode,
+        "cycle_mode": bot.cycle_mode,
         "is_running": state.is_running,
         "connected_to_kalshi": has_creds,
         "uptime_seconds": uptime,
@@ -251,7 +252,7 @@ async def list_events(
         for rm in (ev.top_markets or [])[:3]:
             top_mkts.append({
                 "ticker": rm.market_ticker,
-                "title": "",
+                "title": rm.title,
                 "yes_bid": _cents_to_dollars(rm.yes_price) if rm.yes_price else None,
                 "no_bid": _cents_to_dollars(rm.no_price) if rm.no_price else None,
                 "total_resting_order_quantity": float(max(rm.score, 0)),
@@ -261,6 +262,8 @@ async def list_events(
             })
         result.append({
             "event_ticker": ev.event_ticker,
+            "event_title": ev.event_title,
+            "event_sub_title": ev.event_sub_title,
             "market_count": ev.num_top_markets,
             "live_market_count": ev.num_top_markets,
             "total_resting_order_quantity": float(ev.total_volume),
@@ -484,6 +487,7 @@ async def get_config(bot: Any = Depends(get_bot)):
     settings = bot.settings
     return ok({
         "mode": bot.mode,
+        "cycle_mode": bot.cycle_mode,
         "strategy": {
             "name": bot.strategy.name if bot.strategy else None,
             "params": settings.strategy.params,
@@ -563,6 +567,36 @@ async def switch_mode(body: SwitchModeRequest, bot: Any = Depends(get_bot)):
         "switched_at": datetime.now(timezone.utc).isoformat(),
         "requires_auth": body.mode == "live" and not bot.settings.kalshi.private_key,
         "auth_configured": bool(bot.settings.kalshi.private_key),
+    })
+
+
+class CycleModeRequest(BaseModel):
+    """Request body for /scanner/cycle-mode."""
+    cycle_mode: str  # "live" or "one-shot"
+
+
+@router.post("/scanner/cycle-mode")
+async def set_cycle_mode(body: CycleModeRequest, bot: Any = Depends(get_bot)):
+    """14. Switch between live-cycle and one-shot scanner modes."""
+    valid_modes = {"live", "one-shot"}
+    if body.cycle_mode not in valid_modes:
+        return err("INVALID_CYCLE_MODE", f"Cycle mode must be one of: {sorted(valid_modes)}", status_code=400)
+
+    if body.cycle_mode == bot.cycle_mode:
+        return ok({"cycle_mode": bot.cycle_mode, "message": "Already in this mode."})
+
+    old_mode = bot.cycle_mode
+    bot.cycle_mode = body.cycle_mode
+
+    if body.cycle_mode == "live":
+        await bot._start_live_tasks()
+    else:
+        await bot._stop_live_tasks()
+
+    return ok({
+        "previous_mode": old_mode,
+        "current_mode": body.cycle_mode,
+        "switched_at": datetime.now(timezone.utc).isoformat(),
     })
 
 

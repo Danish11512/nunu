@@ -8,6 +8,8 @@ from backend.core.scanner_state import ScannerState
 from backend.engines.engine1_discovery import fetch_all_open_markets
 from backend.engines.engine2_classification import get_same_day_live_markets
 from backend.engines.engine3_grouping import group_by_event_ticker
+from backend.engines.engine4_orderbook import fetch_orderbooks
+from backend.engines.engine5_ranking import rank_all_events
 
 logger = logging.getLogger(__name__)
 ET = ZoneInfo("America/New_York")
@@ -16,6 +18,7 @@ ET = ZoneInfo("America/New_York")
 class DiscoveryPoller:
     """Periodically re-discovers markets and updates state.
     Depends on MarketReader interface, not concrete adapter.
+    Runs E1→E2→E3→E4→E5 each cycle to populate ranked_events.
     """
 
     def __init__(self, client: MarketReader, state: ScannerState, interval: int = 30):
@@ -31,11 +34,24 @@ class DiscoveryPoller:
         while not stop_event.is_set():
             try:
                 now = datetime.now(ET)
+
+                # E1: Discovery
                 markets = await fetch_all_open_markets(self.client)
+
+                # E2: Classification
                 _, live = get_same_day_live_markets(markets, now)
+
+                # E3: Grouping
                 events = group_by_event_ticker(live)
 
-                # Diff with current state
+                # E4: Orderbook fetch
+                event_books = await fetch_orderbooks(events, self.client)
+
+                # E5: Ranking → populate ranked_events for ProgressGateLoop
+                ranked_events = rank_all_events(event_books)
+                self.state.ranked_events = ranked_events
+
+                # Diff with current classified_events state
                 current_tickers = set(self.state.classified_events.keys())
                 new_tickers = {e.event_ticker for e in events}
 
@@ -51,7 +67,10 @@ class DiscoveryPoller:
                 self.state.classified_events = {e.event_ticker: e for e in events}
                 self.state.last_discovery = now
 
-                logger.info(f"Discovery: {len(live)} live markets, {len(events)} events. +{len(added)} -{len(removed)}")
+                logger.info(
+                    f"Discovery: {len(live)} live markets, {len(events)} events, "
+                    f"{len(ranked_events)} ranked. +{len(added)} -{len(removed)}"
+                )
 
                 # Broadcast discovery cycle update
                 from backend.api.websocket_handler import manager  # lazy import
