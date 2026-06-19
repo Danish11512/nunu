@@ -119,6 +119,7 @@ export interface MarketSummary {
   yes_order_quantity: number;
   no_order_quantity: number;
   volume_24h: number;
+  last_price_update: string | null;
 }
 
 export interface EventSummary {

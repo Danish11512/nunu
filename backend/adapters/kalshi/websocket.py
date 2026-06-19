@@ -7,17 +7,19 @@ from typing import Any, Awaitable, Callable
 
 import websockets
 
-from .auth import KalshiSigner  # PKCS1v15 signer — correct for WS auth
+from backend.utils.auth_utils import KalshiSigner  # RSA-PSS signer for WS
 
 logger = logging.getLogger(__name__)
 
 
 class KalshiWebSocket:
-    """WebSocket client for Kalshi real-time updates (PKCS1v15 auth).
+    """WebSocket client for Kalshi real-time updates (RSA-PSS auth).
 
-    Uses :class:`.auth.KalshiSigner` for connect authentication headers.
+    Uses :class:`backend.utils.auth_utils.KalshiSigner` (RSA-PSS) for
+    connect authentication headers — same signing as REST API.
     Each callback is wrapped in try/except so one bad handler doesn't
     break the listen loop. On reconnect, subscribed tickers are re-sent.
+    Reconnect uses exponential backoff (1s→60s cap) with jitter.
     """
 
     def __init__(
@@ -27,20 +29,30 @@ class KalshiWebSocket:
         private_key: str = "",
     ):
         self.url = url
-        self._signer = KalshiSigner(api_key_id=api_key_id, private_key_pem=private_key)
+        self._api_key_id = api_key_id
+        self._signer = KalshiSigner(private_key_pem=private_key) if private_key else None
         self._ws: websockets.WebSocketClientProtocol | None = None
         self._running = False
         self._callbacks: list[Callable[[dict[str, Any]], Awaitable[None]]] = []
         self._subscribed_tickers: list[str] = []
+        self._reconnect_delay = 1.0
 
     def on_message(self, callback: Callable[[dict[str, Any]], Awaitable[None]]) -> None:
         """Register a callback invoked on each decoded message."""
         self._callbacks.append(callback)
 
     async def connect(self) -> None:
-        """Connect with PKCS1v15 API key auth via headers."""
-        headers = self._signer.get_headers("GET", "/trade-api/ws/v2")
-        self._ws = await websockets.connect(self.url, additional_headers=headers)
+        """Connect with RSA-PSS API key auth via headers."""
+        import time
+        ts = str(int(time.time() * 1000))  # epoch ms — WS expects ms, not ISO
+        message = ts + "GET" + "/trade-api/ws/v2"
+        sig = self._signer.sign(message) if self._signer else ""
+        headers = {
+            "KALSHI-ACCESS-KEY": self._api_key_id,
+            "KALSHI-ACCESS-SIGNATURE": sig,
+            "KALSHI-ACCESS-TIMESTAMP": ts,
+        }
+        self._ws = await websockets.connect(self.url, extra_headers=headers)
         logger.info("WebSocket connected to %s", self.url)
 
     async def subscribe(self, tickers: list[str]) -> None:
@@ -61,7 +73,13 @@ class KalshiWebSocket:
         logger.info("Subscribed to %d tickers.", len(tickers))
 
     async def listen(self) -> None:
-        """Listen loop with callback isolation, reconnect, and re-subscribe."""
+        """Listen loop with callback isolation, reconnect, and re-subscribe.
+
+        Reconnect uses exponential backoff (1s→60s cap) with jitter.
+        Resets delay on successful reconnection.
+        """
+        import random
+
         self._running = True
         while self._running:
             try:
@@ -77,12 +95,21 @@ class KalshiWebSocket:
                             "WebSocket callback error: %s", exc, exc_info=True
                         )
 
+                # Reset delay on successful recv
+                self._reconnect_delay = 1.0
+
             except websockets.exceptions.ConnectionClosed:
-                logger.warning("WebSocket disconnected. Reconnecting in 5s...")
-                await asyncio.sleep(5)
+                delay = min(self._reconnect_delay, 60.0)
+                jitter = random.uniform(0.5, 1.5)
+                sleep_time = delay * jitter
+                logger.warning(
+                    "WebSocket disconnected. Reconnecting in %.1fs...", sleep_time
+                )
+                await asyncio.sleep(sleep_time)
                 if not self._running:
                     break
                 await self._reconnect()
+                self._reconnect_delay = min(delay * 2, 60.0)
 
             except Exception as exc:
                 logger.error("WebSocket listen error: %s", exc, exc_info=True)

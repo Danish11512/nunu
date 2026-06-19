@@ -16,10 +16,22 @@ let pingTimer: ReturnType<typeof setInterval> | null = null;
 
 interface WSStore {
   connectedChannels: Record<string, boolean>;
+  /** Last price:changed timestamp (epoch ms) per market ticker */
+  priceTimestamps: Record<string, number>;
+  /** Last event:updated timestamp (epoch ms) per event ticker */
+  eventTimestamps: Record<string, number>;
+  setPriceTimestamp: (ticker: string, ts: number) => void;
+  setEventTimestamp: (eventTicker: string, ts: number) => void;
 }
 
-const useWSStore = create<WSStore>(() => ({
+const useWSStore = create<WSStore>((set) => ({
   connectedChannels: {},
+  priceTimestamps: {},
+  eventTimestamps: {},
+  setPriceTimestamp: (ticker, ts) =>
+    set((s) => ({ priceTimestamps: { ...s.priceTimestamps, [ticker]: ts } })),
+  setEventTimestamp: (eventTicker, ts) =>
+    set((s) => ({ eventTimestamps: { ...s.eventTimestamps, [eventTicker]: ts } })),
 }));
 
 // ── Ping ──
@@ -137,7 +149,7 @@ export function unregisterListener(channel: string) {
 
 // ── App-level initialization ──
 
-const WS_CHANNELS = ['scanner', 'events', 'candidates', 'trades'] as const;
+const WS_CHANNELS = ['scanner', 'events', 'candidates', 'trades', 'prices'] as const;
 let initialized = false;
 
 /** Pre-connect all WS channels at app startup. After this, hooks only
@@ -151,3 +163,15 @@ export function initialize() {
 }
 
 export { useWSStore };
+
+// ── Timestamp getters (non-reactive — read latest values without subscribing) ──
+
+/** Last price:changed timestamp for a ticker (epoch ms), or undefined. */
+export function getPriceTimestamp(ticker: string): number | undefined {
+  return useWSStore.getState().priceTimestamps[ticker];
+}
+
+/** Last event:updated timestamp for an event ticker (epoch ms), or undefined. */
+export function getEventTimestamp(eventTicker: string): number | undefined {
+  return useWSStore.getState().eventTimestamps[eventTicker];
+}

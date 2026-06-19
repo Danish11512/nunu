@@ -86,3 +86,8 @@ async def ws_candidates(ws: WebSocket):
 @router.websocket("/ws/trades")
 async def ws_trades(ws: WebSocket):
     await _ping_loop("trades", ws)
+
+
+@router.websocket("/ws/prices")
+async def ws_prices(ws: WebSocket):
+    await _ping_loop("prices", ws)

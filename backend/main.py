@@ -35,6 +35,10 @@ class TradingBot:
         self.execution_engine: Any = None
         self.mode: str = "dry_run"
         self.cycle_mode: str = "live"  # "live" or "one-shot"
+        self.price_tracker: Any = None
+        self._ws_client: Any = None
+        self._ws_subscription_task: asyncio.Task | None = None
+        self._ws_listen_task: asyncio.Task | None = None
 
     async def start(self, config_path: str | None = None) -> None:
         """Initialize all dependencies and start background loops."""
@@ -82,6 +86,28 @@ class TradingBot:
         )
         await self.execution_engine.start()
 
+        # ── Price Change Tracker ──
+        from backend.trading.price_tracker import PriceChangeTracker
+        from backend.api.websocket_handler import manager
+
+        async def _broadcast_price_changes(changes):
+            """Broadcast price changes via WebSocket ``prices`` channel."""
+            for c in changes:
+                await manager.broadcast("prices", "price:changed", {
+                    "ticker": c.ticker,
+                    "field": c.field,
+                    "old_value": c.old_value,
+                    "new_value": c.new_value,
+                    "delta": c.delta,
+                    "timestamp": c.timestamp.isoformat() if c.timestamp else None,
+                })
+
+        self.price_tracker = PriceChangeTracker(on_change=_broadcast_price_changes)
+
+        # ── Kalshi WebSocket (orderbook_delta) ──
+        self._ws_client = None
+        await self._start_ws_price_feed()
+
         # ── Live engine background loops ──
         self._stop_live: asyncio.Event | None = None
         self._discovery_poller: DiscoveryPoller | None = None
@@ -100,6 +126,98 @@ class TradingBot:
         }
 
         logger.info(f"TradingBot started: mode={self.mode}, cycle_mode={self.cycle_mode}, strategy={strategy_name}")
+
+    async def _start_ws_price_feed(self) -> None:
+        """Connect Kalshi WebSocket for real-time orderbook_delta prices."""
+        try:
+            kc = self.settings.kalshi
+            if not kc.key_id or not kc.private_key:
+                logger.warning("No Kalshi credentials — WS price feed disabled")
+                return
+
+            from backend.adapters.kalshi.websocket import KalshiWebSocket
+            self._ws_client = KalshiWebSocket(
+                url=kc.ws_base_url,
+                api_key_id=kc.key_id,
+                private_key=kc.private_key,
+            )
+
+            async def _on_ws_message(data: dict) -> None:
+                """Handle orderbook_delta WS message → feed into price tracker."""
+                msg_type = data.get("type", "")
+                if msg_type == "orderbook_delta":
+                    ticker = data.get("market_ticker", "")
+                    yes_data = data.get("yes", {}) or {}
+                    no_data = data.get("no", {}) or {}
+                    await self.price_tracker.ingest(
+                        ticker=ticker,
+                        yes_bid=yes_data.get("bid"),
+                        yes_ask=yes_data.get("ask"),
+                        no_bid=no_data.get("bid"),
+                        no_ask=no_data.get("ask"),
+                        source="ws",
+                    )
+
+            self._ws_client.on_message(_on_ws_message)
+            await self._ws_client.connect()
+
+            # Subscribe to markets that are already discovered
+            self._ws_subscription_task = asyncio.create_task(
+                self._ws_subscription_loop()
+            )
+
+            # Start listen loop as background task
+            self._ws_listen_task = asyncio.create_task(
+                self._ws_client.listen()
+            )
+
+            logger.info("Kalshi WebSocket price feed connected")
+        except Exception as e:
+            logger.warning(f"Failed to start WS price feed: {e}")
+            self._ws_client = None
+
+    async def _ws_subscription_loop(self) -> None:
+        """Periodically check for new market tickers and subscribe via WS."""
+        if self._ws_client is None:
+            return
+        while True:
+            try:
+                # Collect all tracked market tickers from scanner state
+                tickers = set()
+                for ev in self.scanner_state.ranked_events:
+                    for rm in (ev.top_markets or []):
+                        tickers.add(rm.market_ticker)
+
+                if tickers and self._ws_client is not None:
+                    await self._ws_client.subscribe(list(tickers))
+                    logger.info("WS subscribed to %d market tickers", len(tickers))
+                    await asyncio.sleep(60)
+                else:
+                    await asyncio.sleep(10)
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.warning("WS subscription loop error: %s", e)
+                await asyncio.sleep(10)
+
+    async def _stop_ws_price_feed(self) -> None:
+        """Disconnect Kalshi WebSocket."""
+        # Cancel background tasks
+        for task_name in ("_ws_subscription_task", "_ws_listen_task"):
+            task = getattr(self, task_name, None)
+            if task and not task.done():
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+        # Close WS connection
+        if self._ws_client:
+            try:
+                await self._ws_client.close()
+            except Exception as e:
+                logger.warning(f"WS close error: {e}")
+            self._ws_client = None
 
     async def _start_live_tasks(self) -> None:
         """Start background discovery poller + progress gate + price refresher loops."""
@@ -124,6 +242,7 @@ class TradingBot:
         self._price_refresher = PriceRefresher(
             self.kalshi_adapter, self.scanner_state,
             interval=5,
+            price_tracker=self.price_tracker,
         )
         self._live_tasks = [
             asyncio.create_task(self._discovery_poller.run(self._stop_live), name="discovery_poller"),
@@ -148,6 +267,7 @@ class TradingBot:
 
     async def stop(self) -> None:
         """Shut down all components gracefully."""
+        await self._stop_ws_price_feed()
         await self._stop_live_tasks()
         if self.execution_engine:
             await self.execution_engine.stop()

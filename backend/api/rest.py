@@ -61,14 +61,11 @@ class SwitchModeRequest(BaseModel):
 
 # ── Helpers ────────────────────────────────────────────────────────────
 
-
-def _cents_to_dollars(cents: int) -> float:
-    """Convert integer cents to float dollars."""
-    return round(cents / 100.0, 2)
+from backend.utils.price_utils import cents_to_dollars
 
 
 def _cents_or_none(val: int | None) -> float | None:
-    return _cents_to_dollars(val) if val is not None else None
+    return cents_to_dollars(val)
 
 
 def _serialize_ranked_market(rm: Any) -> dict:
@@ -78,8 +75,8 @@ def _serialize_ranked_market(rm: Any) -> dict:
         "spread_cents": rm.spread_cents,
         "yes_price_cents": rm.yes_price,
         "no_price_cents": rm.no_price,
-        "yes_price": _cents_to_dollars(rm.yes_price),
-        "no_price": _cents_to_dollars(rm.no_price),
+        "yes_price": cents_to_dollars(rm.yes_price),
+        "no_price": cents_to_dollars(rm.no_price),
         "rank": rm.rank,
         "score": rm.score,
     }
@@ -92,7 +89,7 @@ def _serialize_candidate(c: Any) -> dict:
         "market_ticker": oc.market_ticker,
         "side": oc.side,
         "price_cents": oc.price,
-        "price": _cents_to_dollars(oc.price),
+        "price": cents_to_dollars(oc.price),
         "confidence": oc.confidence,
         "volume": oc.volume,
         "progress_pct": oc.progress_pct,
@@ -100,9 +97,9 @@ def _serialize_candidate(c: Any) -> dict:
         "validation_errors": c.validation_errors,
         "risk_score": c.risk_score,
         "estimated_entry_price_cents": c.estimated_entry_price,
-        "estimated_entry_price": _cents_to_dollars(c.estimated_entry_price),
+        "estimated_entry_price": cents_to_dollars(c.estimated_entry_price),
         "estimated_exit_price_cents": c.estimated_exit_price,
-        "estimated_exit_price": _cents_to_dollars(c.estimated_exit_price),
+        "estimated_exit_price": cents_to_dollars(c.estimated_exit_price),
         "max_contracts": c.max_contracts,
     }
 
@@ -244,6 +241,15 @@ async def list_events(
     elif sort_by in ("volume", "score", "total_orders"):
         events.sort(key=lambda e: e.total_volume, reverse=True)
 
+    # Build price-timestamp lookup from price tracker
+    tracker = getattr(bot, "price_tracker", None)
+    price_timestamps: dict[str, str] = {}
+    if tracker:
+        for ticker, info in tracker.summary.items():
+            ts = info.get("last_updated")
+            if ts:
+                price_timestamps[ticker] = ts
+
     result = []
     for ev in events:
         progress = ev.top_markets[0].score if ev.top_markets else 0.0
@@ -253,12 +259,13 @@ async def list_events(
             top_mkts.append({
                 "ticker": rm.market_ticker,
                 "title": rm.title,
-                "yes_bid": _cents_to_dollars(rm.yes_price) if rm.yes_price else None,
-                "no_bid": _cents_to_dollars(rm.no_price) if rm.no_price else None,
+                "yes_bid": cents_to_dollars(rm.yes_price),
+                "no_bid": cents_to_dollars(rm.no_price),
                 "total_resting_order_quantity": float(max(rm.score, 0)),
                 "yes_order_quantity": 0.0,
                 "no_order_quantity": 0.0,
                 "volume_24h": float(rm.volume),
+                "last_price_update": price_timestamps.get(rm.market_ticker),
             })
         result.append({
             "event_ticker": ev.event_ticker,
@@ -317,11 +324,11 @@ async def get_event_orderbook(
     orderbook = parse_orderbook(raw, market_ticker)
 
     yes_bids = [
-        {"price": _cents_to_dollars(l.price), "price_cents": l.price, "count": l.count}
+        {"price": cents_to_dollars(l.price), "price_cents": l.price, "count": l.count}
         for l in orderbook.yes_side[:max_levels]
     ]
     no_bids = [
-        {"price": _cents_to_dollars(l.price), "price_cents": l.price, "count": l.count}
+        {"price": cents_to_dollars(l.price), "price_cents": l.price, "count": l.count}
         for l in orderbook.no_side[:max_levels]
     ]
 
@@ -407,7 +414,7 @@ async def approve_candidate(
         "market_ticker": exec_candidate.market_ticker,
         "side": exec_candidate.side,
         "price_cents": exec_candidate.price,
-        "price": _cents_to_dollars(exec_candidate.price),
+        "price": cents_to_dollars(exec_candidate.price),
         "volume": exec_candidate.volume,
         "approved": True,
     })
@@ -461,9 +468,9 @@ async def list_trades(
             "market_ticker": t.market_ticker,
             "side": t.side,
             "entry_price_cents": t.entry_price,
-            "entry_price": _cents_to_dollars(t.entry_price),
+            "entry_price": cents_to_dollars(t.entry_price),
             "exit_price_cents": t.exit_price,
-            "exit_price": _cents_or_none(t.exit_price),
+            "exit_price": cents_to_dollars(t.exit_price),
             "quantity": t.quantity,
             "entry_time": t.entry_time.isoformat() if t.entry_time else None,
             "exit_time": t.exit_time.isoformat() if t.exit_time else None,
@@ -570,6 +577,16 @@ async def switch_mode(body: SwitchModeRequest, bot: Any = Depends(get_bot)):
     })
 
 
+class PriceWebhookRequest(BaseModel):
+    """Inbound price update from external webhook."""
+    ticker: str
+    yes_bid: int | None = None
+    yes_ask: int | None = None
+    no_bid: int | None = None
+    no_ask: int | None = None
+    source: str = "webhook"
+
+
 class CycleModeRequest(BaseModel):
     """Request body for /scanner/cycle-mode."""
     cycle_mode: str  # "live" or "one-shot"
@@ -598,6 +615,95 @@ async def set_cycle_mode(body: CycleModeRequest, bot: Any = Depends(get_bot)):
         "current_mode": body.cycle_mode,
         "switched_at": datetime.now(timezone.utc).isoformat(),
     })
+
+
+@router.post("/webhooks/price-update")
+async def webhook_price_update(body: PriceWebhookRequest, bot: Any = Depends(get_bot)):
+    """15. Webhook endpoint for external price update notifications.
+
+    Accepts price changes from external sources (or Kalshi callback),
+    feeds them through the PriceChangeTracker, and broadcasts via WS.
+    """
+    tracker = getattr(bot, "price_tracker", None)
+    if tracker is None:
+        return err("TRACKER_UNAVAILABLE", "Price tracker not initialized.", status_code=503)
+
+    changes = await tracker.ingest(
+        ticker=body.ticker,
+        yes_bid=body.yes_bid,
+        yes_ask=body.yes_ask,
+        no_bid=body.no_bid,
+        no_ask=body.no_ask,
+        source=body.source,
+    )
+
+    return ok({
+        "ticker": body.ticker,
+        "changes_detected": len(changes),
+        "changes": [
+            {
+                "field": c.field,
+                "old_value": c.old_value,
+                "new_value": c.new_value,
+                "delta": c.delta,
+            }
+            for c in changes
+        ],
+    })
+
+
+@router.get("/prices")
+async def list_prices(
+    ticker: str | None = Query(None, description="Filter by market ticker"),
+    bot: Any = Depends(get_bot),
+):
+    """16. Return latest tracked prices for all (or one) tickers."""
+    tracker = getattr(bot, "price_tracker", None)
+    if tracker is None:
+        return err("TRACKER_UNAVAILABLE", "Price tracker not initialized.", status_code=503)
+
+    if ticker:
+        snap = tracker.get_latest(ticker)
+        if snap is None:
+            return err("NOT_FOUND", f"No prices for ticker {ticker!r}.", status_code=404)
+        return ok({
+            "ticker": snap.ticker,
+            "yes_bid": snap.yes_bid,
+            "yes_ask": snap.yes_ask,
+            "no_bid": snap.no_bid,
+            "no_ask": snap.no_ask,
+            "timestamp": snap.timestamp.isoformat() if snap.timestamp else None,
+        })
+
+    return ok(tracker.summary)
+
+
+@router.get("/prices/{ticker}/history")
+async def get_price_history(
+    ticker: str,
+    limit: int = Query(10, description="Max history entries"),
+    bot: Any = Depends(get_bot),
+):
+    """17. Return price history for a specific ticker."""
+    tracker = getattr(bot, "price_tracker", None)
+    if tracker is None:
+        return err("TRACKER_UNAVAILABLE", "Price tracker not initialized.", status_code=503)
+
+    hist = tracker.get_history(ticker, limit=limit)
+    if not hist:
+        return err("NOT_FOUND", f"No history for ticker {ticker!r}.", status_code=404)
+
+    return ok([
+        {
+            "ticker": s.ticker,
+            "yes_bid": s.yes_bid,
+            "yes_ask": s.yes_ask,
+            "no_bid": s.no_bid,
+            "no_ask": s.no_ask,
+            "timestamp": s.timestamp.isoformat() if s.timestamp else None,
+        }
+        for s in hist
+    ])
 
 
 @router.get("/scanner/progress")

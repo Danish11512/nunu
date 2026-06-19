@@ -31,6 +31,7 @@ class DiscoveryPoller:
         self._on_new_events_callbacks.append(callback)
 
     async def run(self, stop_event: asyncio.Event):
+        self.state.is_running = True
         while not stop_event.is_set():
             try:
                 now = datetime.now(ET)
@@ -85,6 +86,6 @@ class DiscoveryPoller:
                     logger.warning("Failed to broadcast discovery cycle", exc_info=True)
 
             except Exception as e:
-                logger.error(f"Discovery poller error: {e}")
+                logger.error("Discovery poller error: %s", e, exc_info=True)
 
             await asyncio.sleep(self.interval)

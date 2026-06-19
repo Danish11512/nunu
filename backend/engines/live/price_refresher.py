@@ -3,6 +3,7 @@
 import asyncio
 import logging
 from datetime import datetime, timezone
+from typing import Any
 
 from backend.core.interfaces.adapter import MarketReader
 from backend.core.scanner_state import ScannerState
@@ -11,8 +12,7 @@ from backend.engines.engine5_ranking import rank_event_markets
 logger = logging.getLogger(__name__)
 
 
-def _cents_to_dollars(cents: int) -> float:
-    return round(cents / 100.0, 2)
+from backend.utils.price_utils import cents_to_dollars
 
 
 class PriceRefresher:
@@ -28,11 +28,13 @@ class PriceRefresher:
         state: ScannerState,
         interval: int = 5,
         top_n: int = 3,
+        price_tracker: Any = None,
     ):
         self.client = client
         self.state = state
         self.interval = interval
         self.top_n = top_n
+        self.price_tracker = price_tracker
 
     async def run(self, stop_event: asyncio.Event) -> None:
         while not stop_event.is_set():
@@ -74,6 +76,23 @@ class PriceRefresher:
                 try:
                     raw = await self.client.fetch_orderbook(ticker)
                     ob = parse_orderbook(raw, ticker)
+                    # Feed into price tracker (poll source)
+                    if self.price_tracker is not None:
+                        yes_bid = ob.yes_side[0].price if ob.yes_side else None
+                        yes_ask = ob.yes_side[-1].price if ob.yes_side else None
+                        no_bid = ob.no_side[0].price if ob.no_side else None
+                        no_ask = ob.no_side[-1].price if ob.no_side else None
+                        try:
+                            await self.price_tracker.ingest(
+                                ticker=ticker,
+                                yes_bid=yes_bid,
+                                yes_ask=yes_ask,
+                                no_bid=no_bid,
+                                no_ask=no_ask,
+                                source="poll",
+                            )
+                        except Exception:
+                            logger.warning("Price tracker ingest failed for %s", ticker)
                     return ticker, ob
                 except Exception as e:
                     logger.warning(f"Price refresh OB fetch failed for {ticker}: {e}")
@@ -122,8 +141,8 @@ class PriceRefresher:
                 top_mkts.append({
                     "ticker": rm.market_ticker,
                     "title": rm.title,
-                    "yes_bid": _cents_to_dollars(rm.yes_price) if rm.yes_price else None,
-                    "no_bid": _cents_to_dollars(rm.no_price) if rm.no_price else None,
+                    "yes_bid": cents_to_dollars(rm.yes_price),
+                    "no_bid": cents_to_dollars(rm.no_price),
                     "total_resting_order_quantity": float(max(rm.score, 0)),
                     "yes_order_quantity": 0.0,
                     "no_order_quantity": 0.0,
