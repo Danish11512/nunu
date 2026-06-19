@@ -53,6 +53,18 @@ class DiscoveryPoller:
 
                 logger.info(f"Discovery: {len(live)} live markets, {len(events)} events. +{len(added)} -{len(removed)}")
 
+                # Broadcast discovery cycle update
+                from backend.api.websocket_handler import manager  # lazy import
+                try:
+                    await manager.broadcast("scanner", "scanner:discovery_cycle", {
+                        "total_markets": len(live),
+                        "total_events": len(events),
+                        "added": len(added),
+                        "removed": len(removed),
+                    })
+                except Exception:
+                    logger.warning("Failed to broadcast discovery cycle", exc_info=True)
+
             except Exception as e:
                 logger.error(f"Discovery poller error: {e}")
 

@@ -8,7 +8,7 @@ const PING_INTERVAL_MS = 30_000;
 // a reactive store. The store only exposes the reactive derived state (connection
 // status) that React components care about.
 const sockets = new Map<string, WebSocket>();
-const listeners = new Map<string, (msg: WSMessage) => void>();
+const listeners = new Map<string, Set<(msg: WSMessage) => void>>();
 const reconnectTimers = new Map<string, ReturnType<typeof setTimeout>>();
 let pingTimer: ReturnType<typeof setInterval> | null = null;
 
@@ -53,9 +53,19 @@ export function connect(channel: string, onClose?: () => void) {
   };
 
   ws.onmessage = (event) => {
-    const msg: WSMessage = JSON.parse(event.data);
+    let msg: WSMessage;
+    try {
+      msg = JSON.parse(event.data);
+    } catch (e) {
+      return;
+    }
     if (msg.type === 'pong') return;
-    listeners.get(channel)?.(msg);
+    const cbs = listeners.get(channel);
+    if (cbs) {
+      cbs.forEach(cb => {
+        try { cb(msg); } catch (e) { console.warn(`WS listener error on ${channel}:`, e); }
+      });
+    }
   };
 
   ws.onclose = () => {
@@ -113,8 +123,12 @@ export function cancelReconnect(channel: string) {
 
 // ── Listeners ──
 
-export function registerListener(channel: string, cb: (msg: WSMessage) => void) {
-  listeners.set(channel, cb);
+export function registerListener(channel: string, cb: (msg: WSMessage) => void): () => void {
+  if (!listeners.has(channel)) {
+    listeners.set(channel, new Set());
+  }
+  listeners.get(channel)!.add(cb);
+  return () => { listeners.get(channel)?.delete(cb); };
 }
 
 export function unregisterListener(channel: string) {

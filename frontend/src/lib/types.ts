@@ -302,3 +302,104 @@ export interface WSMessage<T = unknown> {
   data: T;
   timestamp: string;
 }
+
+// ── Phase 11: Scanner / Pipeline Diagnostics ──
+
+export type PipelineStageStatus = 'pending' | 'running' | 'done' | 'error' | 'skipped';
+
+export interface PipelineStageInfo {
+  stage: string;
+  label: string;
+  status: PipelineStageStatus;
+  input_count: number;
+  output_count: number;
+  duration_ms: number;
+  error: string | null;
+}
+
+export interface PipelineCycleInfo {
+  cycle_id: number;
+  status: 'running' | 'completed' | 'error';
+  stages: Record<string, PipelineStageInfo>;
+  started_at: string | null;
+  completed_at: string | null;
+  total_markets_discovered: number;
+  total_events_active: number;
+  total_candidates_found: number;
+}
+
+export interface ApiTraceInfo {
+  method: string;
+  path: string;
+  status: number;
+  duration_ms: number;
+  rate_remaining: number | null;
+  timestamp: string;
+  error: string | null;
+}
+
+export interface ScannerProgressResponse {
+  success: boolean;
+  data: PipelineCycleInfo | null;
+}
+
+export interface WsScannerStarted {
+  type: 'scanner:started';
+  cycle_id: number;
+  started_at: string;
+}
+
+export interface WsScannerStageUpdate {
+  type: 'scanner:stage_update';
+  cycle_id: number;
+  stage: string;
+  label: string;
+  status: PipelineStageStatus;
+  input_count: number;
+  output_count: number;
+  duration_ms: number;
+  error: string | null;
+}
+
+export interface WsScannerCompleted {
+  type: 'scanner:completed';
+  cycle_id: number;
+  completed_at: string;
+  total_duration_ms: number;
+  total_markets: number;
+  total_events: number;
+  total_candidates: number;
+}
+
+export interface WsScannerError {
+  type: 'scanner:error';
+  cycle_id: number;
+  error: string;
+}
+
+export interface WsScannerApiBatch {
+  type: 'scanner:api_batch';
+  data: ApiTraceInfo[];
+}
+
+export interface WsDiscoveryCycle {
+  type: 'scanner:discovery_cycle';
+  total_markets: number;
+  total_events: number;
+  added: number;
+  removed: number;
+}
+
+export interface WsProgressCycle {
+  type: 'scanner:progress_cycle';
+  events_checked: number;
+}
+
+export type WsScannerMessage =
+  | WsScannerStarted
+  | WsScannerStageUpdate
+  | WsScannerCompleted
+  | WsScannerError
+  | WsScannerApiBatch
+  | WsDiscoveryCycle
+  | WsProgressCycle;

@@ -28,16 +28,16 @@ cp .env.example .env
 # 6. Follow phases below — each tells you what to build and how to verify
 ```
 
-> **⚠️ Implementation status (2026-06-18):** Phases 0–8 are complete.
-> Phase 9 (Frontend Pages — Dashboard + Settings) is complete.
-> Phase 10 (Frontend Components + API Contract Alignment + App-level WebSocket Handshake) is complete.
->   - Badge, ConfirmDialog, ProgressBar, ThresholdSlider, ModeSelector
->   - API contract alignment: frontend `types.ts` refactored to match actual backend Pydantic response shapes
->   - App-level WebSocket via Zustand: `wsStore.ts` manages connections at app startup, hooks only listen
->   - Vite proxy config (`/api` → `localhost:8000` with `ws: true`) for unified dev server
->   - Backend websocket_handler DRYed with shared `_ping_loop` + `pong` replies
-> Phase 11 (Test Infrastructure) — **not yet implemented**.
-> Phase 12 (Docker + Integration) — **not yet implemented**.
+> **⚠️ Implementation status (2026-06-18):** Phases 0–10 are complete.
+> 
+> > **Phase 11 (Pipeline Diagnostics Panel — spec complete 2026-06-18):**
+> > A live diagnostics console in the Settings page that surfaces the scanner pipeline
+> > stage-by-stage (E1→E7) and backend HTTP request traces — all pushed in real-time
+> > over the existing `scanner` WebSocket channel. Full spec in Phase 11 below.
+> > **Not yet implemented** — this is the next build target.
+> 
+> Phase 12 (Test Infrastructure) — **not yet implemented**.
+> Phase 13 (Docker + Integration) — **not yet implemented**.
 >
 > **Pipeline bugfix — Kalshi API V2 field name alignment (2026-06-19):**
 > `parse_market()` in `backend/adapters/kalshi/types.py` was using V1 API field names
@@ -97,7 +97,7 @@ Every file below is referenced from this build plan. Read them alongside the cor
 ## Build Execution Order (54 Steps)
 
 Phases build in dependency order. Within each phase, create files in the order listed.
-For the full detailed step list with pseudocode references, see the [Full Build Execution Order](#full-build-execution-order-54-steps) section at the end.
+For the full detailed step list with pseudocode references, see the [Full Build Execution Order](#full-build-execution-order-62-steps) section at the end.
 
 **Quick reference:**
 ```
@@ -112,8 +112,9 @@ Phase 7:  API Layer (DRY errors.py)                — Steps 52–54     ✅
 Phase 8:  Frontend lib (Types + API Client)         — Steps 55–56     ✅
 Phase 9:  Frontend Hooks + Pages                    — Steps 57–66     ✅
 Phase 10: Frontend Components + API Alignment       — Steps 67–76     ✅
-Phase 11: Test Infrastructure                       — After all steps ⬜
-Phase 12: Docker + Integration                      — After all steps ⬜
+Phase 11: Pipeline Diagnostics Panel                — Steps 77–84     📋
+Phase 12: Test Infrastructure                       — After all steps ⬜
+Phase 13: Docker + Integration                      — After all steps ⬜
 ```
 
 ### Dependency Graph
@@ -143,9 +144,11 @@ Phase 1: Core (models, interfaces, state)
                                                     │
                                             Phase 10: Frontend Components + API Alignment
                                                     │
-                                            Phase 11: Test Infrastructure
+                                            Phase 11: Pipeline Diagnostics Panel
                                                     │
-                                            Phase 12: Docker + Integration
+                                            Phase 12: Test Infrastructure
+                                                    │
+                                            Phase 13: Docker + Integration
 ```
 
 ---
@@ -4969,9 +4972,540 @@ Beyond the components above, Phase 10 included critical integration work:
 
 ---
 
-## Phase 11: Test Infrastructure (⬜ Not Yet Implemented)
+## Phase 11: Pipeline Diagnostics Panel (📋 Spec Complete — Not Yet Implemented)
 
-### 11.1 — Test setup
+**Commit:** _TBD_
+
+**Goal:** A live diagnostics console in the Settings page that surfaces the scanner pipeline stage-by-stage (E1→E7) and backend HTTP request traces — all pushed in real-time over the existing `scanner` WebSocket channel. This makes the backend's internal workflow observable from the frontend.
+
+### 11.1 — Backend: Pipeline progress broadcast model
+
+Create `backend/models/scanner_progress.py` with:
+
+```python
+@dataclass
+class PipelineStage:
+    stage: str          # "E1" through "E7"
+    label: str          # "Discovery", "Classification", "Grouping", "Orderbook", "Ranking", "Progress Gate", "Validation"
+    status: str         # "pending" | "running" | "done" | "error" | "skipped" (never ran because pipeline exited early)
+    input_count: int = 0
+    output_count: int = 0
+    duration_ms: int = 0
+    error: str | None = None
+
+@dataclass
+class PipelineCycle:
+    cycle_id: int
+    status: str         # "running" | "completed" | "error"
+    stages: dict[str, PipelineStage]
+    started_at: str | None = None
+    completed_at: str | None = None
+    total_markets_discovered: int = 0
+    total_events_active: int = 0
+    total_candidates_found: int = 0
+
+@dataclass
+class ApiTrace:
+    method: str
+    path: str
+    status: int
+    duration_ms: int
+    rate_remaining: int
+    timestamp: str
+    error: str | None = None
+```
+
+### 11.2 — Wire WS broadcasts into E8 orchestrator
+
+In `backend/engines/engine8_orchestrator.py`:
+
+- Import `manager` from `backend.api.websocket_handler` (lazy import inside `run_one_shot` to avoid circular imports)
+- Before E1: broadcast `scanner:started`
+- After each E-stage: broadcast `scanner:stage_update` with stage counts + timing
+- On completion: broadcast `scanner:completed` with `StopResult`-style summary
+- On error: broadcast `scanner:error`
+
+**WS message types on the `scanner` channel:**
+```
+scanner:started       → { cycle_id, started_at }
+scanner:stage_update  → { cycle_id, stage, label, status, input_count, output_count, duration_ms, error? }
+scanner:completed     → { cycle_id, completed_at, total_duration_ms, total_markets, total_events, total_candidates }
+scanner:error         → { cycle_id, stage, error }
+```
+
+### 11.3 — Add HTTP request tracing to KalshiHttpClient
+
+In `backend/adapters/kalshi/http_client.py`:
+
+- Add optional `on_request: Callable[[ApiTrace], Awaitable[None]] | None = None` to `KalshiHttpClient` (**must be async** — see bugfix below)
+- After each `response = await self.client.request(...)` (successful or retry-exhausted), build an `ApiTrace` and `await self.on_request(trace)`
+- After a retry-exhausted failure, build an `ApiTrace` with extracted response info + `error` field
+- Only includes: method, path, status, duration_ms, rate_remaining from headers, timestamp
+- Never logs: request body, response body, auth headers, signing material
+- Wrap the `await self.on_request(trace)` call in `try/except logger.warning(...)` so a failing callback doesn't crash the API call
+- Probe rate limit headers: check `x-rate-limit-remaining`, `x-kalshi-rate-limit-remaining`, `ratelimit-remaining` (in order); `rate_remaining = None` if none found
+
+**🐛 Bugfix — Async callback + batching using `asyncio.Queue`:**
+
+Initial spec had `on_request` as sync (`Callable`) but `manager.broadcast()` is async. Sync callback can't await. If we fire-and-forget with `asyncio.create_task`, exceptions vanish and broadcasts become unpredictable.
+
+**Fix:** Use an `asyncio.Queue` shared between `run_one_shot()` and the HTTP client:
+
+In `engine8_orchestrator.py`, inside `run_one_shot()`:
+
+```python
+trace_queue: asyncio.Queue[ApiTrace] = asyncio.Queue()
+client.on_request = lambda t: trace_queue.put_nowait(t)
+
+# Background flusher task
+async def _flush_traces():
+    try:
+        while True:
+            batch: list[ApiTrace] = []
+            try:
+                while len(batch) < 20:
+                    trace = await asyncio.wait_for(trace_queue.get(), timeout=0.5)
+                    batch.append(trace)
+            except (asyncio.TimeoutError, asyncio.CancelledError):
+                pass
+            if batch:
+                try:
+                    await manager.broadcast("scanner", "scanner:api_batch", batch)
+                except Exception:
+                    logger.warning("Failed to broadcast trace batch", exc_info=True)
+    except asyncio.CancelledError:
+        # Final flush on cancellation
+        remaining = []
+        while not trace_queue.empty():
+            try:
+                remaining.append(trace_queue.get_nowait())
+            except asyncio.QueueEmpty:
+                break
+        if remaining:
+            await manager.broadcast("scanner", "scanner:api_batch", remaining)
+
+flusher = asyncio.create_task(_flush_traces())
+```
+
+The flusher task is cancelled when the pipeline completes or errors:
+
+```python
+flusher.cancel()
+try:
+    await flusher
+except asyncio.CancelledError:
+    pass  # flusher does final flush in CancelledError handler
+```
+
+### 11.4 — Wire live pollers
+
+In `backend/engines/live/discovery_poller.py`:
+
+- Broadcast `scanner:discovery_cycle` with event count diff after each poll loop
+
+In `backend/engines/live/progress_gate_loop.py`:
+
+- Broadcast `scanner:progress_cycle` with candidate count after each loop
+
+### 11.5 — Add `GET /api/v1/scanner/progress` REST fallback
+
+In `backend/api/rest.py`:
+
+```python
+@router.get("/scanner/progress")
+async def get_scanner_progress():
+    """Return current pipeline cycle state (for initial mount before WS messages arrive)."""
+```
+
+Returns the current `PipelineCycle` snapshot from a lightweight in-memory store (updated each time the orchestrator broadcasts).
+
+### 11.6 — Frontend: Add types to `lib/types.ts`
+
+> **🐛 Bugfix — snake_case alignment:** Backend Pydantic models serialize with `model_dump_json()` using snake_case field names (`input_count`, `output_count`). TypeScript types must match exactly — the frontend receives JSON property names as-is from the backend.
+
+```typescript
+export interface PipelineStage {
+  stage: string;
+  label: string;
+  status: 'pending' | 'running' | 'done' | 'error' | 'skipped';
+  input_count: number;
+  output_count: number;
+  duration_ms: number;
+  error?: string;
+}
+
+export interface PipelineCycle {
+  cycle_id: number;
+  status: 'running' | 'completed' | 'error';
+  stages: Record<string, PipelineStage>;
+  started_at: string | null;
+  completed_at: string | null;
+  total_markets_discovered: number;
+  total_events_active: number;
+  total_candidates_found: number;
+}
+
+export interface ApiTrace {
+  method: string;
+  path: string;
+  status: number;
+  duration_ms: number;
+  rate_remaining: number | null;  // null if Kalshi didn't send rate-limit headers
+  timestamp: string;
+  error?: string;
+}
+
+export type DiagnosticLogEntry =
+  | { kind: 'pipeline-stage'; stage: PipelineStage }
+  | { kind: 'api-trace'; trace: ApiTrace }
+  | { kind: 'cycle-event'; type: 'started' | 'completed' | 'error'; cycle_id: number };
+```
+
+### 11.7 — Create `useDiagnostics` hook
+
+Create `frontend/src/hooks/useDiagnostics.ts`:
+
+- Subscribes to `scanner` WS channel via `useWebSocket`
+- Accumulates `PipelineCycle` state (current active cycle)
+- Accumulates `ApiTrace[]` ring buffer (last 200 entries)
+- Tracks `completedCycles: PipelineCycle[]` — last 3 completed cycles (to preserve visibility if a new cycle starts mid-pipeline)
+- Derives `DiagnosticLogEntry[]` from both — each entry gets a timestamp
+- Returns: `{ currentCycle, completedCycles, apiTraces, logEntries, clear, paused, setPaused }`
+- Uses `useRef` to avoid stale closure issues
+- Batches React state updates with a render throttle (~3fps via a simple `setTimeout` gate)
+
+**Key behaviors:**
+- `scanner:started` → creates a new `currentCycle`, pushes previous completed one to `completedCycles`
+- `scanner:stage_update` → updates the stage inside `currentCycle`
+- `scanner:completed` / `scanner:error` → marks all remaining `pending` stages as `skipped` (prevents "waiting forever" in summary strip)
+- `scanner:api_batch` → appends to apiTraces ring buffer (capped at 200), derives log entries
+- `clear` → resets everything
+- `paused` → stops appending new entries (but still accepts and discards)
+
+### 11.8 — Create `DiagnosticsPanel` component
+
+Create `frontend/src/components/DiagnosticsPanel.tsx`:
+
+**🐛 Bugfix — Auto-scroll vs user scroll-up conflict:**
+The component tracks scroll position. Only auto-scrolls to bottom when the user is already near the bottom (within 40px). If the user scrolls up to read historical logs, new entries don't steal their position. A "Jump to bottom" button appears when scrolled up.
+
+**🐛 Bugfix — Re-render cascade from parent:**
+Wrapped in `React.memo()` so config changes in Settings.tsx don't force unnecessary re-renders of the panel.
+
+Create `frontend/src/components/DiagnosticsPanel.tsx`:
+
+**Layout:**
+```
+┌─ Diagnostics ─────────────────────────────────── [Pipeline] [HTTP] [All] ● Live [Clear] [Pause] ─┐
+│ E1 ✅  E2 ✅  E3 ✅  E4 🔄 3/8  E5 ⏳  E6 ⏳  E7 ⏳           ← pipeline summary strip           │
+├─────────────────────────────────────────────────────────────────────────────────────────────────┤
+│ 19:42:03  🔄 Scanner cycle #42 started                                                           │
+│ 19:42:04  ✅ E1 Discovery        12,450 markets                                                  │
+│ 19:42:05  ✅ E2 Classification   148 → 11 same-day-live                                          │
+│ 19:42:05  🌐 GET /markets?limit=100 → 200 (1.2s)  rate_remaining=42                             │
+│ 19:42:06  🌐 GET /markets?limit=100&cursor=xxx → 200 (0.4s)                                     │
+│ 19:42:07  🔄 E4 Orderbook        3/8 markets                                                     │
+│ 19:42:08  ❌ E4 Orderbook        HTTP 429 rate-limited — retrying...                             │
+│ 19:42:11  ✅ E6 Progress Gate    3 candidates found                                              │
+│ 19:42:12  ✅ Scanner cycle #42 complete (9.2s)  3 candidates                                    │
+└─────────────────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+**Features:**
+- **Collapsible** — toggle `▼/▲` header to show/hide
+- **Auto-scroll** — scrolls to bottom on new entry unless user has scrolled up
+- **Filter pills** — `[Pipeline]` `[HTTP]` `[All]` toggle which log entry kinds appear
+- **Live indicator** — green dot + "Live" when WS connected, gray "Disconnected" when not
+- **Clear** — empties all log entries
+- **Pause/Resume** — stops incoming entries from appending (useful to freeze for reading)
+- **Pipeline summary strip** — shows E1-E7 in a single row with ✅/🔄/⏳ status per stage
+- **Scrollable log area** — fixed max-height (`max-h-96`), dark code-like background (`bg-gray-950`), monospace font
+- **Color coding**: green for completed stages, yellow for running, blue for HTTP traces, red for errors
+- **Smart auto-scroll** (🐛 bugfix): tracks `isUserAtBottom` via `onScroll` handler (within 40px of bottom). Only auto-scrolls when user is at the bottom. Shows a floating "↓ Jump to bottom" button when scrolled up.
+- **React.memo wrapper** (🐛 bugfix): prevents re-renders when parent Settings page updates config state
+
+### 11.9 — Integrate into Settings.tsx
+
+Add below the Save button:
+
+```tsx
+<section className="mt-8 border-t border-gray-700 pt-8">
+  <DiagnosticsPanel />
+</section>
+```
+
+### 11.10 — WS listener conflict mitigation
+
+Update `frontend/src/stores/wsStore.ts` — change `registerListener` from `Map<string, cb>` to `Map<string, Set<cb>>` so multiple components can listen on the same `scanner` channel without silently replacing each other.
+
+**🐛 Bugfix — Backward-compatible `unregisterListener`:**
+
+Existing callers (`useWebSocket` cleanup) call `unregisterListener(channel)` without passing a specific callback — they expect the whole channel to be cleared. New multi-listener callers need to pass the callback to remove just that one.
+
+Both patterns supported via optional `cb` parameter:
+
+```typescript
+const listeners = new Map<string, Set<(msg: WSMessage) => void>>();
+
+export function registerListener(channel: string, cb: (msg: WSMessage) => void): void {
+  if (!listeners.has(channel)) listeners.set(channel, new Set());
+  listeners.get(channel)!.add(cb);
+}
+
+export function unregisterListener(channel: string, cb?: (msg: WSMessage) => void): void {
+  if (cb) {
+    listeners.get(channel)?.delete(cb);
+  } else {
+    listeners.delete(channel);  // clear all — backward compat for existing callers
+  }
+}
+```
+
+Update `wsStore.ts` `onmessage` handler to iterate the Set:
+
+```typescript
+ws.onmessage = (event) => {
+  const msg: WSMessage = JSON.parse(event.data);
+  if (msg.type === 'pong') return;
+  const channelListeners = listeners.get(channel);
+  if (channelListeners) {
+    for (const cb of channelListeners) {
+      cb(msg);
+    }
+  }
+};
+```
+
+### 11.11 — Theoretical QA: Bugs Found & Fixes Applied
+
+A systematic end-to-end trace of every data path revealed **10 bugs** in the initial spec. Each is documented below with the fix baked into the plan above.
+
+#### 🐛 CRITICAL: Async/sync mismatch in HTTP tracing callback
+
+**Problem:** `KalshiHttpClient.request()` is async. The `on_request` callback is called after each response. But `manager.broadcast()` is also async — you can't `await` from a sync callback. If we use `asyncio.create_task()` from a sync callback, unhandled exceptions silently disappear and the task may survive beyond the pipeline lifecycle.
+
+**Fix:**
+```python
+# In http_client.py — on_request is an async callable:
+on_request: Callable[[ApiTrace], Awaitable[None]] | None = None
+
+# Inside request(), after the response:
+if self.on_request:
+    try:
+        await self.on_request(trace)
+    except Exception:
+        logger.warning("HTTP trace callback failed", exc_info=True)
+```
+
+This adds ~1ms per request (the `await` is near-instant). For E1's ~120 paginated requests, that's ~120ms total overhead — acceptable.
+
+#### 🐛 CRITICAL: Snake_case / camelCase mismatch
+
+**Problem:** Backend Pydantic models serialize with `model_dump_json()` → snake_case field names (`input_count`, `output_count`). The TypeScript types in the initial spec used camelCase (`inputCount`, `outputCount`). The frontend would receive snake_case JSON but access camelCase properties → all values `undefined`.
+
+**Fix:** All TypeScript types use snake_case field names, matching the backend's Pydantic serialization:
+
+```typescript
+export interface PipelineStage {
+  stage: string;
+  label: string;
+  status: 'pending' | 'running' | 'done' | 'error' | 'skipped';
+  input_count: number;
+  output_count: number;
+  duration_ms: number;
+  error?: string;
+}
+// ... same pattern for all types
+```
+
+#### 🐛 HIGH: Broadcast exceptions crash the pipeline
+
+**Problem:** Each `await manager.broadcast(...)` could raise (e.g., WS connection drops mid-send). Without try/except, the exception propagates up `run_one_shot()` and aborts the entire pipeline mid-scan.
+
+**Fix:** Every `manager.broadcast()` call in the orchestrator is wrapped:
+
+```python
+try:
+    await manager.broadcast("scanner", "scanner:stage_update", stage)
+except Exception:
+    logger.warning("Failed to broadcast stage update", exc_info=True)
+```
+
+Same pattern for live poller broadcasts.
+
+#### 🐛 HIGH: HTTP trace batching architecture was undefined
+
+**Problem:** The spec said "buffer and flush every 500ms" but didn't define *how*. The `on_request` callback fires inside `KalshiHttpClient.request()`, which is called deep inside E1's pagination loop (`fetch_all_open_markets()` → `list_markets()` → `http.request()`). The orchestrator has no control over when callbacks fire mid-stage.
+
+**Fix:** Use an `asyncio.Queue` shared between `run_one_shot()` and the HTTP client:
+
+1. `run_one_shot()` accepts an optional `trace_queue: asyncio.Queue[ApiTrace]`
+2. When set, `KalshiHttpClient.on_request = lambda t: trace_queue.put_nowait(t)`
+3. `run_one_shot()` spawns a background `asyncio.Task` that does:
+   ```python
+   async def _flush_traces():
+       while True:
+           batch = []
+           try:
+               while len(batch) < 20:
+                   trace = await asyncio.wait_for(trace_queue.get(), timeout=0.5)
+                   batch.append(trace)
+           except (asyncio.TimeoutError, asyncio.CancelledError):
+               pass
+           if batch:
+               await manager.broadcast("scanner", "scanner:api_batch", batch)
+   ```
+4. On error or completion, the task is cancelled and flushed one final time
+
+This keeps tracing zero-overhead on the critical path (the `put_nowait` is O(1)) and batches the broadcasts at ~2 batches/second max.
+
+#### 🐛 HIGH: Auto-scroll UX steals user's position
+
+**Problem:** New log entries cause auto-scroll to bottom. If the user scrolls up to read a historical entry, the next WS message snatches them back to the bottom — infuriating.
+
+**Fix:** Track scroll position in `DiagnosticsPanel`:
+
+```typescript
+const [isUserAtBottom, setIsUserAtBottom] = useState(true);
+const logEndRef = useRef<HTMLDivElement>(null);
+
+const handleScroll = useCallback(() => {
+  const el = logEndRef.current?.parentElement;
+  if (!el) return;
+  const threshold = 40; // px from bottom
+  setIsUserAtBottom(el.scrollTop + el.clientHeight >= el.scrollHeight - threshold);
+}, []);
+
+// Only auto-scroll when user hasn't scrolled up:
+useEffect(() => {
+  if (isUserAtBottom) {
+    logEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+  }
+}, [logEntries, isUserAtBottom]);
+```
+
+#### 🐛 HIGH: Pipeline summary shows ⏳ for stages that never ran
+
+**Problem:** If E1 finds 0 same-day-live markets, E3-E7 never execute. Their status stays "⏳ waiting" forever in the pipeline summary strip.
+
+**Fix:** When the pipeline completes (or errors), auto-mark all remaining `pending` stages as `skipped`:
+
+```typescript
+// On scanner:completed or scanner:error
+if (msg.type === 'scanner:completed' || msg.type === 'scanner:error') {
+  setPipelineCycle(prev => {
+    if (!prev) return prev;
+    const updated = { ...prev };
+    for (const stage of Object.values(updated.stages)) {
+      if (stage.status === 'pending') stage.status = 'skipped';
+    }
+    return updated;
+  });
+}
+```
+
+Also: a stage with 0 input and 0 output that was never called shows as `skipped` (not `pending`).
+
+#### 🐛 MEDIUM: Rate limit header name is unknown
+
+**Problem:** The spec assumed Kalshi returns a `rate_remaining` header on 200 responses. In practice, the Kalshi V2 API may not provide standard rate-limit headers. `KalshiHttpClient` only reads `retry-after` on 429 responses.
+
+**Fix:** Probe for multiple possible header names; `null` if none found:
+
+```python
+rate_remaining = None
+for header in ("x-rate-limit-remaining", "x-kalshi-rate-limit-remaining", "ratelimit-remaining"):
+    if header in response.headers:
+        try:
+            rate_remaining = int(response.headers[header])
+        except (ValueError, TypeError):
+            pass
+        break
+```
+
+The frontend TypeScript type makes `rate_remaining: number | null` explicit. The UI shows "?" when `null`.
+
+#### 🐛 MEDIUM: Multiple pipeline cycles race
+
+**Problem:** If a user triggers `POST /scanner/start` while the live poller is also running, two concurrent cycles broadcast interleaved messages. The frontend replaces `pipelineCycle` state on each `scanner:started`, losing visibility into the first cycle.
+
+**Fix:** Track a short history of recent cycles:
+
+```typescript
+interface UseDiagnosticsReturn {
+  currentCycle: PipelineCycle | null;      // actively running or last completed
+  completedCycles: PipelineCycle[];         // last 3 completed cycles
+  // ... rest
+}
+```
+
+Completed cycles (with `scanner:completed` or `scanner:error`) are appended to `completedCycles` (capped at 3), then `currentCycle` is reset to allow the next `scanner:started` to create a new one.
+
+#### 🐛 MEDIUM: `unregisterListener` API breakage
+
+**Problem:** Changing `registerListener` from `Map<string, cb>` to `Map<string, Set<cb>>` requires unregistration to specify *which* callback to remove. But existing callers (`useWebSocket` cleanup) call `unregisterListener(channel)` without a callback, intending to clear all listeners for that channel.
+
+**Fix:** Support both signatures:
+
+```typescript
+export function registerListener(channel: string, cb: (msg: WSMessage) => void): void {
+  if (!listeners.has(channel)) listeners.set(channel, new Set());
+  listeners.get(channel)!.add(cb);
+}
+
+export function unregisterListener(channel: string, cb?: (msg: WSMessage) => void): void {
+  if (cb) {
+    listeners.get(channel)?.delete(cb);
+  } else {
+    listeners.delete(channel); // clear all for this channel
+  }
+}
+```
+
+Existing callers pass no callback → channel is fully cleared. New multi-listener callers pass the specific callback → only that listener is removed.
+
+#### 🐛 LOW: `DiagnosticsPanel` re-renders on every config change
+
+**Problem:** `Settings.tsx` re-renders whenever config queries or mutations update. These re-renders cascade into `DiagnosticsPanel`, causing unnecessary DOM diffing.
+
+**Fix:** Wrap `DiagnosticsPanel` in `React.memo()`:
+
+```typescript
+const DiagnosticsPanel = React.memo(function DiagnosticsPanel() {
+  // ... component body
+});
+```
+
+Since the panel only depends on WS messages (not props), memoization prevents re-renders from parent state changes.
+
+---
+
+### Risk Mitigations Summary (updated)
+
+| # | Risk | Mitigation Applied |
+|---|------|--------------------|
+| 1 | Circular import — engines importing `manager` | Lazy `import` inside function bodies |
+| 2 | WS flood from E1 pagination (~120 API calls) | HTTP traces buffered via `asyncio.Queue`, flushed every 500ms as batches of ≤20 |
+| 3 | Single listener per channel replaced silently | `registerListener` → `Map<string, Set<cb>>`; `unregisterListener` has backward-compat overload |
+| 4 | Memory leak — log entries accumulate forever | Ring buffer capped at 200 API traces; `[Clear]` button; completed cycles capped at 3 |
+| 5 | Settings page cramped | Diagnostics panel is collapsible with `max-h-96` scrollable log area |
+| 6 | Sensitive data in HTTP traces | Only method, path, status, timing logged — never body, headers, or auth material |
+| 7 | WS messages arrive before component mounts | `GET /api/v1/scanner/progress` REST endpoint provides initial state snapshot |
+| 8 | Stale closures in WS listener | `useWebSocket` uses `useRef`; `useDiagnostics` uses `useRef` for accumulation + render throttle |
+| 9 | Broadcast exceptions crash pipeline | Every `manager.broadcast()` wrapped in `try/except logger.warning` |
+| 10 | Auto-scroll steals user's position | `isUserAtBottom` scroll-detection; only auto-scroll when user is at the bottom |
+| 11 | Snake_case/camelCase type mismatch | TypeScript types use snake_case to match Pydantic `model_dump_json()` |
+| 12 | Async/sync callback mismatch | `on_request` is `Callable[[ApiTrace], Awaitable[None]]`; `await`-ed inside `request()` |
+| 13 | Rate limit header unknown | Probes multiple header names; `rate_remaining: number \| null` in types |
+| 14 | Multiple cycles race | Track `currentCycle` + `completedCycles[]` (last 3) |
+| 15 | Stages never ran show as "waiting" forever | `scanner:completed`/`scanner:error` marks remaining `pending` stages as `skipped` |
+| 16 | Re-render cascade on config changes | `DiagnosticsPanel` wrapped in `React.memo()` |
+
+---
+
+## Phase 12: Test Infrastructure (⬜ Not Yet Implemented)
+
+### 12.1 — Test setup
 
 > **DRY**: Shared test factories in `tests/test_utils.py` are reused across
 > all engine tests (create_sample_market, create_sample_orderbook, etc.).
@@ -4994,7 +5528,7 @@ tests/
   run_simulation.py     # Smoke test: runs pipeline against real Kalshi API
 ```
 
-### 11.2 — `tests/test_utils.py` (DRY: shared factory functions)
+### 12.2 — `tests/test_utils.py` (DRY: shared factory functions)
 
 ```python
 """
@@ -5057,7 +5591,7 @@ def create_classification(
     )
 ```
 
-### 11.2 — `pytest.ini`
+### 12.3 — `pytest.ini`
 
 ```ini
 [pytest]
@@ -5071,7 +5605,7 @@ markers =
     integration: marks tests that hit real Kalshi API
 ```
 
-### 11.3 — `tests/conftest.py` (fixtures + helper functions)
+### 12.4 — `tests/conftest.py` (fixtures + helper functions)
 
 > **DRY**: Helper factories (`create_sample_market`, `create_sample_orderbook`)
 > are shared across all test files. Add common test data here.
@@ -5192,7 +5726,7 @@ def ranked_market(sample_market, sample_stats) -> RankedMarket:
     )
 ```
 
-### 11.4 — Running tests
+### 12.5 — Running tests
 
 ```bash
 # Run all unit tests (fast — no API calls)
@@ -5327,7 +5861,7 @@ if __name__ == "__main__":
 
 ---
 
-### 11.5 — Running the app
+### 12.6 — Running the app
 
 ```bash
 # Backend only (Phase 1)
@@ -5345,9 +5879,9 @@ cd backend && python scripts/run_simulation.py
 
 ---
 
-## Phase 12: Docker + Integration
+## Phase 13: Docker + Integration (⬜ Not Yet Implemented)
 
-### 12.1 — `docker-compose.yml`
+### 13.1 — `docker-compose.yml`
 
 ```yaml
 version: '3.8'
@@ -5377,7 +5911,7 @@ services:
       - VITE_API_URL=http://localhost:8000
 ```
 
-### 12.2 — `backend/Dockerfile`
+### 13.2 — `backend/Dockerfile`
 
 ```dockerfile
 FROM python:3.11-slim
@@ -5388,7 +5922,7 @@ COPY . .
 CMD ["uvicorn", "backend.main:app", "--host", "0.0.0.0", "--port", "8000"]
 ```
 
-### 12.3 — Dev Runner
+### 13.3 — Dev Runner
 
 The project root has a single `run.sh` script that starts everything:
 
@@ -5400,7 +5934,7 @@ The project root has a single `run.sh` script that starts everything:
 ./run.sh --docker
 ```
 
-### 12.4 — Testing Script
+### 13.4 — Testing Script
 
 ```bash
 # backend/tests/run_simulation.py
@@ -5432,7 +5966,7 @@ asyncio.run(test())
 
 ---
 
-## Full Build Execution Order (54 Steps)
+## Full Build Execution Order (62 Steps)
 
 Following this exact order ensures each file's dependencies exist before it's created.
 Each step maps to the pseudocode in the corresponding phase section above.
@@ -5511,7 +6045,18 @@ Step 54: backend/api/errors.py                      # No deps
 Step 55: backend/api/rest.py                        # Depends on everything above
 Step 56: backend/main.py                            # Depends on everything above
 
-# ─── Phase 8+: Frontend — scaffolded when those phases begin ──────────
+# ─── Phase 8+: Frontend scaffolding & pages ─────────────────────────
+# (Phases 8-10 steps defined in their respective phase sections above)
+
+# ─── Phase 11: Pipeline Diagnostics Panel ────────────────────────────
+Step 77: backend/models/scanner_progress.py          # Pipeline stage + cycle + API trace dataclasses
+Step 78: backend/engines/engine8_orchestrator.py      # Add WS broadcasts after each E-stage
+Step 79: backend/adapters/kalshi/http_client.py        # Add on_request callback for HTTP tracing
+Step 80: backend/api/rest.py                          # Add GET /scanner/progress endpoint
+Step 81: frontend/src/lib/types.ts                     # Add PipelineStage, PipelineCycle, ApiTrace, DiagnosticLogEntry
+Step 82: frontend/src/hooks/useDiagnostics.ts         # New hook — WS listener + ring buffer + render throttle
+Step 83: frontend/src/components/DiagnosticsPanel.tsx # New component — collapsible live log + pipeline summary
+Step 84: frontend/src/stores/wsStore.ts               # Multi-listener support (Map → Map<string, Set>)
 ```
 
 ---

@@ -1,26 +1,48 @@
-import { useState } from 'react';
+import { useState, useCallback, useMemo, lazy, Suspense, memo } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { useScannerConfig } from '../hooks/useScannerConfig';
-import { ScannerMode } from '../lib/types';
+import { ScannerMode, LiveMode } from '../lib/types';
 import { ROUTES } from '../lib/routes';
 import ModeSelector from '../components/ModeSelector';
 import ThresholdSlider from '../components/ThresholdSlider';
 
-export default function Settings() {
+const DiagnosticsPanel = lazy(() => import('../components/DiagnosticsPanel'));
+
+function SettingsInner() {
   const navigate = useNavigate();
   const { config, updateConfig, switchMode } = useScannerConfig();
   const [threshold, setThreshold] = useState<number | null>(null);
   const [selectedStrategy, setSelectedStrategy] = useState<string | null>(null);
 
-  const resolvedThreshold = threshold ?? config.data?.threshold_percent ?? 65;
-  const resolvedStrategy = selectedStrategy ?? config.data?.strategy.name ?? '';
+  const resolvedThreshold = useMemo(
+    () => threshold ?? config.data?.threshold_percent ?? 65,
+    [threshold, config.data?.threshold_percent],
+  );
+  const resolvedStrategy = useMemo(
+    () => selectedStrategy ?? config.data?.strategy.name ?? '',
+    [selectedStrategy, config.data?.strategy.name],
+  );
 
-  const handleSave = () => {
+  const handleSave = useCallback(() => {
     updateConfig.mutate({
       threshold_percent: resolvedThreshold,
       strategy: resolvedStrategy,
     });
-  };
+  }, [updateConfig, resolvedThreshold, resolvedStrategy]);
+
+  const handleModeSwitch = useCallback(
+    (mode: LiveMode) => switchMode.mutate({ mode, confirm: true }),
+    [switchMode],
+  );
+
+  const handleStrategyChange = useCallback(
+    (e: React.ChangeEvent<HTMLSelectElement>) => setSelectedStrategy(e.target.value),
+    [],
+  );
+  const handleThresholdChange = useCallback(
+    (value: number) => setThreshold(value),
+    [],
+  );
 
   const currentMode = config.data?.mode ?? ScannerMode.DRY_RUN;
   const kalshiConnected = config.data?.kalshi.connected ?? false;
@@ -55,7 +77,7 @@ export default function Settings() {
               <h2 className="text-lg font-semibold mb-3">Mode</h2>
               <ModeSelector
                 currentMode={currentMode}
-                onSwitch={(mode) => switchMode.mutate({ mode, confirm: true })}
+                onSwitch={handleModeSwitch}
                 hasCredentials={kalshiConnected}
                 switching={switchMode.isPending}
               />
@@ -66,7 +88,7 @@ export default function Settings() {
               <h2 className="text-lg font-semibold mb-3">Strategy</h2>
               <select
                 value={resolvedStrategy}
-                onChange={(e) => setSelectedStrategy(e.target.value)}
+                onChange={handleStrategyChange}
                 className="w-full bg-gray-700 border border-gray-600 rounded px-3 py-2 text-gray-100"
               >
                 {config.data.available_strategies.map((s) => (
@@ -82,7 +104,7 @@ export default function Settings() {
               <h2 className="text-lg font-semibold mb-3">Progress Threshold</h2>
               <ThresholdSlider
                 value={resolvedThreshold}
-                onChange={(value) => setThreshold(value)}
+                onChange={handleThresholdChange}
               />
             </section>
 
@@ -94,9 +116,14 @@ export default function Settings() {
             >
               {updateConfig.isPending ? 'Saving...' : 'Save Configuration'}
             </button>
+
+            <Suspense fallback={null}>
+              <DiagnosticsPanel />
+            </Suspense>
           </>
         )}
       </main>
     </div>
   );
 }
+export default memo(SettingsInner);

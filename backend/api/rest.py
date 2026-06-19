@@ -564,3 +564,30 @@ async def switch_mode(body: SwitchModeRequest, bot: Any = Depends(get_bot)):
         "requires_auth": body.mode == "live" and not bot.settings.kalshi.private_key,
         "auth_configured": bool(bot.settings.kalshi.private_key),
     })
+
+
+@router.get("/scanner/progress")
+async def get_scanner_progress():
+    """Return current pipeline cycle state (for initial mount before WS messages arrive)."""
+    from backend.models.scanner_progress import get_current_cycle
+
+    cycle = get_current_cycle()
+    if cycle is None:
+        return ok(None)
+    return ok({
+        "cycle_id": cycle.cycle_id,
+        "status": cycle.status,
+        "stages": {
+            sid: {
+                "stage": s.stage, "label": s.label, "status": s.status,
+                "input_count": s.input_count, "output_count": s.output_count,
+                "duration_ms": s.duration_ms, "error": s.error,
+            }
+            for sid, s in cycle.stages.items()
+        },
+        "started_at": cycle.started_at,
+        "completed_at": cycle.completed_at,
+        "total_markets_discovered": cycle.total_markets_discovered,
+        "total_events_active": cycle.total_events_active,
+        "total_candidates_found": cycle.total_candidates_found,
+    })

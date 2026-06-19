@@ -1,5 +1,6 @@
 """Application entry point — TradingBot + FastAPI bootstrap."""
 
+import asyncio
 import logging
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
@@ -35,12 +36,14 @@ class TradingBot:
         self.mode: str = "dry_run"
 
     async def start(self, config_path: str | None = None) -> None:
-        """Initialize all dependencies."""
+        """Initialize all dependencies and start background loops."""
         # Lazy imports to break circular deps
         from backend.adapters.kalshi.client import KalshiClient
         from backend.adapters.kalshi.adapter import KalshiAdapter
         from backend.trading.portfolio import Portfolio
         from backend.trading.execution_engine import ExecutionEngine
+        from backend.engines.live.discovery_poller import DiscoveryPoller
+        from backend.engines.live.progress_gate_loop import ProgressGateLoop
 
         self.settings = load_settings(config_path)
 
@@ -76,6 +79,23 @@ class TradingBot:
         )
         await self.execution_engine.start()
 
+        # ── Live engine background loops ──
+        self._stop_live = asyncio.Event()
+        self._discovery_poller = DiscoveryPoller(
+            self.kalshi_adapter, self.scanner_state,
+            interval=self.settings.scanner.poll_interval_seconds,
+        )
+        self._progress_gate = ProgressGateLoop(
+            self.scanner_state,
+            self.strategy,
+            threshold=self.settings.scanner.default_threshold,
+            interval=self.settings.scanner.progress_check_interval_seconds,
+        )
+        self._live_tasks = [
+            asyncio.create_task(self._discovery_poller.run(self._stop_live), name="discovery_poller"),
+            asyncio.create_task(self._progress_gate.run(self._stop_live), name="progress_gate"),
+        ]
+
         # ── State ──
         self.scanner_state.started_at = datetime.now(timezone.utc)
         self.scanner_state.config_snapshot = {
@@ -88,6 +108,14 @@ class TradingBot:
 
     async def stop(self) -> None:
         """Shut down all components gracefully."""
+        if hasattr(self, '_stop_live'):
+            self._stop_live.set()
+            for task in getattr(self, '_live_tasks', []):
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
         if self.execution_engine:
             await self.execution_engine.stop()
         if self.kalshi_client:

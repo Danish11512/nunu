@@ -1,6 +1,6 @@
 import { useEffect, useRef } from 'react';
 import type { WSMessage } from '../lib/types';
-import { registerListener, unregisterListener } from '../stores/wsStore';
+import { registerListener } from '../stores/wsStore';
 
 /** Subscribes a message handler to an app-level WebSocket channel.
  *  Connections are managed by `initialize()` in wsStore — the hook
@@ -13,7 +13,7 @@ export function useWebSocket<T = unknown>(
   onMessageRef.current = onMessage;
 
   useEffect(() => {
-    registerListener(channel, (msg) => onMessageRef.current(msg as WSMessage<T>));
-    return () => { unregisterListener(channel); };
+    const unsub = registerListener(channel, (msg) => onMessageRef.current(msg as WSMessage<T>));
+    return unsub;
   }, [channel]);
 }
