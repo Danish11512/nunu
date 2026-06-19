@@ -403,3 +403,45 @@ export type WsScannerMessage =
   | WsScannerApiBatch
   | WsDiscoveryCycle
   | WsProgressCycle;
+
+// ── Diagnostics Column Types ──
+
+export interface DiscoveryEvent {
+  id: number;
+  timestamp: string;
+  data: {
+    total_markets: number;
+    total_events: number;
+    added: number;
+    removed: number;
+  };
+}
+
+export interface ProgressGateEvent {
+  id: number;
+  timestamp: string;
+  data: {
+    events_checked: number;
+  };
+}
+
+export interface CandidateSummary {
+  event_ticker: string;
+  market_ticker: string;
+  side: string;
+  price: number;
+  status: string;
+  is_valid: boolean;
+}
+
+export interface ScannerStatusInfo {
+  mode: ScannerMode;
+  is_running: boolean;
+  connected_to_kalshi: boolean;
+  uptime_seconds: number;
+  markets_tracked: number;
+  events_tracked: number;
+  active_candidates: number;
+  last_discovery: string | null;
+  last_progress_check: string | null;
+}

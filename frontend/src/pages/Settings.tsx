@@ -56,7 +56,7 @@ function SettingsInner() {
         </div>
       </header>
 
-      <main className="max-w-2xl mx-auto p-6 space-y-8">
+      <main className="p-6 space-y-8">
         {config.isLoading && (
           <div className="flex items-center justify-center h-32">
             <div className="animate-spin rounded-full h-6 w-6 border-b-2 border-blue-500" />

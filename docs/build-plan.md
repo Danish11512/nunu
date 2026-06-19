@@ -112,7 +112,7 @@ Phase 7:  API Layer (DRY errors.py)                — Steps 52–54     ✅
 Phase 8:  Frontend lib (Types + API Client)         — Steps 55–56     ✅
 Phase 9:  Frontend Hooks + Pages                    — Steps 57–66     ✅
 Phase 10: Frontend Components + API Alignment       — Steps 67–76     ✅
-Phase 11: Pipeline Diagnostics Panel                — Steps 77–84     📋
+Phase 11: Pipeline Diagnostics Panel                — Steps 77–94     🔄
 Phase 12: Test Infrastructure                       — After all steps ⬜
 Phase 13: Docker + Integration                      — After all steps ⬜
 ```
@@ -5501,6 +5501,316 @@ Since the panel only depends on WS messages (not props), memoization prevents re
 | 15 | Stages never ran show as "waiting" forever | `scanner:completed`/`scanner:error` marks remaining `pending` stages as `skipped` |
 | 16 | Re-render cascade on config changes | `DiagnosticsPanel` wrapped in `React.memo()` |
 
+### 11.12 — Multi-column pipeline visual redesign
+
+Refactor `DiagnosticsPanel` from a single log list to a 4-column grid layout, one column per engine/endpoint, each showing its own live feed.
+
+#### Column layout
+
+```
+┌─ 🔧 Pipeline Diagnostics ────────────────────────────────────────────────── [▼] ─┐
+├───────────────┬───────────────────┬────────────────┬─────────────────────────────┤
+│ 🔍 DISCOVERY  │ ⚙️ PIPELINE E1-E7 │ 🎯 PROGRESS    │ ↗ API CALLS                 │
+│ ● Live        │ ● Idle            │ GATE ● Checking│ 142 total · 3 err           │
+├───────────────┼───────────────────┼────────────────┼─────────────────────────────┤
+│ [scrolling    │ [scrolling feed]  │ [scrolling     │ [scrolling feed]            │
+│  feed]        │                   │  feed]         │                             │
+│               │ ── #3 ──          │                │ ↗ GET /markets              │
+│ 14:02:01      │ ✅ Discovery      │ 14:01:30       │   200 · 43ms                │
+│ 🔍 120 mkts   │   200→120 (43ms)  │ ⏱ Checked 12  │ ──────────────────────      │
+│   8 events    │ ✅ Classify       │   events       │ ↗ POST /orderbook           │
+│   +2 / -0     │   120→8 (12ms)    │ ─────────────  │   201 · 120ms               │
+│ ────────────  │ ✅ Grouping       │ 14:00:15       │ ──────────────────────      │
+│ 14:00:08      │   8→8 (2ms)      │ ⏱ Checked 8   │ ↗ GET /markets              │
+│ 🔍 115 mkts   │ ✅ Orderbook      │   events       │   200 · 38ms                │
+│   7 events    │   8→8 (215ms)    │                │                             │
+│   +1 / -0     │ ✅ Ranking        │                │                             │
+│               │   8→8 (3ms)      │                │                             │
+│               │ ✅ Progress Gate  │                │                             │
+│               │   8→3 (8ms)      │                │                             │
+│               │ ✅ Validation     │                │                             │
+│               │   3→2 (67ms)     │                │                             │
+│               │                  │                │                             │
+│               │ ── #2 (error) ── │                │                             │
+│               │ ❌ Discovery      │                │                             │
+│               │   error: timeout  │                │                             │
+└───────────────┴───────────────────┴────────────────┴─────────────────────────────┘
+```
+
+#### Component architecture
+
+All new files in `frontend/src/components/pipeline/`:
+
+| Sub-component | File | Data Source | Memo strategy |
+|---|---|---|---|
+| `DiscoveryColumn` | `pipeline/DiscoveryColumn.tsx` | `diagnostics.discoveryFeed` — ring buffer of `scanner:discovery_cycle` events | `React.memo`, auto-scroll via `useRef`, stable keys per event |
+| `PipelineColumn` | `pipeline/PipelineColumn.tsx` | `diagnostics.currentCycle` + `diagnostics.completedCycles` | `React.memo`, stage sorting with `useMemo` (stable E1→E7 order), `useCallback` for inline handlers |
+| `ProgressGateColumn` | `pipeline/ProgressGateColumn.tsx` | `diagnostics.progressGateFeed` — ring buffer of `scanner:progress_cycle` events | `React.memo`, auto-scroll via `useRef` |
+| `ApiTracesColumn` | `pipeline/ApiTracesColumn.tsx` | `diagnostics.apiTraces` | `React.memo`, path truncation with `useMemo`, color coding with `useMemo` |
+
+#### Phase 1 — Refactor `useDiagnostics` hook
+
+**File:** `frontend/src/hooks/useDiagnostics.ts`
+
+- Add `discoveryFeed: DiscoveryEvent[]` state (ring buffer, last 100 entries).
+- Add `progressGateFeed: ProgressGateEvent[]` state (ring buffer, last 100 entries).
+- Each entry: `{ timestamp, data }` where data is the raw WS payload.
+- New types:
+  ```typescript
+  export interface DiscoveryEvent { timestamp: string; data: { total_markets: number; total_events: number; added: number; removed: number } }
+  export interface ProgressGateEvent { timestamp: string; data: { events_checked: number } }
+  ```
+- Mount-only `useEffect` populates the new feeds from existing WS listeners (no new WS subscriptions).
+- Keep existing `addLog` callback via `useCallback` for downward compatibility.
+- Return: `{ ..., discoveryFeed, progressGateFeed }`.
+
+#### Phase 2 — Column sub-components
+
+Each component:
+- Receives only the data it needs (no store reference — just arrays of events).
+- Uses `React.memo` wrapper.
+- Has a header bar with status dot + column title.
+- Has a fixed-height scrollable feed (`h-64 overflow-y-auto`).
+- Implements auto-scroll: tracks `isUserAtBottom` via `onScroll`, scrolls to bottom on new entries only when user is at bottom.
+- Uses stable keys (e.g. `discovery-${index}` for ring buffer index, `trace-${method}-${timestamp}`).
+- No inline functions or objects in JSX props — uses `useCallback`/`useMemo`.
+
+**DiscoveryColumn details:**
+```tsx
+interface DiscoveryColumnProps {
+  events: DiscoveryEvent[];
+  isRunning: boolean;
+}
+```
+- Shows "● Live" when `isRunning` is true AND events have been received recently (< 60s ago), else "○ Idle".
+- Each row: gray timestamp, 🔍 icon, `N markets, N events, +added/-removed`.
+
+**PipelineColumn details:**
+```tsx
+interface PipelineColumnProps {
+  currentCycle: PipelineCycleInfo | null;
+  completedCycles: PipelineCycleInfo[];
+  isRunning: boolean;
+}
+```
+- Top card = current (running) cycle with E1→E7 stages.
+- Below: completed cycles as smaller collapsed cards.
+- Stage row format: status badge (`✅`/`▶️`/`❌`/`⏭️`), `label: input→output (Nms)`.
+- Empty state: "No pipeline runs yet."
+
+**ProgressGateColumn details:**
+```tsx
+interface ProgressGateColumnProps {
+  events: ProgressGateEvent[];
+  isRunning: boolean;
+}
+```
+- Shows "● Checking" when `isRunning` && recent events, else "○ Idle".
+- Each row: timestamp, ⏱ icon, `Checked N events`.
+
+**ApiTracesColumn details:**
+```tsx
+interface ApiTracesColumnProps {
+  traces: ApiTraceInfo[];
+  isRunning: boolean;
+}
+```
+- Summary bar: `N total · M errors` with yellow highlight if errors > 0.
+- Each row: status icon (↗️/⚠️), `METHOD /short-path → status (Nms)`.
+- Long paths truncated with ellipsis via `useMemo`.
+
+#### Phase 3 — Rewrite `DiagnosticsPanel.tsx`
+
+**File:** `frontend/src/components/DiagnosticsPanel.tsx` (rewrite)
+
+- Imports all 4 column sub-components.
+- Uses `useDiagnostics()` hook for all data.
+- Collapsible header (same `div[role="button"]` pattern, no nested `<button>`).
+- Grid layout: `grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4`.
+- Each column rendered in its own `<div>`.
+- "Clear" button resets all column data via `diagnostics.reset()`.
+- Below the grid: collapsed "Raw Log" accordion that shows the original text log viewer for debugging.
+- Maintains `React.memo` wrapper.
+
+#### Phase 4 — Performance guarantees
+
+| Item | How |
+|------|-----|
+| Column re-renders | `React.memo` on each column — only re-renders when its prop reference changes |
+| Ring buffers | Arrays capped at 100 entries — React never diffs 1000-element lists |
+| Stable keys | `discovery-${idx}`, `stage-${stage.stage}`, `gate-${timestamp}`, `trace-${method}-${ts}` — not array index |
+| Auto-scroll | Each column maintains its own `useRef` + `onScroll` handler — no shared state |
+| No inline props | All handlers wrapped in `useCallback` at the hook level |
+| Settings page | `DiagnosticsPanel` already `React.lazy` loaded with `<Suspense>` — the 4 column components are imported normally inside the panel (not lazy individually, to avoid waterfall) |
+
+#### Phase 5 — Status header bar (pills above columns)
+
+Add a status bar row above the grid with individual pills showing system health at a glance.
+
+**Data sources:**
+- **Mode pill** — from `GET /api/v1/scanner/status` → `.mode` (dry_run / read_only / live) fetched on mount + polled every 30s via `useEffect` interval. Color: green=live, yellow=read_only, gray=dry_run.
+- **Uptime pill** — from scanner status `.uptime_seconds`, formatted as `Xh Ym` via `useMemo`.
+- **Market count pill** — from `.markets_tracked`, live-updated from `scanner:discovery_cycle` WS events.
+- **Rate limit % pill** — from `ApiTraceInfo.rate_remaining` (last known value). Shown as `N remaining` with color: green > 50%, yellow > 10%, red ≤ 10%.
+- **WS status pill** — from `wsStore.connectedChannels` Zustand store. Shows `● Connected` / `○ Disconnected` for the `scanner` channel. Subscribes via Zustand `useWSStore(s => s.connectedChannels.scanner)`.
+
+**Implementation:**
+- New sub-component: `StatusBar` in `frontend/src/components/pipeline/StatusBar.tsx`
+- Props: `{ mode: ScannerMode; uptimeSeconds: number; marketCount: number; rateLimitRemaining: number | null; wsConnected: boolean }`
+- `React.memo` wrapper.
+- Layout: `<div className="flex flex-wrap gap-2 mb-4">` with pill `<span>` elements.
+- Each pill: rounded-full, small text, colored dot, label.
+- Fetched scanner status via a small `useScannerStatus()` hook or inline in `DiagnosticsPanel.tsx`:
+  ```typescript
+  const [status, setStatus] = useState<ScannerStatus | null>(null);
+  useEffect(() => {
+    fetch(`${API_BASE}/scanner/status`).then(r => r.json()).then(d => setStatus(d.data));
+    const timer = setInterval(() => {...}, 30000);
+    return () => clearInterval(timer);
+  }, []);
+  ```
+- Rate limit: track the latest `rate_remaining` from `apiTraces[apiTraces.length - 1]?.rate_remaining` via `useMemo`.
+
+**Memoization:**
+- `StatusBar` wrapped in `React.memo` — only re-renders when status data actually changes.
+- Status fetch uses a mount-only `useEffect` with interval cleanup.
+
+#### Phase 6 — Additional columns (medium-value)
+
+Expand the grid to include 3 more columns from the "medium-value" diagnostics data. The grid becomes `grid-cols-1 md:grid-cols-2 lg:grid-cols-4 xl:grid-cols-5`, with the original 4 columns on the left and the new ones pushed to additional rows on smaller screens.
+
+##### Column 5: Error Feed (`pipeline/ErrorFeed.tsx`)
+
+- **Data source:** Derived from `logs.filter(l => l.type === 'cycle_error' || (l.type === 'trace' && l.detail?.status >= 400))` + any errors from `completedCycles` (iterate `.stages` and collect stage entries where `.status === 'error'`).
+- **Display:** Vertical feed of error entries only — red-highlighted, timestamped.
+- Each row: ❌ icon + message + timestamp.
+- Counter badge in header: `❌ Errors (N)`.
+- **Scrolling:** Respects user scroll position (same pattern as other columns — `isUserAtBottom` + auto-scroll only when at bottom). Not "always auto-scroll" — that would steal position.
+- **🐛 Bugfix — `completedCycles` error extraction:** Use a `useMemo` to flatten all stage errors:
+  ```typescript
+  const cycleErrors = useMemo(() => {
+    return completedCycles.flatMap(c =>
+      Object.values(c.stages).filter(s => s.status === 'error').map(s => ({ cycle_id: c.cycle_id, ...s }))
+    );
+  }, [completedCycles]);
+  ```
+- **🐛 Bugfix — API trace error severity:** 4xx errors (client errors, e.g., 429 rate limit) and 5xx errors (server errors) shown with different icons: ⚠️ for 4xx, ❌ for 5xx.
+- `React.memo` wrapper.
+
+##### Column 6: Candidate Queue (`pipeline/CandidateQueue.tsx`)
+
+- **Data source:** `GET /api/v1/candidates` fetched on mount + polled every 15s.
+- **🐛 Bugfix — No overlapping polls:** Use recursive `setTimeout` instead of `setInterval`. If the fetch takes >15s, the next poll waits 15s after the previous one completes, not on an overlapping schedule:
+  ```typescript
+  const POLL_MS = 15_000;
+  useEffect(() => {
+    let cancelled = false;
+    const poll = async () => {
+      try {
+        const resp = await fetch(`${API_BASE}/candidates`);
+        const json = await resp.json();
+        if (!cancelled) setData(json.data ?? []);
+      } catch { /* ignore */ }
+      if (!cancelled) setTimeout(poll, POLL_MS);
+    };
+    poll();
+    return () => { cancelled = true; };
+  }, []);
+  ```
+- **Display:**
+  - Pending count (blue badge)
+  - Approved count (green badge)
+  - Rejected count (red badge)
+  - Total count
+- Each candidate shown if available: `event_ticker → side $price` with status badge.
+- Links to event detail if available.
+- **🐛 Bugfix — Auth/empty responses:** If the endpoint returns a 401 or `success: false`, show `"Auth required"` or `"No candidates yet"` empty state instead of crashing.
+- **Memoization:** `React.memo`, data fetch via mount-only `useEffect` with cancelled flag cleanup.
+
+##### Column 7: Live Event Metrics (`pipeline/LiveEventMetrics.tsx`)
+
+- **Data source:** Derived from `scanner:discovery_cycle` WS events over time + current scanner status.
+- **Display:** Delta-based metrics:
+  - Markets tracked (current count + delta from last cycle)
+  - Events tracked (current count + delta)
+  - Active candidates
+  - Time since last discovery
+- Each metric as a small labeled stat with trend arrow (↑ ↓ →).
+- **🐛 Bugfix — First-event delta:** When only one discovery event exists, there's nothing to diff against. Show `—` instead of a delta value:
+  ```typescript
+  const delta = useMemo(() => {
+    if (events.length < 2) return null;
+    const prev = events[events.length - 2];
+    const curr = events[events.length - 1];
+    return { markets: curr.data.total_markets - prev.data.total_markets, events: ... };
+  }, [events]);
+  ```
+- **🐛 Bugfix — "Time since last discovery" ticker:** Without a periodic timer, the display freezes at the value set when the event arrived. Add a `useEffect` that updates every 60s:
+  ```typescript
+  const [now, setNow] = useState(Date.now());
+  useEffect(() => {
+    const t = setInterval(() => setNow(Date.now()), 60_000);
+    return () => clearInterval(t);
+  }, []);
+  const lastDiscovery = events.length > 0 ? events[events.length - 1].timestamp : null;
+  const timeSince = lastDiscovery ? Math.floor((now - new Date(lastDiscovery).getTime()) / 1000) : null;
+  ```
+- **🐛 Bugfix — Double data source:** WS discovery events and REST scanner status both report market/event counts. If they diverge (WS delayed vs REST fresh), numbers would flicker. Fix: prefer WS data when available; only fall back to REST when `events.length === 0` (before first discovery cycle).
+- **Memoization:** `React.memo`, delta calculations via `useMemo` comparing last two discovery events.
+
+#### Layout update for Phase 6
+
+The grid expands to accommodate all columns. On wide screens all 7 columns are visible; on narrower layouts columns wrap to the next row:
+
+```tsx
+<div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-5 gap-4">
+  {/* Row 1: core columns */}
+  <DiscoveryColumn ... />        {/* col 1 */}
+  <PipelineColumn ... />         {/* col 2 */}
+  <ProgressGateColumn ... />     {/* col 3 */}
+  <ApiTracesColumn ... />        {/* col 4 */}
+  {/* Row 2: additional columns */}
+  <ErrorFeed ... />              {/* col 5 */}
+  <CandidateQueue ... />         {/* col 6 */}
+  <LiveEventMetrics ... />       {/* col 7 */}
+</div>
+```
+
+### Theoretical QA: Bugs Found & Fixes Applied
+
+A systematic playthrough of every component's data path found the following bugs. All are fixed in the plan above.
+
+| # | Component | Bug | Fix |
+|---|-----------|-----|-----|
+| 1 | StatusBar | `setInterval` polls can overlap if fetch takes >30s | Recursive `setTimeout` instead of `setInterval` — next poll starts after previous completes |
+| 2 | StatusBar | `setState` after unmount if user navigates away | `AbortController` + cancelled flag in cleanup |
+| 3 | StatusBar | `useWSStore(s => s.connectedChannels.scanner)` returns `undefined` on first render | `?? false` fallback |
+| 4 | DiscoveryColumn + ProgressGateColumn | `React.memo` prevents re-render when no new events arrive, so "Live" → "Idle" transition never happens | Internal `useEffect` with 60s interval that updates a `lastEventTime` ref; staleness check compares against `Date.now()` on each interval tick |
+| 5 | All columns | Ring buffer uses array index as React key; when old entries drop off, indices shift causing React to think all items changed | Monotonically incrementing ID counter (`useRef(0)`) in `useDiagnostics`, assigned to each event on insertion |
+| 6 | ApiTracesColumn | Long URL paths overflow beyond column width | CSS `overflow-hidden text-ellipsis` on path span; `useMemo` truncates path to ~40 chars |
+| 7 | ApiTracesColumn | 4xx (client) and 5xx (server) errors shown identically | Different icons: ⚠️ for 4xx, ❌ for 5xx |
+| 8 | ErrorFeed | Extracting errors from `completedCycles` requires nested iteration of `.stages` | Flatten via `useMemo`: `Object.values(c.stages).filter(s => s.status === 'error').map(...)` |
+| 9 | ErrorFeed | "Always auto-scroll" conflicts with user reading historical errors | Same `isUserAtBottom` scroll-lock pattern as other columns |
+| 10 | CandidateQueue | `setInterval` causes overlapping requests if fetch takes >15s | Recursive `setTimeout` with cancelled flag |
+| 11 | CandidateQueue | 401 / `success: false` responses crash the component | `"Auth required"` / `"No candidates yet"` empty states |
+| 12 | LiveEventMetrics | With only one discovery event, there's no previous value to diff against | Ternery: `delta === null ? "—" : formattedDelta` |
+| 13 | LiveEventMetrics | "Time since last discovery" freezes after event arrives | 60s `setInterval` ticker updating `Date.now()` |
+| 14 | LiveEventMetrics | WS discovery data and REST scanner status report conflicting counts | Prefer WS data; fall back to REST only when `events.length === 0` |
+| 15 | `useDiagnostics` | All WS handlers assume `data` fields exist; malformed messages crash | Optional chaining (`data?.field`) + default values on all field accesses |
+
+#### Risk Register Additions
+
+| # | Risk | Mitigation |
+|---|------|------------|
+| 17 | Columns are empty on initial mount (late-join) | `useDiagnostics` discovery/progress feeds initialized empty; data flows in from WS within seconds |
+| 18 | Discovery column shows stale "Live" after engine stops | "Recent" heuristic: check if last event timestamp is within 60s; fall back to "Idle" |
+| 19 | 7 columns on mobile too cramped | Responsive grid: `grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-5` — columns wrap to next row on smaller screens |
+| 20 | Pipeline column has too many cycle cards | `completedCycles` already capped at 3 by `useDiagnostics` |
+| 21 | Status bar data stale after navigating away | Poll interval refetches every 30s; WS discovery events update market count instantly |
+| 22 | Rate limit pill shows stale value | Uses last known `ApiTrace.rate_remaining` — resets to null if no API calls in last 60s |
+| 23 | Candidate Queue shows no data on initial mount | Unauthenticated / no-candidates responses handled gracefully with "No candidates" empty state |
+| 24 | 7 columns too wide on small screens | Responsive grid: 1→2→3→5 columns as screen size increases; each column has min-width |
+
 ---
 
 ## Phase 12: Test Infrastructure (⬜ Not Yet Implemented)
@@ -6057,6 +6367,16 @@ Step 81: frontend/src/lib/types.ts                     # Add PipelineStage, Pipe
 Step 82: frontend/src/hooks/useDiagnostics.ts         # New hook — WS listener + ring buffer + render throttle
 Step 83: frontend/src/components/DiagnosticsPanel.tsx # New component — collapsible live log + pipeline summary
 Step 84: frontend/src/stores/wsStore.ts               # Multi-listener support (Map → Map<string, Set>)
+Step 85: frontend/src/hooks/useDiagnostics.ts         # Add discoveryFeed + progressGateFeed ring buffers + types
+Step 86: frontend/src/components/pipeline/DiscoveryColumn.tsx    # New — memoized discovery feed column
+Step 87: frontend/src/components/pipeline/PipelineColumn.tsx     # New — memoized E1-E7 stage column
+Step 88: frontend/src/components/pipeline/ProgressGateColumn.tsx # New — memoized progress gate column
+Step 89: frontend/src/components/pipeline/ApiTracesColumn.tsx    # New — memoized API trace column
+Step 90: frontend/src/components/DiagnosticsPanel.tsx            # Rewrite to multi-column grid layout
+Step 91: frontend/src/components/pipeline/StatusBar.tsx          # New — status pills bar (mode, uptime, markets, rate limit, WS)
+Step 92: frontend/src/hooks/useDiagnostics.ts                    # Add error feed derivation + scanner status fetch
+Step 93: frontend/src/components/pipeline/CandidateQueue.tsx     # New — candidate queue polling column
+Step 94: frontend/src/components/pipeline/LiveEventMetrics.tsx   # New — live event delta metrics column
 ```
 
 ---
